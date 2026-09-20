@@ -3,6 +3,7 @@ import { ValidationPipe } from '@nestjs/common';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { ThrottlerExceptionFilter } from './common/filters/throttler-exception.filter';
+import { isOriginAllowed, parseOrigins } from './common/cors';
 
 async function bootstrap() {
   // rawBody: true makes req.rawBody (a Buffer) available alongside the
@@ -14,6 +15,18 @@ async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { rawBody: true });
 
   app.useGlobalFilters(new ThrottlerExceptionFilter());
+
+  // Browsers block a web page (the admin dashboard) from calling this API unless
+  // the API says it may. There was no CORS setting at all before, so the admin
+  // could never connect. Set CORS_ORIGINS to the dashboard's address(es).
+  const allowedOrigins = parseOrigins(process.env.CORS_ORIGINS);
+  const production = process.env.NODE_ENV === 'production';
+  app.enableCors({
+    origin: (origin, callback) => callback(null, isOriginAllowed(origin, allowedOrigins, production)),
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Authorization', 'Content-Type', 'Accept'],
+    maxAge: 86400,
+  });
 
   app.useGlobalPipes(
     new ValidationPipe({
