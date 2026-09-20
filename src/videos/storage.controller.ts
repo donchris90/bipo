@@ -1,4 +1,4 @@
-import { Controller, Get, Inject, Req, Res } from '@nestjs/common';
+import { Controller, Get, Inject, Logger, Req, Res } from '@nestjs/common';
 import { Request, Response } from 'express';
 import { STORAGE_PROVIDER, type StorageProvider } from './providers/storage-provider.interface';
 import { isServableKey, parseByteRange } from './storage-range';
@@ -13,6 +13,8 @@ import { isServableKey, parseByteRange } from './storage-range';
 // public bucket + custom domain) and point S3_PUBLIC_BASE_URL at that instead.
 @Controller('api/v1/storage')
 export class StorageController {
+  private readonly logger = new Logger(StorageController.name);
+
   constructor(@Inject(STORAGE_PROVIDER) private readonly storage: StorageProvider) {}
 
   @Get('files/*')
@@ -26,6 +28,8 @@ export class StorageController {
     try {
       out = await this.storage.readObject(key, parseByteRange(req.headers.range) ?? undefined);
     } catch (e: any) {
+      // Record the real reason for the server logs (the response stays generic).
+      this.logger.warn(`Could not read ${key}: ${e?.name ?? 'Error'} (HTTP ${e?.$metadata?.httpStatusCode ?? '-'}) ${String(e?.message ?? e).slice(0, 200)}`);
       const status = e?.getStatus?.() ?? 502;
       res.status(status).json({ statusCode: status, message: status === 503 ? e.message : 'Could not read that file' });
       return;

@@ -1,8 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import type { ObjectRead, StorageProvider } from './storage-provider.interface';
+import type { ObjectRead, StorageCheck, StorageProvider } from './storage-provider.interface';
 
 const UPLOAD_URL_TTL_SECONDS = 900;
 
@@ -22,6 +22,7 @@ export class S3StorageProvider implements StorageProvider {
   private readonly client: S3Client;
   private readonly bucket: string;
   private readonly publicBase: string;
+  private readonly endpointHost: string;
 
   constructor(config: ConfigService) {
     const bucket = config.get<string>('S3_BUCKET');
@@ -46,7 +47,19 @@ export class S3StorageProvider implements StorageProvider {
       credentials: { accessKeyId, secretAccessKey },
       // R2 / MinIO / Spaces are happiest with path-style when an endpoint is custom.
       forcePathStyle: !!config.get<string>('S3_ENDPOINT'),
+      // Recent SDK versions add checksum headers to requests by default. Cloudflare R2
+      // (and several other S3-compatible stores) reject them, which breaks uploads
+      // and reads. Only send a checksum when an operation actually requires one.
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      responseChecksumValidation: 'WHEN_REQUIRED',
     });
+    this.endpointHost = (() => {
+      try {
+        return new URL(config.get<string>('S3_ENDPOINT') || 'https://s3.amazonaws.com').host;
+      } catch {
+        return 'invalid S3_ENDPOINT';
+      }
+    })();
   }
 
   async createUpload({ key, contentType }: { key: string; contentType: string }) {
@@ -92,6 +105,34 @@ export class S3StorageProvider implements StorageProvider {
     } catch (e: any) {
       if (e?.name === 'NoSuchKey' || e?.name === 'NotFound' || e?.$metadata?.httpStatusCode === 404) return null;
       throw e;
+    }
+  }
+
+  // What an admin sees when they press "Test video storage". Names the failure and
+  // what to look at, and never includes a credential.
+  async check(): Promise<StorageCheck> {
+    const base = { bucket: this.bucket, endpointHost: this.endpointHost };
+    try {
+      await this.client.send(new HeadBucketCommand({ Bucket: this.bucket }));
+      await this.client.send(new ListObjectsV2Command({ Bucket: this.bucket, MaxKeys: 1 }));
+      return { ok: true, ...base };
+    } catch (e: any) {
+      const name = String(e?.name ?? e?.Code ?? e?.code ?? 'Error');
+      const status = e?.$metadata?.httpStatusCode;
+      const hints: Record<string, string> = {
+        InvalidAccessKeyId: 'The access key id is wrong (S3_ACCESS_KEY_ID).',
+        SignatureDoesNotMatch: 'The secret key is wrong (S3_SECRET_ACCESS_KEY), or has extra spaces.',
+        AccessDenied: 'The credentials are valid but not allowed on this bucket: give the R2 API token "Object Read & Write" for this bucket.',
+        NoSuchBucket: 'No bucket with this name at this endpoint: check S3_BUCKET and the account id in S3_ENDPOINT.',
+        NotFound: 'No bucket with this name at this endpoint: check S3_BUCKET and the account id in S3_ENDPOINT.',
+        ENOTFOUND: 'The endpoint address does not exist: check S3_ENDPOINT (R2: https://<account-id>.r2.cloudflarestorage.com, no bucket name on the end).',
+        ECONNREFUSED: 'Could not connect to S3_ENDPOINT.',
+        CERT_HAS_EXPIRED: 'The endpoint has a certificate problem: check S3_ENDPOINT.',
+      };
+      const hint =
+        hints[name] ??
+        (status === 403 ? hints.AccessDenied : status === 404 ? hints.NoSuchBucket : 'Check S3_ENDPOINT, S3_BUCKET and both keys.');
+      return { ok: false, ...base, errorName: name, errorMessage: String(e?.message ?? e).slice(0, 300), hint };
     }
   }
 

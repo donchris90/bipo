@@ -102,3 +102,42 @@ describe('S3 configuration', () => {
     expect(p.publicUrl('videos/u/a.mp4')).toBe('https://api.example.com/api/v1/storage/files/videos/u/a.mp4');
   });
 });
+
+describe('S3StorageProvider.check (the admin storage self-test)', () => {
+  const make = (send: jest.Mock) => {
+    const values: Record<string, string> = { S3_BUCKET: 'ryda', S3_ACCESS_KEY_ID: 'k', S3_SECRET_ACCESS_KEY: 's', S3_PUBLIC_BASE_URL: 'https://a/b', S3_REGION: 'auto', S3_ENDPOINT: 'https://acct.r2.cloudflarestorage.com' };
+    const p = new S3StorageProvider({ get: (k: string) => values[k] } as any);
+    (p as any).client = { send };
+    return p;
+  };
+
+  it('reports success without revealing any credential', async () => {
+    const res = await make(jest.fn().mockResolvedValue({})).check();
+    expect(res).toEqual({ ok: true, bucket: 'ryda', endpointHost: 'acct.r2.cloudflarestorage.com' });
+    expect(JSON.stringify(res)).not.toMatch(/"k"|"s"/);
+  });
+
+  it.each([
+    ['InvalidAccessKeyId', 403, /access key id is wrong/],
+    ['SignatureDoesNotMatch', 403, /secret key is wrong/],
+    ['AccessDenied', 403, /Object Read & Write/],
+    ['NoSuchBucket', 404, /check S3_BUCKET/],
+    ['ENOTFOUND', undefined, /endpoint address does not exist/],
+  ])('names the problem and what to look at: %s', async (name, status, hint) => {
+    const err: any = Object.assign(new Error('boom'), { name, $metadata: { httpStatusCode: status } });
+    const res = await make(jest.fn().mockRejectedValue(err)).check();
+    expect(res.ok).toBe(false);
+    expect(res.errorName).toBe(name);
+    expect(res.hint).toMatch(hint);
+  });
+
+  it('the file route logs the real cause but keeps the public answer generic', async () => {
+    const read = jest.fn().mockRejectedValue(Object.assign(new Error('The secret is wrong'), { name: 'SignatureDoesNotMatch' }));
+    const c = new StorageController({ readObject: read } as any);
+    const res = fakeRes();
+    await c.file({ params: { 0: 'videos/u/a.mp4' }, headers: {} } as any, res);
+    expect(res.statusCode).toBe(502);
+    expect(res.jsonBody.message).toBe('Could not read that file');
+    expect(JSON.stringify(res.jsonBody)).not.toContain('secret');
+  });
+});

@@ -1,8 +1,9 @@
-import { Body, Controller, Get, Param, Put, Query, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Inject, Param, Put, Query, Req, UseGuards } from '@nestjs/common';
 import { Request } from 'express';
 import { RoleName } from '@prisma/client';
 import { AdminService } from './admin.service';
 import { PayoutConfigService } from '../payouts/payout-config.service';
+import { STORAGE_PROVIDER, type StorageProvider } from '../videos/providers/storage-provider.interface';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -25,6 +26,7 @@ export class AdminController {
   constructor(
     private readonly admin: AdminService,
     private readonly payoutConfig: PayoutConfigService,
+    @Inject(STORAGE_PROVIDER) private readonly storage: StorageProvider,
   ) {}
 
   @Get('overview')
@@ -99,5 +101,12 @@ export class AdminController {
   @Roles(...FINANCE)
   setPayoutConfig(@Param('countryCode') countryCode: string, @Body() body: unknown, @Req() req: AuthedRequest) {
     return this.payoutConfig.upsert(countryCode, body, req.user.userId, req.user.roles);
+  }
+
+  // "Test video storage": can the server reach the bucket with its credentials?
+  @Get('storage/check')
+  @Roles(RoleName.SUPER_ADMIN)
+  storageCheck() {
+    return this.storage.check ? this.storage.check() : { ok: false, errorName: 'Unsupported', errorMessage: 'This storage provider has no self-test' };
   }
 }

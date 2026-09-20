@@ -5,6 +5,7 @@ import { AdminService } from './admin.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { PrismaService } from '../prisma/prisma.service';
 import { PayoutConfigService } from '../payouts/payout-config.service';
+import { STORAGE_PROVIDER } from '../videos/providers/storage-provider.interface';
 
 // Stands in for JwtAuthGuard only: the caller's roles come from a header, so the
 // REAL RolesGuard, routing, query parsing and service run over real HTTP.
@@ -45,6 +46,7 @@ describe('admin API over HTTP', () => {
         AdminService,
         { provide: PrismaService, useValue: prisma },
         { provide: PayoutConfigService, useValue: payoutConfig },
+        { provide: STORAGE_PROVIDER, useValue: { check: jest.fn().mockResolvedValue({ ok: true, bucket: 'ryda' }) } },
       ],
     })
       .overrideGuard(JwtAuthGuard)
@@ -103,5 +105,13 @@ describe('admin API over HTTP', () => {
     expect((await put('USER,TRUST_SAFETY_ADMIN')).status).toBe(403);
     expect((await put('USER,FINANCE_ADMIN')).status).toBe(200);
     expect(payoutConfig.upsert).toHaveBeenCalledWith('NG', { enabled: true }, 'admin-1', ['USER', 'FINANCE_ADMIN']);
+  });
+
+  it('the storage self-test is super-admin only', async () => {
+    expect((await get('storage/check', 'USER,FINANCE_ADMIN')).status).toBe(403);
+    expect((await get('storage/check', 'USER,TRUST_SAFETY_ADMIN')).status).toBe(403);
+    const ok = await get('storage/check', 'USER,SUPER_ADMIN');
+    expect(ok.status).toBe(200);
+    expect((await ok.json()).ok).toBe(true);
   });
 });

@@ -24,6 +24,18 @@ export interface StorageProvider {
   // bucket itself never has to be public. `range` is a validated HTTP byte range
   // such as "bytes=0-1023". Null when the object does not exist.
   readObject?(key: string, range?: string): Promise<ObjectRead | null>;
+
+  // A safe self-test for admins: can we reach the bucket with these credentials?
+  check?(): Promise<StorageCheck>;
+}
+
+export interface StorageCheck {
+  ok: boolean;
+  bucket?: string;
+  endpointHost?: string; // never the credentials
+  errorName?: string;
+  errorMessage?: string;
+  hint?: string; // what to look at
 }
 
 export interface ObjectRead {
@@ -57,6 +69,9 @@ export class UnavailableStorageProvider implements StorageProvider {
   async readObject(): Promise<never> {
     return notConfigured('Video storage', this.reason);
   }
+  async check(): Promise<StorageCheck> {
+    return { ok: false, errorName: 'NotConfigured', errorMessage: this.reason, hint: 'Set the S3_* variables on the server and redeploy.' };
+  }
 }
 
 // Dev-only. Issues an upload URL nothing listens on and pretends every key
@@ -74,6 +89,10 @@ export class MockStorageProvider implements StorageProvider {
 
   publicUrl(key: string) {
     return `mock://media/${key}`;
+  }
+
+  async check(): Promise<StorageCheck> {
+    return { ok: false, errorName: 'MockStorage', errorMessage: 'Development stand-in: nothing is stored', hint: 'Set S3_BUCKET and its credentials.' };
   }
 
   async deleteObject() {

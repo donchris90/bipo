@@ -42,5 +42,6 @@ const logger = new Logger('VideosModule');
     },
   ],
   controllers: [VideosController, StorageController],
+  exports: [STORAGE_PROVIDER],
 })
 export class VideosModule {}
