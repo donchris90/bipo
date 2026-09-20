@@ -1,0 +1,72 @@
+import { BadRequestException } from '@nestjs/common';
+import { maxSumProbability, sameRules, shapeOf, validateGameRules } from './game-rules';
+
+const dice = { payoutMultiplier: 9, diceCount: 3, diceSides: 10 };
+const crash = { houseEdge: 0.03, growthRate: 0.1386 };
+
+describe('maxSumProbability', () => {
+  it('finds the likeliest single sum for 3 ten-sided dice (13 or 14: 75 ways of 1000)', () => {
+    expect(maxSumProbability(3, 10)).toBeCloseTo(0.075, 6);
+  });
+  it('is 1/sides for one die', () => expect(maxSumProbability(1, 6)).toBeCloseTo(1 / 6, 9));
+});
+
+describe('validateGameRules — dice', () => {
+  it('accepts the current settings and safe changes', () => {
+    expect(validateGameRules(dice, dice)).toMatchObject({ payoutMultiplier: 9 });
+    expect(validateGameRules(dice, { ...dice, payoutMultiplier: 12, openSeconds: 20, minStake: 5, maxStake: 5000 })).toMatchObject({ payoutMultiplier: 12, openSeconds: 20, minStake: 5, maxStake: 5000 });
+  });
+
+  it('refuses a multiplier that would let players win on average', () => {
+    // best single number has probability 0.075, so 13.33x is the break-even
+    expect(() => validateGameRules(dice, { ...dice, payoutMultiplier: 14 })).toThrow(/too high/);
+    expect(() => validateGameRules(dice, { ...dice, payoutMultiplier: 13.4 })).toThrow(/too high/);
+    expect(validateGameRules(dice, { ...dice, payoutMultiplier: 13.3 }).payoutMultiplier).toBe(13.3);
+  });
+
+  it('does not let the dice themselves be changed', () => {
+    expect(() => validateGameRules(dice, { ...dice, diceCount: 4 })).toThrow(/diceCount cannot be changed/);
+    expect(() => validateGameRules(dice, { ...dice, diceSides: 6 })).toThrow(/diceSides cannot be changed/);
+  });
+
+  it('rejects out-of-range and missing values', () => {
+    expect(() => validateGameRules(dice, { ...dice, payoutMultiplier: 1 })).toThrow(/payoutMultiplier/);
+    expect(() => validateGameRules(dice, { diceCount: 3, diceSides: 10 })).toThrow(BadRequestException);
+  });
+});
+
+describe('validateGameRules — crash', () => {
+  it('bounds the house edge and growth rate', () => {
+    expect(validateGameRules(crash, { ...crash, houseEdge: 0.05 }).houseEdge).toBe(0.05);
+    expect(() => validateGameRules(crash, { ...crash, houseEdge: 0 })).toThrow(/houseEdge/); // a zero or negative edge is a loss-maker
+    expect(() => validateGameRules(crash, { ...crash, houseEdge: -0.1 })).toThrow(/houseEdge/);
+    expect(() => validateGameRules(crash, { ...crash, houseEdge: 0.5 })).toThrow(/houseEdge/);
+    expect(() => validateGameRules(crash, { ...crash, growthRate: 5 })).toThrow(/growthRate/);
+  });
+});
+
+describe('validateGameRules — shared limits and safety', () => {
+  it('rejects unknown keys instead of silently accepting typos', () => {
+    expect(() => validateGameRules(dice, { ...dice, payoutMultipler: 9 })).toThrow(/Unknown setting/);
+  });
+  it('bounds round length and stakes, and keeps max above min', () => {
+    expect(() => validateGameRules(dice, { ...dice, openSeconds: 2 })).toThrow(/openSeconds/);
+    expect(() => validateGameRules(dice, { ...dice, openSeconds: 900 })).toThrow(/openSeconds/);
+    expect(() => validateGameRules(dice, { ...dice, minStake: 0 })).toThrow(/minStake/);
+    expect(() => validateGameRules(dice, { ...dice, minStake: 100, maxStake: 50 })).toThrow(/maxStake cannot be below/);
+  });
+  it('will not let a game lose its core settings', () => {
+    expect(() => validateGameRules(crash, { openSeconds: 10 })).toThrow(/core settings/);
+    expect(() => validateGameRules(undefined, {})).toThrow(/supported game/);
+  });
+  it('detects the game type from its settings', () => {
+    expect(shapeOf(dice)).toBe('dice');
+    expect(shapeOf(crash)).toBe('crash');
+    expect(shapeOf({ payoutMultiplier: 20 })).toBe('lucky');
+    expect(shapeOf({})).toBeNull();
+  });
+  it('compares settings regardless of key order', () => {
+    expect(sameRules({ a: 1, b: 2 }, { b: 2, a: 1 })).toBe(true);
+    expect(sameRules({ a: 1 }, { a: 2 })).toBe(false);
+  });
+});

@@ -1,0 +1,924 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique
+  phone         String?        @unique
+  passwordHash  String
+  displayName   String?
+  countryCode   String
+  languageCode  String         @default("en")
+  status        UserStatus     @default(ACTIVE)
+  kycVerified   Boolean        @default(false)
+  referralCode  String         @unique
+  referredById  String?
+  lastCheckInAt DateTime?
+  checkInStreak Int            @default(0)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  avatarUrl     String?
+  bio           String?
+  liveViews     LiveViewer[]
+  refreshTokens RefreshToken[]
+  referredBy    User?          @relation("Referrals", fields: [referredById], references: [id])
+  referrals     User[]         @relation("Referrals")
+  roles         UserRole[]
+
+  @@index([countryCode])
+}
+
+model UserRole {
+  id     String   @id @default(uuid())
+  userId String
+  role   RoleName
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, role])
+}
+
+model RefreshToken {
+  id         String   @id @default(uuid())
+  userId     String
+  tokenHash  String   @unique
+  revoked    Boolean  @default(false)
+  replacedBy String?
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model RegionalConfig {
+  countryCode     String   @id
+  countryName     String
+  currencyCode    String
+  defaultLanguage String
+  minAge          Int      @default(18)
+  gamesEnabled    Boolean  @default(false)
+  paymentsEnabled Boolean  @default(false)
+  active          Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model FeatureFlag {
+  key         String   @id
+  enabled     Boolean  @default(false)
+  description String?
+  updatedBy   String?
+  updatedAt   DateTime @updatedAt
+}
+
+model Follow {
+  id          String   @id @default(uuid())
+  followerId  String
+  followingId String
+  createdAt   DateTime @default(now())
+
+  @@unique([followerId, followingId])
+  @@index([followingId])
+}
+
+model Block {
+  id        String   @id @default(uuid())
+  blockerId String
+  blockedId String
+  createdAt DateTime @default(now())
+
+  @@unique([blockerId, blockedId])
+  @@index([blockedId])
+}
+
+model Mute {
+  id        String   @id @default(uuid())
+  muterId   String
+  mutedId   String
+  createdAt DateTime @default(now())
+
+  @@unique([muterId, mutedId])
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  type      NotificationType
+  payload   Json?
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  @@index([userId, read])
+}
+
+// A device that can receive phone push notifications. Keyed by token: the
+// same physical device signing in as someone else re-points its row rather
+// than creating a second one that would keep pushing the previous account's
+// notifications to it.
+model PushToken {
+  id         String   @id @default(uuid())
+  userId     String
+  token      String   @unique
+  platform   String?
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model AuditLog {
+  id         String    @id @default(uuid())
+  actorId    String?
+  actorRole  RoleName?
+  action     String
+  targetType String?
+  targetId   String?
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime  @default(now())
+
+  @@index([actorId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+model LiveSession {
+  id              String       @id @default(uuid())
+  hostId          String
+  providerChannel String       @unique
+  title           String
+  category        String?
+  coverUrl        String?
+  privacy         RoomPrivacy  @default(PUBLIC)
+  countryCode     String
+  status          LiveStatus   @default(SCHEDULED)
+  startedAt       DateTime?
+  endedAt         DateTime?
+  createdAt       DateTime     @default(now())
+  themeColor      String?
+  likeCount       Int          @default(0)
+  peakViewerCount Int          @default(0)
+  durationSeconds Int?
+  viewers         LiveViewer[]
+
+  @@index([hostId])
+  @@index([status])
+}
+
+model LiveViewer {
+  id        String      @id @default(uuid())
+  sessionId String
+  userId    String
+  joinedAt  DateTime    @default(now())
+  leftAt    DateTime?
+  session   LiveSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, leftAt])
+  @@index([userId])
+}
+
+enum RoomMode {
+  VIDEO
+  AUDIO
+}
+
+model PartyRoom {
+  id              String      @id @default(uuid())
+  hostId          String
+  title           String
+  privacy         RoomPrivacy @default(PUBLIC)
+  seatCount       Int         @default(8)
+  locked          Boolean     @default(false)
+  status          RoomStatus  @default(OPEN)
+  countryCode     String
+  createdAt       DateTime    @default(now())
+  closedAt        DateTime?
+  providerChannel String      @unique
+  category        String?
+  themeColor      String?
+  // A video party (seats show camera) or an audio lounge (voice only). Chosen by
+  // the host when starting the room; the Party tab's two filters use it.
+  mode            RoomMode    @default(AUDIO)
+
+  @@index([hostId])
+  @@index([status])
+}
+
+model RoomSeat {
+  id         String   @id @default(uuid())
+  roomId     String
+  userId     String
+  seatNumber Int
+  joinedAt   DateTime @default(now())
+
+  @@unique([roomId, seatNumber])
+  @@unique([roomId, userId])
+}
+
+model SeatRequest {
+  id            String            @id @default(uuid())
+  roomId        String
+  userId        String
+  status        SeatRequestStatus @default(PENDING)
+  invitedByHost Boolean           @default(false)
+  createdAt     DateTime          @default(now())
+  decidedAt     DateTime?
+
+  @@index([roomId, status])
+  @@index([userId, status])
+}
+
+model RoomModerator {
+  id        String   @id @default(uuid())
+  roomId    String
+  userId    String
+  createdAt DateTime @default(now())
+
+  @@unique([roomId, userId])
+}
+
+model ChatMessage {
+  id        String      @id @default(uuid())
+  context   ChatContext
+  contextId String
+  senderId  String
+  content   String
+  createdAt DateTime    @default(now())
+
+  @@index([context, contextId, createdAt])
+}
+
+model DirectMessage {
+  id          String   @id @default(uuid())
+  senderId    String
+  recipientId String
+  content     String
+  read        Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([senderId, recipientId, createdAt])
+  @@index([recipientId, senderId, createdAt])
+}
+
+model ModerationAction {
+  id           String               @id @default(uuid())
+  actorId      String
+  actionType   ModerationActionType
+  targetUserId String?
+  context      ChatContext
+  contextId    String
+  reason       String?
+  createdAt    DateTime             @default(now())
+
+  @@index([context, contextId])
+}
+
+model Wallet {
+  id           String     @id @default(uuid())
+  userId       String
+  type         WalletType
+  balance      BigInt     @default(0)
+  currencyCode String
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@unique([userId, type])
+}
+
+model LedgerEntry {
+  id             String          @id @default(uuid())
+  walletId       String?
+  type           LedgerEntryType
+  amount         BigInt
+  balanceAfter   BigInt?
+  reference      String?
+  idempotencyKey String          @unique
+  createdAt      DateTime        @default(now())
+
+  @@index([walletId])
+  @@index([type])
+}
+
+model CoinPackage {
+  id           String   @id @default(uuid())
+  countryCode  String
+  currencyCode String
+  coinAmount   Int
+  priceMinor   Int
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  @@index([countryCode, active])
+}
+
+model CoinPurchase {
+  id             String         @id @default(uuid())
+  userId         String
+  packageId      String
+  provider       String
+  providerRef    String?
+  amountMinor    Int
+  currencyCode   String
+  coinAmount     Int
+  status         PurchaseStatus @default(PENDING)
+  idempotencyKey String         @unique
+  // The provider's hosted payment page. The app opens it so the person can pay;
+  // it is stored so a retried request returns the same link.
+  checkoutUrl    String?
+  createdAt      DateTime       @default(now())
+  confirmedAt    DateTime?
+
+  @@index([userId])
+}
+
+model Gift {
+  id        String   @id @default(uuid())
+  code      String   @unique
+  name      String
+  coinPrice Int
+  category  String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+model Chargeback {
+  id             String   @id @default(uuid())
+  userId         String
+  coinPurchaseId String?
+  amountMinor    Int
+  currencyCode   String
+  coinAmount     Int
+  reason         String?
+  createdAt      DateTime @default(now())
+
+  @@index([userId])
+}
+
+model LoginEvent {
+  id        String   @id @default(uuid())
+  userId    String
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([ipAddress])
+}
+
+model GiftTransaction {
+  id             String       @id @default(uuid())
+  senderId       String
+  recipientId    String
+  giftId         String
+  coinAmount     Int
+  context        ChatContext?
+  contextId      String?
+  pkBattleId     String?
+  idempotencyKey String       @unique
+  createdAt      DateTime     @default(now())
+
+  @@index([recipientId])
+  @@index([pkBattleId])
+}
+
+model RevenueSplitConfig {
+  id               String   @id @default(uuid())
+  scope            String
+  scopeKey         String?
+  creatorShareBps  Int
+  platformShareBps Int
+  agencyShareBps   Int      @default(0)
+  active           Boolean  @default(true)
+  effectiveFrom    DateTime @default(now())
+
+  @@index([scope, scopeKey, active])
+}
+
+model CreatorApplication {
+  id         String                   @id @default(uuid())
+  userId     String
+  status     CreatorApplicationStatus @default(PENDING)
+  appliedAt  DateTime                 @default(now())
+  reviewedBy String?
+  reviewedAt DateTime?
+  reason     String?
+
+  @@index([userId])
+  @@index([status])
+}
+
+// Daily creator missions. Progress is never stored — it is derived from
+// existing rows (live sessions, settled PK battles, gifts, follows) for the
+// current day at read time, so it can't drift from what actually happened.
+// Only the *claim* is recorded, and (userId, missionId, periodKey) is unique,
+// which is what makes a reward claimable exactly once per day.
+model MissionDefinition {
+  id          String         @id @default(uuid())
+  code        String         @unique
+  title       String
+  description String
+  metric      MissionMetric
+  target      Int
+  // Paid in coins into the claimer's BONUS wallet.
+  rewardCoins Int
+  active      Boolean        @default(true)
+  sortOrder   Int            @default(0)
+  createdAt   DateTime       @default(now())
+  claims      MissionClaim[]
+}
+
+model MissionClaim {
+  id          String            @id @default(uuid())
+  userId      String
+  missionId   String
+  // The mission day the claim belongs to, e.g. "2026-09-19" (see
+  // missionPeriod() for how a day is bounded).
+  periodKey   String
+  rewardCoins Int
+  createdAt   DateTime          @default(now())
+  mission     MissionDefinition @relation(fields: [missionId], references: [id])
+
+  @@unique([userId, missionId, periodKey])
+  @@index([userId, periodKey])
+}
+
+// Cash rules for withdrawals, one row per country, set by an admin. Nothing is
+// hardcoded: what a coin is worth, the smallest withdrawal and any fee all live
+// here. A country with no row (or enabled = false) cannot withdraw.
+model PayoutConfig {
+  countryCode        String   @id
+  currencyCode       String
+  enabled            Boolean  @default(false)
+  // Cash paid for 100 coins, in the currency's minor unit (kobo for NGN):
+  // 5000 means N50.00 per 100 coins.
+  minorPer100Coins   Int
+  minWithdrawalCoins Int
+  maxWithdrawalCoins Int?
+  // Fee taken from the payout: feeBps is basis points of the gross amount
+  // (100 = 1%), feeFlatMinor is a flat amount in minor units. Both apply.
+  feeBps             Int      @default(0)
+  feeFlatMinor       Int      @default(0)
+  // Whether a person must have passed identity verification to withdraw.
+  requireKyc         Boolean  @default(true)
+  updatedAt          DateTime @updatedAt
+  updatedBy          String?
+}
+
+// Where a person is paid. One per user. The full account number is NOT stored:
+// the provider holds it behind `recipientCode`, and only the last 4 digits and
+// the verified account name are kept for display.
+model PayoutAccount {
+  id            String   @id @default(uuid())
+  userId        String   @unique
+  provider      String
+  countryCode   String
+  currencyCode  String
+  bankCode      String
+  bankName      String
+  accountLast4  String
+  accountName   String
+  recipientCode String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model WithdrawalRequest {
+  id             String           @id @default(uuid())
+  creatorId      String
+  // Which wallet the funds are reserved from and paid out of. `creatorId`
+  // is the requesting user — a creator for CREATOR_EARNINGS, an agency
+  // owner for AGENCY_EARNINGS. Existing rows are all creator withdrawals.
+  walletType     WalletType       @default(CREATOR_EARNINGS)
+  amountMinor    Int
+  currencyCode   String
+  status         WithdrawalStatus @default(PENDING_REVIEW)
+  riskFlags      Json?
+  payoutProvider String?
+  providerRef    String?
+  idempotencyKey String           @unique
+  requestedAt    DateTime         @default(now())
+  decidedAt      DateTime?
+  failureReason  String?
+  // Snapshot taken when the request was made, so a later rate change or a
+  // changed payout account can't alter what THIS withdrawal pays or where.
+  // `amountMinor` above is the coins withdrawn; these are the cash figures.
+  grossMinor     Int?
+  feeMinor       Int?
+  netMinor       Int?
+  rateMinorPer100Coins Int?
+  payoutTo       Json?
+
+  @@index([creatorId])
+  @@index([creatorId, requestedAt])
+  @@index([status])
+}
+
+model Agency {
+  id        String       @id @default(uuid())
+  name      String
+  ownerId   String
+  status    AgencyStatus @default(PENDING)
+  createdAt DateTime     @default(now())
+}
+
+model AgencyMembership {
+  id            String           @id @default(uuid())
+  agencyId      String
+  creatorId     String
+  commissionBps Int
+  status        MembershipStatus @default(ACTIVE)
+  joinedAt      DateTime         @default(now())
+  endedAt       DateTime?
+
+  @@index([creatorId, status])
+}
+
+model Call {
+  id              String     @id @default(uuid())
+  callerId        String
+  calleeId        String
+  providerChannel String     @unique
+  status          CallStatus @default(RINGING)
+  startedAt       DateTime?
+  endedAt         DateTime?
+  createdAt       DateTime   @default(now())
+
+  @@index([callerId])
+  @@index([calleeId])
+}
+
+model PKBattle {
+  id              String    @id @default(uuid())
+  challengerId    String
+  opponentId      String
+  status          PKStatus  @default(CHALLENGED)
+  scoreChallenger BigInt    @default(0)
+  scoreOpponent   BigInt    @default(0)
+  startedAt       DateTime?
+  endsAt          DateTime?
+  winnerId        String?
+  createdAt       DateTime  @default(now())
+  settledAt       DateTime?
+
+  @@index([status])
+}
+
+model PKScoreConfig {
+  id            String  @id @default(uuid())
+  countryCode   String?
+  coinsPerPoint Int     @default(1)
+  active        Boolean @default(true)
+
+  @@index([countryCode, active])
+}
+
+model GameDefinition {
+  code      String     @id
+  name      String
+  version   Int        @default(1)
+  status    GameStatus @default(DISABLED)
+  minAge    Int        @default(18)
+  rulesJson Json?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+}
+
+model GameRegionConfig {
+  id          String  @id @default(uuid())
+  gameCode    String
+  countryCode String
+  enabled     Boolean @default(false)
+
+  @@unique([gameCode, countryCode])
+}
+
+model GameRound {
+  id             String      @id @default(uuid())
+  gameCode       String
+  rulesVersion   Int
+  numberRange    Int?
+  selectionCount Int?
+  entryPrice     Int
+  openAt         DateTime
+  lockAt         DateTime
+  result         Json?
+  commitmentHash String?
+  revealData     String?
+  hiddenState    Json?
+  status         RoundStatus @default(SCHEDULED)
+  createdAt      DateTime    @default(now())
+  settledAt      DateTime?
+
+  @@index([gameCode, status])
+}
+
+model GameEntry {
+  id                    String          @id @default(uuid())
+  roundId               String
+  userId                String
+  selection             Json
+  coinAmount            Int
+  // The part of `coinAmount` that was paid from BONUS coins. Whatever this entry
+  // wins is paid back in the same proportion, so bonus coins can never turn into
+  // spendable or withdrawable coins by being played.
+  bonusAmount           Int             @default(0)
+  rewardAmount          Int             @default(0)
+  status                GameEntryStatus @default(PLACED)
+  autoCashoutMultiplier Float?
+  cashedOutMultiplier   Float?
+  cashedOutAt           DateTime?
+  idempotencyKey        String          @unique
+  createdAt             DateTime        @default(now())
+
+  @@index([roundId])
+  @@index([userId])
+}
+
+enum RoleName {
+  GUEST
+  USER
+  CREATOR
+  MODERATOR
+  AGENCY
+  FINANCE_ADMIN
+  TRUST_SAFETY_ADMIN
+  GAME_OPERATOR
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+  PENDING_REVIEW
+}
+
+enum NotificationType {
+  FOLLOW
+  SYSTEM
+  SECURITY
+  MESSAGE
+  GIFT_RECEIVED
+  PK_CHALLENGE
+  PK_RESULT
+  SEAT_APPROVED
+  WITHDRAWAL_UPDATE
+  COIN_PURCHASE
+  CREATOR_APPLICATION
+  MISSED_CALL
+}
+
+enum LiveStatus {
+  SCHEDULED
+  LIVE
+  ENDED
+}
+
+enum RoomPrivacy {
+  PUBLIC
+  PRIVATE
+  FOLLOWERS_ONLY
+  INVITE_ONLY
+}
+
+enum RoomStatus {
+  OPEN
+  CLOSED
+}
+
+enum SeatRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum ChatContext {
+  ROOM
+  LIVE
+  VIDEO
+}
+
+enum ModerationActionType {
+  MUTE
+  UNMUTE
+  BAN
+  UNBAN
+  KICK
+  ADD_MODERATOR
+  REMOVE_MODERATOR
+  LOCK_ROOM
+  UNLOCK_ROOM
+}
+
+enum WalletType {
+  COIN
+  CREATOR_EARNINGS
+  AGENCY_EARNINGS
+  BONUS
+}
+
+enum LedgerEntryType {
+  COIN_PURCHASE
+  GIFT_SENT
+  GIFT_RECEIVED
+  GAME_ENTRY
+  GAME_REWARD
+  WITHDRAWAL
+  WITHDRAWAL_RELEASE
+  REFUND
+  CHARGEBACK
+  BONUS
+  ADJUSTMENT
+  AGENCY_COMMISSION
+  PK_SCORE
+}
+
+enum PurchaseStatus {
+  PENDING
+  CONFIRMED
+  FAILED
+  REFUNDED
+  CHARGEBACK
+}
+
+enum CreatorApplicationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// Creator videos. The file itself lives in object storage (see
+// StorageProvider); this row is the metadata and counters. Removal is a soft
+// delete (status REMOVED) so like/view history survives for moderation.
+model Video {
+  id              String      @id @default(uuid())
+  creatorId       String
+  title           String
+  caption         String?
+  tag             String?
+  storageKey      String      @unique
+  videoUrl        String
+  contentType     String
+  sizeBytes       Int
+  // Reported by the client, not measured server-side — informational only.
+  durationSeconds Int?
+  allowGifts      Boolean     @default(true)
+  status          VideoStatus @default(PUBLISHED)
+  viewCount       Int         @default(0)
+  likeCount       Int         @default(0)
+  countryCode     String
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  likes           VideoLike[]
+
+  @@index([creatorId, createdAt])
+  @@index([status, createdAt])
+}
+
+model VideoLike {
+  id        String   @id @default(uuid())
+  videoId   String
+  userId    String
+  createdAt DateTime @default(now())
+  video     Video    @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@unique([videoId, userId])
+  @@index([userId])
+}
+
+enum VideoStatus {
+  PUBLISHED
+  REMOVED
+}
+
+enum MissionMetric {
+  LIVE_MINUTES
+  PK_WINS
+  GIFT_COINS_RECEIVED
+  NEW_FOLLOWERS
+}
+
+enum WithdrawalStatus {
+  PENDING_REVIEW
+  APPROVED
+  PROCESSING
+  PAID
+  FAILED
+  REJECTED
+}
+
+enum AgencyStatus {
+  PENDING
+  APPROVED
+  SUSPENDED
+}
+
+enum MembershipStatus {
+  ACTIVE
+  ENDED
+}
+
+enum PKStatus {
+  CHALLENGED
+  ACCEPTED
+  COUNTDOWN
+  ACTIVE
+  SETTLED
+  CANCELLED
+}
+
+enum CallStatus {
+  RINGING
+  ACCEPTED
+  DECLINED
+  ENDED
+  MISSED
+}
+
+enum GameStatus {
+  ACTIVE
+  DISABLED
+  MAINTENANCE
+}
+
+enum RoundStatus {
+  SCHEDULED
+  OPEN
+  LOCKED
+  RESOLVING
+  SETTLED
+  CANCELLED
+}
+
+enum GameEntryStatus {
+  PLACED
+  WON
+  LOST
+  REFUNDED
+}
+
+enum KycStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// An identity check a person submitted for manual review. The ID number is never
+// stored: only its last 4 digits (for display) and a keyed hash (so one ID can't
+// verify several accounts). The photos live in KycDocument.
+model KycSubmission {
+  id              String        @id @default(uuid())
+  userId          String
+  status          KycStatus     @default(PENDING)
+  fullName        String
+  dateOfBirth     DateTime // the calendar date, stored as midnight UTC
+  idType          String
+  idLast4         String
+  idNumberHash    String
+  rejectionReason String?
+  submittedAt     DateTime      @default(now())
+  reviewedAt      DateTime?
+  reviewedBy      String?
+  documents       KycDocument[]
+
+  @@index([userId, submittedAt])
+  @@index([status, submittedAt])
+  @@index([idNumberHash])
+}
+
+model KycDocument {
+  id           String        @id @default(uuid())
+  submissionId String
+  kind         String
+  contentType  String
+  sizeBytes    Int
+  data         Bytes
+  submission   KycSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+
+  @@unique([submissionId, kind])
+}
+
+// A banner message an admin posts for the scrolling announcement strip on the Live
+// and Party screens. Automatic announcements (biggest win, biggest gift) are
+// generated from real activity and are not stored here.
+model Announcement {
+  id        String    @id @default(uuid())
+  text      String
+  active    Boolean   @default(true)
+  // Higher shows first.
+  priority  Int       @default(0)
+  startsAt  DateTime?
+  endsAt    DateTime?
+  createdBy String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([active, priority])
+}
