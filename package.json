@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Global live social + gaming platform backend (Phase 0/1 foundation skeleton)",
   "scripts": {
-    "build": "nest build",
+    "build": "nest build --builder swc",
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
@@ -12,7 +12,10 @@
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
     "test": "jest",
     "seed": "ts-node prisma/seed.ts",
-    "admin:grant": "ts-node scripts/grant-role.ts"
+    "admin:grant": "ts-node scripts/grant-role.ts",
+    "admin:password": "ts-node scripts/set-password.ts",
+    "build:tsc": "nest build",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1136.0",
@@ -45,6 +48,8 @@
     "@nestjs/cli": "^10.4.5",
     "@nestjs/schematics": "^10.1.4",
     "@nestjs/testing": "^10.4.0",
+    "@swc/cli": "^0.5.2",
+    "@swc/core": "^1.16.2",
     "@types/express": "^4.17.21",
     "@types/jest": "^29.5.12",
     "@types/node": "^20.14.0",
