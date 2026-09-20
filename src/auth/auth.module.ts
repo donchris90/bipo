@@ -1,3 +1,4 @@
+import { ACCESS_TOKEN_DEFAULT, tokenLifetime } from '../common/token-lifetime';
 import { Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
@@ -19,7 +20,7 @@ import { EconomyModule } from '../economy/economy.module';
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         secret: config.get<string>('JWT_ACCESS_SECRET'),
-        signOptions: { expiresIn: config.get<string>('JWT_ACCESS_EXPIRES_IN') },
+        signOptions: { expiresIn: tokenLifetime(config.get<string>('JWT_ACCESS_EXPIRES_IN'), ACCESS_TOKEN_DEFAULT) },
       }),
     }),
   ],

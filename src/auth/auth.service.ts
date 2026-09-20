@@ -1,3 +1,4 @@
+import { ACCESS_TOKEN_DEFAULT, REFRESH_TOKEN_DEFAULT, tokenLifetime } from '../common/token-lifetime';
 import { BadRequestException, ConflictException, Injectable, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -204,12 +205,12 @@ export class AuthService {
       { sub: userId, roles, countryCode },
       {
         secret: this.config.get<string>('JWT_ACCESS_SECRET'),
-        expiresIn: this.config.get<string>('JWT_ACCESS_EXPIRES_IN'),
+        expiresIn: tokenLifetime(this.config.get<string>('JWT_ACCESS_EXPIRES_IN'), ACCESS_TOKEN_DEFAULT),
       },
     );
 
     const refreshTokenRaw = crypto.randomBytes(48).toString('hex');
-    const refreshExpiresIn = this.config.get<string>('JWT_REFRESH_EXPIRES_IN') ?? '30d';
+    const refreshExpiresIn = tokenLifetime(this.config.get<string>('JWT_REFRESH_EXPIRES_IN'), REFRESH_TOKEN_DEFAULT);
     const expiresAt = new Date(Date.now() + parseExpiryToMs(refreshExpiresIn));
 
     await this.prisma.refreshToken.create({

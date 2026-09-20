@@ -4,8 +4,17 @@ import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { ThrottlerExceptionFilter } from './common/filters/throttler-exception.filter';
 import { isOriginAllowed, parseOrigins } from './common/cors';
+import { checkEnv } from './common/env-check';
 
 async function bootstrap() {
+  // Name any missing setting right away, before anything else can fail confusingly.
+  const env = checkEnv(process.env, process.env.NODE_ENV === 'production');
+  if (env.missing.length > 0) {
+    console.error(`FATAL: missing required environment variable(s): ${env.missing.join(', ')}. Set them and restart.`);
+    process.exit(1);
+  }
+  for (const w of env.warnings) console.warn(`WARNING: ${w.name} is not set — ${w.effect}.`);
+
   // rawBody: true makes req.rawBody (a Buffer) available alongside the
   // normal parsed JSON body — needed because Paystack (and most payment
   // providers) sign the exact raw request bytes for webhook verification.
