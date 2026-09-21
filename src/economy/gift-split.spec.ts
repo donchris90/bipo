@@ -71,4 +71,16 @@ describe('computeGiftSplit', () => {
       }
     });
   });
+  it('rejects invalid revenue split totals instead of silently moving coins under a bad config', () => {
+    expect(() => computeGiftSplit(100, { creatorShareBps: 7000, platformShareBps: 2000, agencyShareBps: 0 })).toThrow(
+      'Creator and platform shares must total 100%',
+    );
+  });
+
+  it('rejects invalid agency commission values', () => {
+    expect(() => computeGiftSplit(100, { creatorShareBps: 7000, platformShareBps: 3000, agencyShareBps: 0 }, 10001)).toThrow(
+      'Agency commission must be between 0 and 10000 bps',
+    );
+  });
+
 });

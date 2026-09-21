@@ -74,6 +74,18 @@ export class PaymentWebhookController {
     const result = await this.paymentProvider.handleWebhook(payload);
     if (result.status === 'confirmed') {
       await this.coinPurchase.confirm(result.providerRef);
+    } else if (result.status === 'refunded' && result.providerRef) {
+      const purchase = await this.prisma.coinPurchase.findFirst({ where: { providerRef: result.providerRef } });
+      if (purchase?.status === 'CONFIRMED') await this.chargeback.record(purchase.id, 'Provider refund processed', result.providerRef);
+    } else if (result.status === 'failed' && result.providerRef) {
+      // A provider-reported payment failure is terminal for the pending
+      // purchase, but only after the provider itself has normalized the event.
+      // Unrelated webhook events are returned as "ignored" and can never
+      // accidentally fail a purchase.
+      const purchase = await this.prisma.coinPurchase.findFirst({ where: { providerRef: result.providerRef } });
+      if (purchase && purchase.status === 'PENDING') {
+        await this.prisma.coinPurchase.update({ where: { id: purchase.id }, data: { status: 'FAILED' } });
+      }
     }
     return { received: true };
   }

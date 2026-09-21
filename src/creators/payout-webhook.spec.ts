@@ -14,7 +14,7 @@ const req = (payload: any, signature?: string) => {
 
 describe('payout webhook', () => {
   const build = (p: any = provider) => {
-    const withdrawals: any = { confirmPaid: jest.fn(), confirmFailed: jest.fn() };
+    const withdrawals: any = { confirmPaid: jest.fn(), confirmFailed: jest.fn(), confirmReversed: jest.fn() };
     return { ctl: new PayoutWebhookController(withdrawals, p), withdrawals };
   };
   const success = { event: 'transfer.success', data: { transfer_code: 'TRF_1' } };
@@ -40,7 +40,7 @@ describe('payout webhook', () => {
     expect(withdrawals.confirmFailed).toHaveBeenCalledWith('TRF_2', 'Account closed');
     const reversed = { event: 'transfer.reversed', data: { transfer_code: 'TRF_3' } };
     await ctl.handle(req(reversed), reversed);
-    expect(withdrawals.confirmFailed).toHaveBeenCalledWith('TRF_3', 'The transfer was reversed');
+    expect(withdrawals.confirmReversed).toHaveBeenCalledWith('TRF_3', 'The transfer was reversed');
   });
 
   it('ignores events that are not about payouts', async () => {
@@ -66,6 +66,7 @@ describe('PaystackPayoutProvider', () => {
     expect(ref).toMatch(/^[a-z0-9_-]{16,50}$/);
     expect(toPaystackReference('a').length).toBeGreaterThanOrEqual(16);
     expect(toPaystackReference('x'.repeat(200)).length).toBeLessThanOrEqual(50);
+    expect(toPaystackReference('x'.repeat(200))).not.toBe(toPaystackReference('x'.repeat(199) + 'y'));
   });
 
   it('sends the net amount to the recipient and returns the transfer code', async () => {

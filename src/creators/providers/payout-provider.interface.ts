@@ -24,12 +24,12 @@ export interface PayoutProvider {
 
   // Reads a webhook body into a payout result, or null for an event that is not
   // about a payout outcome.
-  parseWebhook?(payload: any): { providerRef: string; status: 'paid' | 'failed'; reason?: string } | null;
+  parseWebhook?(payload: any): { providerRef: string; status: 'paid' | 'failed' | 'reversed'; reason?: string } | null;
 
   // Real implementations report status asynchronously via webhook, not a
   // synchronous return — this mock simplifies to immediate success for
   // local development only.
-  handleWebhook(payload: unknown): Promise<{ providerRef: string; status: 'paid' | 'failed'; reason?: string }>;
+  handleWebhook(payload: unknown): Promise<{ providerRef: string; status: 'paid' | 'failed' | 'reversed'; reason?: string }>;
 }
 
 // Used when no real payout provider is configured (no PAYSTACK_SECRET_KEY) in

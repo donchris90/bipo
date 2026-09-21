@@ -13,6 +13,7 @@ export interface VerifyPaymentResult {
   verified: boolean;
   amountMinor: number;
   currencyCode: string;
+  status?: string;
 }
 
 export interface PaymentProvider {
@@ -42,7 +43,7 @@ export interface PaymentProvider {
   // after verifyWebhookSignature (when the provider has one) has already
   // passed — a forged webhook is a direct path to "trust client-reported
   // payment success", which spec §26/§94 explicitly forbid.
-  handleWebhook(payload: unknown, signature?: string): Promise<{ providerRef: string; status: 'confirmed' | 'failed' }>;
+  handleWebhook(payload: unknown, signature?: string): Promise<{ providerRef: string; status: 'confirmed' | 'failed' | 'ignored' | 'refunded' }>;
 }
 
 // Used in production when no payment provider is configured. Every call fails
@@ -60,30 +61,36 @@ export class UnavailablePaymentProvider implements PaymentProvider {
   async refundPayment(): Promise<{ refunded: boolean }> {
     return this.fail();
   }
-  async handleWebhook(): Promise<{ providerRef: string; status: 'confirmed' | 'failed' }> {
+  async handleWebhook(): Promise<{ providerRef: string; status: 'confirmed' | 'failed' | 'ignored' | 'refunded' }> {
     return this.fail();
   }
 }
 
 export class MockPaymentProvider implements PaymentProvider {
+  private readonly payments = new Map<string, { amountMinor: number; currencyCode: string }>();
+
   async createPayment(params: { amountMinor: number; currencyCode: string; userId: string; idempotencyKey: string }) {
-    return { providerRef: `mock_${params.idempotencyKey}` };
+    const providerRef = `mock_${params.idempotencyKey}`;
+    this.payments.set(providerRef, { amountMinor: params.amountMinor, currencyCode: params.currencyCode });
+    return { providerRef };
   }
 
   async verifyPayment(providerRef: string): Promise<VerifyPaymentResult> {
-    // Dev-only stand-in: always reports success. Replace before touching
-    // real money — this exists so the coin-purchase flow is exercisable
-    // end-to-end without a live payment provider account.
-    return { verified: true, amountMinor: 0, currencyCode: 'NGN' };
+    // Dev-only stand-in: mirrors the amount/currency originally initialized
+    // for this reference so the same production validation can be exercised
+    // locally. It must never be wired into a real-money production deployment.
+    const payment = this.payments.get(providerRef);
+    if (!payment) return { verified: false, amountMinor: 0, currencyCode: '' };
+    return { verified: true, ...payment };
   }
 
   async refundPayment(providerRef: string) {
     return { refunded: true };
   }
 
-  // Dev-only stand-in: always "verifies" successfully, providing NO real
-  // security — consistent with verifyPayment() above, which also always
-  // reports success. This was originally left unimplemented on the theory
+  // Dev-only stand-in: accepts the mock reference only when it was created
+  // by this provider instance. It provides NO real payment security and must
+  // never be used for real money. This was originally left unimplemented on the theory
   // that a rejected mock webhook was "the thing to look at, not a bug to
   // route around" — that was wrong in practice: it silently blocked the
   // entire mock purchase flow from being testable at all, which defeats
@@ -97,6 +104,7 @@ export class MockPaymentProvider implements PaymentProvider {
   }
 
   async handleWebhook(payload: any) {
-    return { providerRef: payload?.providerRef ?? 'unknown', status: 'confirmed' as const };
+    if (!payload?.providerRef) return { providerRef: '', status: 'ignored' as const };
+    return { providerRef: String(payload.providerRef), status: 'confirmed' as const };
   }
 }

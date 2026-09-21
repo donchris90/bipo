@@ -65,6 +65,12 @@ model RegionalConfig {
   gamesEnabled    Boolean  @default(false)
   paymentsEnabled Boolean  @default(false)
   active          Boolean  @default(false)
+  // Country-level economy controls.
+  creatorEarningMinorPer100Coins Int?
+  coinUsdCentsPer100 Int?
+  // Server-controlled C2C fiat quote in the country currency per 100 coins.
+  c2cFiatMinorPer100Coins Int?
+  paymentMethods Json?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 }
@@ -334,7 +340,7 @@ model CoinPurchase {
   userId         String
   packageId      String
   provider       String
-  providerRef    String?
+  providerRef    String?        @unique
   amountMinor    Int
   currencyCode   String
   coinAmount     Int
@@ -364,7 +370,7 @@ model Gift {
 model Chargeback {
   id             String   @id @default(uuid())
   userId         String
-  coinPurchaseId String?
+  coinPurchaseId String? @unique
   amountMinor    Int
   currencyCode   String
   coinAmount     Int
@@ -393,6 +399,17 @@ model GiftTransaction {
   context        ChatContext?
   contextId      String?
   pkBattleId     String?
+  // Immutable money snapshot captured when the gift is settled. These are
+  // nullable only for legacy GiftTransaction rows created before the audit
+  // snapshot fields existed. New gifts always populate them.
+  creatorShareCoins     Int?
+  platformShareCoins    Int?
+  agencyShareCoins      Int?
+  creatorShareBps        Int?
+  platformShareBps       Int?
+  agencyCommissionBps   Int?
+  agencyId              String?
+  agencyOwnerId         String?
   idempotencyKey String       @unique
   createdAt      DateTime     @default(now())
 
@@ -479,6 +496,11 @@ model PayoutConfig {
   feeFlatMinor       Int      @default(0)
   // Whether a person must have passed identity verification to withdraw.
   requireKyc         Boolean  @default(true)
+  maxDailyWithdrawalCoins Int?
+  maxMonthlyWithdrawalCoins Int?
+  manualReviewAboveCoins Int?
+  cooldownHours Int @default(0)
+  allowedProviders Json?
   updatedAt          DateTime @updatedAt
   updatedBy          String?
 }
@@ -513,7 +535,7 @@ model WithdrawalRequest {
   status         WithdrawalStatus @default(PENDING_REVIEW)
   riskFlags      Json?
   payoutProvider String?
-  providerRef    String?
+  providerRef    String?        @unique
   idempotencyKey String           @unique
   requestedAt    DateTime         @default(now())
   decidedAt      DateTime?
@@ -530,6 +552,46 @@ model WithdrawalRequest {
   @@index([creatorId])
   @@index([creatorId, requestedAt])
   @@index([status])
+}
+
+
+model C2COrder {
+  id                String        @id @default(uuid())
+  buyerId           String
+  sellerId          String
+  coinAmount        Int
+  fiatAmountMinor   Int
+  currencyCode      String
+  status            C2COrderStatus @default(OPEN)
+  paymentReference  String?
+  paymentProofUrl   String?
+  paymentProofNote  String?
+  disputeReason     String?
+  adminNote         String?
+  expiresAt         DateTime
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  acceptedAt        DateTime?
+  paidAt            DateTime?
+  releasedAt        DateTime?
+  cancelledAt       DateTime?
+  disputedAt        DateTime?
+  resolvedAt        DateTime?
+
+  @@index([buyerId, status])
+  @@index([sellerId, status])
+  @@index([status, expiresAt])
+}
+
+enum C2COrderStatus {
+  OPEN
+  ACCEPTED
+  PAYMENT_SUBMITTED
+  RELEASED
+  CANCELLED
+  DISPUTED
+  REFUNDED
+  EXPIRED
 }
 
 model Agency {
@@ -729,6 +791,8 @@ enum ModerationActionType {
   REMOVE_MODERATOR
   LOCK_ROOM
   UNLOCK_ROOM
+  LOCK_SEAT
+  UNLOCK_SEAT
 }
 
 enum WalletType {
@@ -752,6 +816,9 @@ enum LedgerEntryType {
   ADJUSTMENT
   AGENCY_COMMISSION
   PK_SCORE
+  C2C_ESCROW
+  C2C_RELEASE
+  C2C_REFUND
 }
 
 enum PurchaseStatus {
@@ -830,6 +897,7 @@ enum WithdrawalStatus {
   PROCESSING
   PAID
   FAILED
+  REVERSED
   REJECTED
 }
 

@@ -362,3 +362,20 @@ This is ongoing rather than a discrete phase — see the roadmap doc. The
 regional-config schema decision from Phase 0 is already in place; what's
 left is adding more countries/currencies/languages as they're cleared, plus
 the AI live-translation differentiator (post-MVP).
+
+## Global country economy configuration
+
+Ryda is country-configurable rather than Nigeria-only. The seed now contains all 249 ISO alpha-2 countries/territories represented by the bundled country dataset. Countries are inactive by default except Nigeria (the initial launch market).
+
+Each country has independent controls in **Admin → Settings → Countries & regional economy**:
+
+- activation / registration availability
+- games and payments switches
+- currency
+- creator earning reference rate (minor units per 100 coins)
+- USD reference value for 100 coins
+- payment rails: `PAYSTACK`, `CRYPTO`, `C2C`
+
+Coin packages remain country-specific, and withdrawal conversion/limits/fees remain in `PayoutConfig`, so customer coin pricing and creator cash-out rules can differ by country.
+
+Nigeria is seeded with Paystack + C2C; other countries are seeded with Crypto + C2C. Crypto and C2C are surfaced as configured rails but remain unavailable in the purchase flow until their real transaction/escrow providers are connected. This prevents the app from pretending a payment succeeded without a real settlement mechanism.

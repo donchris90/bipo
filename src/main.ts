@@ -68,7 +68,6 @@ async function bootstrap() {
     app.set('trust proxy', /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy);
   }
 
-  app.enableCors(); // tighten to an explicit allowlist before production
 
   const port = process.env.PORT ?? 3000;
   await app.listen(port);

@@ -169,6 +169,10 @@ export class LiveService {
       where: { status: 'LIVE' },
       orderBy: { startedAt: 'desc' },
       take: 50,
+      select: {
+        id: true, hostId: true, title: true, category: true, coverUrl: true,
+        themeColor: true, status: true, startedAt: true, endedAt: true, durationSeconds: true,
+      },
     });
   }
 

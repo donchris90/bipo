@@ -22,6 +22,21 @@ export function computeGiftSplit(
   split: ResolvedSplit,
   agencyCommissionBps = 0,
 ): { creatorShare: number; platformShare: number; agencyShare: number } {
+  if (!Number.isInteger(coinAmount) || coinAmount <= 0) throw new Error('Gift coin amount must be a positive integer');
+  if (!Number.isInteger(agencyCommissionBps) || agencyCommissionBps < 0 || agencyCommissionBps > 10_000) {
+    throw new Error('Agency commission must be between 0 and 10000 bps');
+  }
+  if (
+    !Number.isInteger(split.creatorShareBps) ||
+    !Number.isInteger(split.platformShareBps) ||
+    split.creatorShareBps < 0 ||
+    split.platformShareBps < 0 ||
+    split.creatorShareBps > 10_000 ||
+    split.platformShareBps > 10_000 ||
+    split.creatorShareBps + split.platformShareBps !== 10_000
+  ) {
+    throw new Error('Creator and platform shares must total 100%');
+  }
   const totalCreatorPool = Math.floor((coinAmount * split.creatorShareBps) / 10000);
   const platformShare = coinAmount - totalCreatorPool; // remainder to platform — avoids rounding leaks from splitting 3 ways with floor()
   const agencyShare = agencyCommissionBps > 0 ? Math.floor((totalCreatorPool * agencyCommissionBps) / 10000) : 0;
@@ -131,6 +146,7 @@ export class GiftService {
   }
 
   async send(params: SendGiftParams) {
+    this.validateIdempotencyKey(params.idempotencyKey);
     if (params.senderId === params.recipientId) {
       throw new BadRequestException('Cannot send a gift to yourself');
     }
@@ -237,6 +253,14 @@ export class GiftService {
           context: params.context,
           contextId: params.contextId,
           pkBattleId: params.pkBattleId,
+          creatorShareCoins: creatorShare,
+          platformShareCoins: platformShare,
+          agencyShareCoins: agencyShare,
+          creatorShareBps: split.creatorShareBps,
+          platformShareBps: split.platformShareBps,
+          agencyCommissionBps: membership?.commissionBps ?? 0,
+          agencyId: agency?.id ?? null,
+          agencyOwnerId: agency?.ownerId ?? null,
           idempotencyKey: params.idempotencyKey,
         },
       });
@@ -263,6 +287,12 @@ export class GiftService {
     // in the controller/gateway layer, which has access to the Socket.IO
     // server instance — this service stays transport-agnostic.
     return transaction;
+  }
+
+  private validateIdempotencyKey(key: string) {
+    if (typeof key !== 'string' || key.length < 16 || key.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(key)) {
+      throw new BadRequestException('Invalid idempotency key');
+    }
   }
 
   private async applyPkScore(pkBattleId: string, senderId: string, coinAmount: number) {

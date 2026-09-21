@@ -22,7 +22,7 @@ describe('GiftService', () => {
   }
 
   it('debits the sender, credits the recipient their share, and records the platform share (default 70/30 fallback)', async () => {
-    const { wallet, gifts } = makeService();
+    const { prisma, wallet, gifts } = makeService();
     await wallet.credit({
       userId: 'sender',
       walletType: WalletType.COIN,
@@ -31,16 +31,26 @@ describe('GiftService', () => {
       idempotencyKey: 'seed',
     });
 
-    await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-1' });
+    await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-key-000000000001' });
 
     expect(await wallet.getBalance('sender', WalletType.COIN)).toBe(0n);
     expect(await wallet.getBalance('recipient', WalletType.CREATOR_EARNINGS)).toBe(70n);
+    const tx = prisma.giftTransactions.get('gift-key-000000000001');
+    expect(tx).toMatchObject({
+      coinAmount: 100,
+      creatorShareCoins: 70,
+      platformShareCoins: 30,
+      agencyShareCoins: 0,
+      creatorShareBps: 7000,
+      platformShareBps: 3000,
+      agencyCommissionBps: 0,
+    });
   });
 
   it('rejects sending a gift to yourself', async () => {
     const { gifts } = makeService();
     await expect(
-      gifts.send({ senderId: 'sender', recipientId: 'sender', giftId: 'rose', idempotencyKey: 'gift-2' }),
+      gifts.send({ senderId: 'sender', recipientId: 'sender', giftId: 'rose', idempotencyKey: 'gift-key-000000000002' }),
     ).rejects.toThrow('Cannot send a gift to yourself');
   });
 
@@ -48,13 +58,13 @@ describe('GiftService', () => {
     const { prisma, gifts } = makeService();
     // sender has 0 coins — no credit() call
     await expect(
-      gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-3' }),
+      gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-key-000000000003' }),
     ).rejects.toThrow('Insufficient balance');
-    expect(prisma.giftTransactions.get('gift-3')).toBeUndefined();
+    expect(prisma.giftTransactions.get('gift-key-000000000003')).toBeUndefined();
   });
 
   it('is idempotent: retrying the same key does not double-charge the sender', async () => {
-    const { wallet, gifts } = makeService();
+    const { prisma, wallet, gifts } = makeService();
     await wallet.credit({
       userId: 'sender',
       walletType: WalletType.COIN,
@@ -63,8 +73,8 @@ describe('GiftService', () => {
       idempotencyKey: 'seed',
     });
 
-    const first = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-4' });
-    const second = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-4' });
+    const first = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-key-000000000004' });
+    const second = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-key-000000000004' });
 
     expect(second).toEqual(first);
     expect(await wallet.getBalance('sender', WalletType.COIN)).toBe(0n); // spent once, not twice
@@ -74,10 +84,10 @@ describe('GiftService', () => {
     const { prisma, gifts } = makeService();
     prisma.gifts.set('retired', { id: 'retired', coinPrice: 50, active: false });
     await expect(
-      gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'retired', idempotencyKey: 'gift-5' }),
+      gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'retired', idempotencyKey: 'gift-key-000000000005' }),
     ).rejects.toThrow('Gift not available');
     await expect(
-      gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'does-not-exist', idempotencyKey: 'gift-6' }),
+      gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'does-not-exist', idempotencyKey: 'gift-key-000000000006' }),
     ).rejects.toThrow('Gift not available');
   });
 
@@ -98,7 +108,7 @@ describe('GiftService', () => {
       idempotencyKey: 'seed',
     });
 
-    await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-7' });
+    await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-key-000000000007' });
 
     // 100 coins, 70% creator pool = 70. 20% agency commission of that pool = 14.
     expect(await wallet.getBalance('recipient', WalletType.CREATOR_EARNINGS)).toBe(56n);
@@ -117,7 +127,7 @@ describe('gifts do not create notifications', () => {
     prisma.gifts.set('rose', { id: 'rose', coinPrice: 100, active: true });
     await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
-    await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'g-1' });
+    await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'gift-key-notify-0001' });
 
     expect(notifications.notifyGift).not.toHaveBeenCalled();
     expect(notifications.notify).not.toHaveBeenCalled();

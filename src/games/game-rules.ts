@@ -9,7 +9,7 @@ export type GameRules = Record<string, number | null>;
 
 const SHARED = ['openSeconds', 'minStake', 'maxStake'] as const;
 const SHAPES = {
-  dice: ['payoutMultiplier', 'diceCount', 'diceSides', ...SHARED],
+  dice: ['payoutMultiplier', 'diceCount', 'diceSides', 'numberPayouts', ...SHARED],
   crash: ['houseEdge', 'growthRate', ...SHARED],
   lucky: ['payoutMultiplier', ...SHARED],
 } as const;
@@ -38,6 +38,18 @@ export function maxSumProbability(dice: number, sides: number): number {
 }
 
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+function sumProbabilities(dice: number, sides: number): Map<number, number> {
+  let dist = new Map<number, number>([[0, 1]]);
+  for (let i = 0; i < dice; i++) {
+    const next = new Map<number, number>();
+    for (const [sum, ways] of dist) for (let face = 0; face < sides; face++) next.set(sum + face, (next.get(sum + face) ?? 0) + ways);
+    dist = next;
+  }
+  const total = sides ** dice;
+  return new Map([...dist.entries()].map(([n, ways]) => [n, ways / total]));
+}
+
 const isInt = (v: unknown, min: number, max: number): v is number => isNum(v) && Number.isInteger(v) && v >= min && v <= max;
 
 export function validateGameRules(existing: any, incoming: any): GameRules {
@@ -75,6 +87,24 @@ export function validateGameRules(existing: any, incoming: any): GameRules {
     out.payoutMultiplier = incoming.payoutMultiplier;
     out.diceCount = incoming.diceCount;
     out.diceSides = incoming.diceSides;
+    if (incoming.numberPayouts !== undefined) {
+      if (!incoming.numberPayouts || typeof incoming.numberPayouts !== 'object' || Array.isArray(incoming.numberPayouts)) {
+        errors.push('numberPayouts must be an object mapping each winning number to a multiplier');
+      } else if (!errors.length) {
+        const max = incoming.diceCount * (incoming.diceSides - 1);
+        const probabilities = sumProbabilities(incoming.diceCount, incoming.diceSides);
+        const clean: Record<string, number> = {};
+        for (let n = 0; n <= max; n++) {
+          const raw = incoming.numberPayouts[String(n)];
+          if (!isNum(raw) || raw < 0 || raw > 1000) { errors.push(`numberPayouts[${n}] must be a number from 0 to 1000`); continue; }
+          const p = probabilities.get(n) ?? 0;
+          if (raw > 0 && p > 0 && raw * p >= 1) { errors.push(`numberPayouts[${n}] is too high for its probability`); continue; }
+          clean[String(n)] = raw;
+        }
+        if (Object.keys(incoming.numberPayouts).some((k) => !/^\d+$/.test(k) || Number(k) < 0 || Number(k) > max)) errors.push(`numberPayouts may only contain numbers 0-${max}`);
+        if (!errors.length) out.numberPayouts = clean as any;
+      }
+    }
   } else if (shape === 'crash') {
     if (!isNum(incoming.houseEdge) || incoming.houseEdge < 0.005 || incoming.houseEdge > 0.2) errors.push('houseEdge must be a number from 0.005 (0.5%) to 0.2 (20%)');
     if (!isNum(incoming.growthRate) || incoming.growthRate < 0.01 || incoming.growthRate > 1) errors.push('growthRate must be a number from 0.01 to 1');

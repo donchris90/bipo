@@ -137,6 +137,7 @@ export class RoomsService {
   async joinToken(roomId: string, userId: string) {
     const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
     if (!room) throw new NotFoundException('Room not found');
+    if (room.status !== 'OPEN') throw new NotFoundException('Room is closed');
     if (await this.moderation.isBanned('ROOM', roomId, userId)) {
       throw new ForbiddenException('You are banned from this room');
     }
@@ -181,20 +182,19 @@ export class RoomsService {
       return this.assignSeat(roomId, userId, seatNumber);
     }
 
-    if (room.privacy === 'PRIVATE' || room.privacy === 'INVITE_ONLY') {
-      // Both privacy levels use the same request→approve flow here; the
-      // spec distinguishes them (INVITE_ONLY implies only pre-invited users
-      // can request at all), but there's no invite-list concept to check
-      // against yet — see inviteToSeat() below for the host-initiated half
-      // of that, which is the part that's actually built. A user calling
-      // this directly on an INVITE_ONLY room creates a normal pending
-      // request rather than being blocked outright; tightening that is the
-      // natural next increment once an actual invite list matters.
+    if (room.privacy === 'INVITE_ONLY') {
+      const invite = await this.prisma.seatRequest.findFirst({
+        where: { roomId, userId, status: 'PENDING', invitedByHost: true },
+      });
+      if (!invite) throw new ForbiddenException('You must be invited to take a seat in this room');
+      return invite;
+    }
+
+    if (room.privacy === 'PRIVATE') {
       const existingPending = await this.prisma.seatRequest.findFirst({
-        where: { roomId, userId, status: 'PENDING' },
+        where: { roomId, userId, status: 'PENDING', invitedByHost: false },
       });
       if (existingPending) return existingPending;
-
       return this.prisma.seatRequest.create({ data: { roomId, userId, invitedByHost: false } });
     }
 
@@ -233,10 +233,11 @@ export class RoomsService {
 
   // Host-initiated half of the INVITE_ONLY flow — the host (or a
   // moderator) creates a pending invite for a specific user, who then
-  // accepts it via acceptInvite(). This is what actually makes
-  // INVITE_ONLY behave differently from PRIVATE right now.
+  // accepts it via acceptInvite(). INVITE_ONLY users cannot create a
+  // normal seat request; only a host-created invite can be accepted.
   async inviteToSeat(roomId: string, actorId: string, targetUserId: string) {
-    await this.assertHostOrModerator(roomId, actorId);
+    const room = await this.assertHostOrModerator(roomId, actorId);
+    if (room.status !== 'OPEN') throw new BadRequestException('Room is closed');
     if (await this.moderation.isBanned('ROOM', roomId, targetUserId)) {
       throw new BadRequestException('Cannot invite a banned user');
     }
@@ -251,17 +252,40 @@ export class RoomsService {
   }
 
   async acceptInvite(roomId: string, userId: string, seatNumber: number) {
-    const invite = await this.prisma.seatRequest.findFirst({
-      where: { roomId, userId, status: 'PENDING', invitedByHost: true },
-    });
-    if (!invite) throw new NotFoundException('No pending invite for you in this room');
+    return this.prisma.$transaction(async (tx) => {
+      const room = await tx.partyRoom.findUnique({ where: { id: roomId } });
+      if (!room || room.status !== 'OPEN') throw new NotFoundException('Room not open');
+      if (room.locked) throw new BadRequestException('Room is locked');
+      if (!Number.isInteger(seatNumber) || seatNumber < 0 || seatNumber >= room.seatCount) {
+        throw new BadRequestException('Invalid seat number');
+      }
+      if (await this.moderation.isBanned('ROOM', roomId, userId)) {
+        throw new ForbiddenException('You are banned from this room');
+      }
 
-    const seat = await this.assignSeat(roomId, userId, seatNumber);
-    await this.prisma.seatRequest.update({
-      where: { id: invite.id },
-      data: { status: 'APPROVED', decidedAt: new Date() },
+      const invite = await tx.seatRequest.findFirst({
+        where: { roomId, userId, status: 'PENDING', invitedByHost: true },
+      });
+      if (!invite) throw new NotFoundException('No pending invite for you in this room');
+
+      const lockedSeat = await tx.roomSeatLock.findUnique({
+        where: { roomId_seatNumber: { roomId, seatNumber } },
+      });
+      if (lockedSeat) throw new ForbiddenException('This seat is locked by the host');
+
+      let seat;
+      try {
+        seat = await tx.roomSeat.create({ data: { roomId, userId, seatNumber } });
+      } catch {
+        throw new BadRequestException('Seat already taken or you already hold a seat in this room');
+      }
+
+      await tx.seatRequest.update({
+        where: { id: invite.id },
+        data: { status: 'APPROVED', decidedAt: new Date() },
+      });
+      return seat;
     });
-    return seat;
   }
 
   async listSeatRequests(roomId: string, actorId: string) {
@@ -293,25 +317,42 @@ export class RoomsService {
 
   async approveSeatRequest(roomId: string, actorId: string, requestId: string, seatNumber: number) {
     const room = await this.assertHostOrModerator(roomId, actorId);
-    const request = await this.prisma.seatRequest.findUnique({ where: { id: requestId } });
-    if (!request || request.roomId !== roomId || request.status !== 'PENDING') {
-      throw new NotFoundException('No such pending request');
-    }
+    const result = await this.prisma.$transaction(async (tx) => {
+      const currentRoom = await tx.partyRoom.findUnique({ where: { id: roomId } });
+      if (!currentRoom || currentRoom.status !== 'OPEN') throw new NotFoundException('Room not open');
+      if (!Number.isInteger(seatNumber) || seatNumber < 0 || seatNumber >= currentRoom.seatCount) {
+        throw new BadRequestException('Invalid seat number');
+      }
+      const lockedSeat = await tx.roomSeatLock.findUnique({
+        where: { roomId_seatNumber: { roomId, seatNumber } },
+      });
+      if (lockedSeat) throw new ForbiddenException('This seat is locked by the host');
 
-    const seat = await this.assignSeat(roomId, request.userId, seatNumber);
-    await this.prisma.seatRequest.update({
-      where: { id: requestId },
-      data: { status: 'APPROVED', decidedAt: new Date() },
+      const request = await tx.seatRequest.findUnique({ where: { id: requestId } });
+      if (!request || request.roomId !== roomId || request.status !== 'PENDING' || request.invitedByHost) {
+        throw new NotFoundException('No such pending request');
+      }
+
+      let seat;
+      try {
+        seat = await tx.roomSeat.create({ data: { roomId, userId: request.userId, seatNumber } });
+      } catch {
+        throw new BadRequestException('Seat already taken or this user already holds a seat in the room');
+      }
+
+      await tx.seatRequest.update({
+        where: { id: requestId },
+        data: { status: 'APPROVED', decidedAt: new Date() },
+      });
+      return { seat, userId: request.userId, roomTitle: currentRoom.title };
     });
 
-    // The requester may have left the room screen while waiting — this is
-    // how they find out they got the seat.
-    await this.notifications.notifyOnce(request.userId, 'SEAT_APPROVED', `seat:${requestId}`, {
+    await this.notifications.notifyOnce(result.userId, 'SEAT_APPROVED', `seat:${requestId}`, {
       roomId,
-      roomTitle: room.title,
+      roomTitle: result.roomTitle,
       seatNumber,
     });
-    return seat;
+    return result.seat;
   }
 
   async rejectSeatRequest(roomId: string, actorId: string, requestId: string) {
@@ -327,8 +368,20 @@ export class RoomsService {
   }
 
   async leaveSeat(roomId: string, userId: string) {
+    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { id: true, hostId: true, status: true, providerChannel: true } });
+    if (!room) throw new NotFoundException('Room not found');
+    if (room.status !== 'OPEN') return { left: false, closed: true };
+
+    // The host is the room owner. Removing the host seat would leave an OPEN
+    // room with no publisher and forces clients to guess whether the room is
+    // still usable. Host departure is therefore an explicit room close.
+    if (room.hostId === userId) {
+      await this.finishClose({ id: room.id, providerChannel: room.providerChannel, status: room.status });
+      return { left: true, closed: true };
+    }
+
     await this.prisma.roomSeat.deleteMany({ where: { roomId, userId } });
-    return { left: true };
+    return { left: true, closed: false };
   }
 
   // Separate from rejectSeatRequest on purpose — that one requires
@@ -393,11 +446,23 @@ export class RoomsService {
   // repeated call (or the sweeper racing the host) can't rewrite the close time.
   private async finishClose(room: { id: string; providerChannel: string; status: string }) {
     if (room.status === 'CLOSED') return this.prisma.partyRoom.findUniqueOrThrow({ where: { id: room.id } });
-    await this.rtc.destroyChannel(room.providerChannel);
-    return this.prisma.partyRoom.update({
-      where: { id: room.id },
+
+    // Atomically claim the close so a host tap, navigation cleanup and the
+    // abandoned-room reaper cannot all try to destroy the same RTC channel.
+    const claimed = await this.prisma.partyRoom.updateMany({
+      where: { id: room.id, status: 'OPEN' },
       data: { status: 'CLOSED', closedAt: new Date() },
     });
+    if (claimed.count === 0) return this.prisma.partyRoom.findUniqueOrThrow({ where: { id: room.id } });
+
+    try {
+      await this.rtc.destroyChannel(room.providerChannel);
+    } catch {
+      // The database remains the source of truth. RTC providers should make
+      // channel destruction idempotent; a transient provider failure must not
+      // resurrect an already-closed room.
+    }
+    return this.prisma.partyRoom.findUniqueOrThrow({ where: { id: room.id } });
   }
 
   async muteGuest(roomId: string, actorId: string, targetUserId: string) {
@@ -460,7 +525,16 @@ export class RoomsService {
   }
 
   listOpen() {
-    return this.prisma.partyRoom.findMany({ where: { status: 'OPEN' }, orderBy: { createdAt: 'desc' }, take: 50 });
+    return this.prisma.partyRoom.findMany({
+      where: { status: 'OPEN' },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      select: {
+        id: true, hostId: true, title: true, privacy: true, seatCount: true,
+        locked: true, status: true, countryCode: true, createdAt: true,
+        category: true, themeColor: true, mode: true,
+      },
+    });
   }
 
   // The audit row is the source of truth; the push is best-effort and must
@@ -480,7 +554,7 @@ export class RoomsService {
 
   private async logModeration(
     actorId: string,
-    actionType: 'KICK' | 'ADD_MODERATOR' | 'LOCK_ROOM' | 'UNLOCK_ROOM' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
+    actionType: 'KICK' | 'ADD_MODERATOR' | 'LOCK_ROOM' | 'UNLOCK_ROOM' | 'LOCK_SEAT' | 'UNLOCK_SEAT' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
     roomId: string,
     targetUserId?: string,
   ) {

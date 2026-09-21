@@ -1,10 +1,21 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { createHash } from 'crypto';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../prisma/prisma.service';
 import { verifyPaystackSignature } from './paystack-signature';
 import type { PaymentProvider, CreatePaymentResult, VerifyPaymentResult } from './payment-provider.interface';
 
 const PAYSTACK_BASE_URL = 'https://api.paystack.co';
+
+export function toPaystackPaymentReference(idempotencyKey: string): string {
+  // The previous implementation truncated a cleaned idempotency key. Two
+  // distinct long keys could therefore collapse to the same Paystack
+  // reference. Keep the reference deterministic but derive it from the full
+  // key so retries are stable and long keys remain distinct.
+  const digest = createHash('sha256').update(idempotencyKey).digest('hex');
+  return `coin_${digest.slice(0, 44)}`; // 5 + 44 = 49 chars, within Paystack's limit.
+}
+
 
 // NOT verified against Paystack's live API in this environment — the
 // sandbox this was built in cannot reach api.paystack.co at all (only a
@@ -44,7 +55,7 @@ export class PaystackPaymentProvider implements PaymentProvider {
     // transaction — reusing our own idempotencyKey directly means there's
     // only ever one identifier to reconcile, not two independent ones that
     // could drift apart.
-    const reference = params.idempotencyKey;
+    const reference = toPaystackPaymentReference(params.idempotencyKey);
 
     const response = await fetch(`${PAYSTACK_BASE_URL}/transaction/initialize`, {
       method: 'POST',
@@ -89,8 +100,9 @@ export class PaystackPaymentProvider implements PaymentProvider {
 
     return {
       verified: body.data.status === 'success',
-      amountMinor: body.data.amount,
-      currencyCode: body.data.currency,
+      amountMinor: Number(body.data.amount ?? 0),
+      currencyCode: String(body.data.currency ?? ''),
+      status: String(body.data.status ?? 'unknown') as any,
     };
   }
 
@@ -117,14 +129,17 @@ export class PaystackPaymentProvider implements PaymentProvider {
     return verifyPaystackSignature(rawBody, signature, this.secretKey);
   }
 
-  async handleWebhook(payload: any): Promise<{ providerRef: string; status: 'confirmed' | 'failed' }> {
+  async handleWebhook(payload: any): Promise<{ providerRef: string; status: 'confirmed' | 'failed' | 'ignored' | 'refunded' }> {
     // Paystack's event types: charge.success is the one that matters for
     // coin purchases. Others (transfer.success, refund.processed, etc.)
     // exist but aren't handled here — this method is only ever reached
     // after the caller has already verified the signature and decided
     // this looks like a purchase-confirmation event.
+    const event = payload?.event;
     const reference = payload?.data?.reference;
-    const status = payload?.event === 'charge.success' ? 'confirmed' : 'failed';
-    return { providerRef: reference, status };
+    if (!reference) return { providerRef: '', status: 'ignored' };
+    if (event === 'charge.success') return { providerRef: String(reference), status: 'confirmed' };
+    if (event === 'charge.failed') return { providerRef: String(reference), status: 'failed' };
+    return { providerRef: String(reference), status: 'ignored' };
   }
 }

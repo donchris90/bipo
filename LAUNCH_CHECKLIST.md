@@ -94,3 +94,10 @@ in this environment specifically.
   design claim, not a load-test result.
 - No BullMQ job failure/retry tuning (jobs currently throw and log rather
   than following a defined retry policy).
+
+## Global economy controls added in v5
+
+- Coin packages are now editable per country from Admin → Coin packages.
+- Withdrawal rules now support per-country daily/monthly limits, manual-review thresholds, cooldown hours and allowed payout providers.
+- Lucky Number / Sum Dice supports optional per-number payout multipliers (0–27 for the default 3d10 game), validated server-side against number probability.
+- Country payment rails remain configurable per country (Nigeria can use Paystack/C2C; other countries can use Crypto/C2C), while actual Crypto/C2C settlement remains disabled until a real provider/escrow implementation is connected.

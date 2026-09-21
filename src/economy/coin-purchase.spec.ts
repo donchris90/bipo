@@ -3,40 +3,10 @@ import { CoinPurchaseController } from './economy.controller';
 import { CoinPurchaseService } from './coin-purchase.service';
 import { MockPaymentProvider, UnavailablePaymentProvider } from './providers/payment-provider.interface';
 
-class PaystackPaymentProvider {
-  async createPayment() { return { providerRef: 'ref_1', redirectUrl: 'https://checkout.paystack.com/abc' }; }
-}
-
-function build(provider: any, existing: any = null) {
-  const created: any[] = [];
-  const prisma: any = {
-    coinPackage: { findUnique: jest.fn().mockResolvedValue({ id: 'p1', active: true, priceMinor: 500000, currencyCode: 'NGN', coinAmount: 1000 }) },
-    coinPurchase: {
-      findUnique: jest.fn().mockResolvedValue(existing),
-      create: jest.fn(async ({ data }: any) => { created.push(data); return { id: 'buy1', ...data }; }),
-    },
-  };
-  return { svc: new CoinPurchaseService(prisma, {} as any, provider, {} as any), prisma, created };
-}
-
-describe('CoinPurchaseService.initiate', () => {
-  it("keeps the provider's payment page URL so the app can send the person to pay", async () => {
-    const { svc, created } = build(new PaystackPaymentProvider());
-    const purchase: any = await svc.initiate('u1', 'p1', 'key-1');
-    expect(purchase.checkoutUrl).toBe('https://checkout.paystack.com/abc');
-    expect(created[0]).toMatchObject({ provider: 'paystack', status: 'PENDING', coinAmount: 1000, amountMinor: 500000 });
-  });
-
-  it('a retry with the same key returns the original purchase (and its link) without charging twice', async () => {
-    const existing = { id: 'buy1', checkoutUrl: 'https://checkout.paystack.com/abc', status: 'PENDING' };
-    const { svc, prisma } = build(new PaystackPaymentProvider(), existing);
-    expect(await svc.initiate('u1', 'p1', 'key-1')).toBe(existing);
-    expect(prisma.coinPurchase.create).not.toHaveBeenCalled();
-  });
-});
+// (initiating a purchase is covered end to end in payments-acceptance.spec.ts)
 
 describe('CoinPurchaseService.statusFor', () => {
-  const svc = (row: any) => new CoinPurchaseService({ coinPurchase: { findUnique: jest.fn().mockResolvedValue(row) } } as any, {} as any, {} as any, {} as any);
+  const svc = (row: any) => new CoinPurchaseService({ coinPurchase: { findUnique: jest.fn().mockResolvedValue(row), findUniqueOrThrow: jest.fn().mockResolvedValue(row) } } as any, {} as any, {} as any, {} as any);
 
   it('reports the status of your own purchase', async () => {
     const out = await svc({ id: 'b', userId: 'u1', status: 'CONFIRMED', coinAmount: 1000, confirmedAt: new Date(0) }).statusFor('u1', 'b');
@@ -50,15 +20,27 @@ describe('CoinPurchaseService.statusFor', () => {
 });
 
 describe('payment methods', () => {
-  const methods = (provider: any) => new CoinPurchaseController({} as any, {} as any, provider).paymentMethods();
+  const ALL = { paymentMethods: ['PAYSTACK', 'CRYPTO', 'C2C'] };
+  const methods = async (provider: any, country = 'NG', region: any = ALL) => {
+    const prisma: any = { regionalConfig: { findUnique: jest.fn().mockResolvedValue(region) } };
+    const list: any[] = await new CoinPurchaseController({} as any, prisma, provider).paymentMethods({ user: { countryCode: country } } as any);
+    return (id: string) => list.find((m) => m.id === id)!;
+  };
 
-  it('lists Stripe as coming soon and never available', () => {
-    const stripe = methods(new PaystackPaymentProvider()).find((m: any) => m.id === 'STRIPE')!;
-    expect(stripe).toMatchObject({ available: false, comingSoon: true });
+  it('Paystack is available in Nigeria when the country enables it and a real provider is configured', async () => {
+    expect((await methods(new MockPaymentProvider()))('PAYSTACK').available).toBe(true);
   });
 
-  it('Paystack is available when a provider is configured, and not when payments are unavailable', () => {
-    expect(methods(new MockPaymentProvider()).find((m: any) => m.id === 'PAYSTACK')!.available).toBe(true);
-    expect(methods(new UnavailablePaymentProvider()).find((m: any) => m.id === 'PAYSTACK')!.available).toBe(false);
+  it('Paystack is not available when payments are unavailable, in another country, or when the country has not enabled it', async () => {
+    expect((await methods(new UnavailablePaymentProvider()))('PAYSTACK').available).toBe(false);
+    expect((await methods(new MockPaymentProvider(), 'GH'))('PAYSTACK').available).toBe(false);
+    expect((await methods(new MockPaymentProvider(), 'NG', { paymentMethods: ['C2C'] }))('PAYSTACK').available).toBe(false);
+    expect((await methods(new MockPaymentProvider(), 'NG', null))('PAYSTACK').available).toBe(false);
+  });
+
+  it('Crypto and C2C are never offered as working unless a real provider is connected', async () => {
+    const m = await methods(new MockPaymentProvider());
+    expect(m('CRYPTO')).toMatchObject({ available: false, comingSoon: true });
+    expect(m('C2C').available).toBe(false); // there is no automatic payment verification to make it safe
   });
 });

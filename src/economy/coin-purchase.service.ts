@@ -8,6 +8,8 @@ import { WalletType, LedgerEntryType } from '@prisma/client';
 
 export const PAYMENT_PROVIDER = 'PAYMENT_PROVIDER';
 
+const PENDING_REFRESH_AFTER_MS = 10_000;
+
 @Injectable()
 export class CoinPurchaseService {
   constructor(
@@ -17,9 +19,27 @@ export class CoinPurchaseService {
     private readonly notifications: NotificationsService,
   ) {}
 
-  async initiate(userId: string, packageId: string, idempotencyKey: string) {
-    const pkg = await this.prisma.coinPackage.findUnique({ where: { id: packageId } });
+  async initiate(userId: string, packageId: string, idempotencyKey: string, paymentMethod = 'PAYSTACK') {
+    this.validateIdempotencyKey(idempotencyKey);
+    const [pkg, user] = await Promise.all([
+      this.prisma.coinPackage.findUnique({ where: { id: packageId } }),
+      this.prisma.user.findUnique({ where: { id: userId }, select: { countryCode: true } }),
+    ]);
     if (!pkg || !pkg.active) throw new NotFoundException('Coin package not available');
+    if (!user) throw new NotFoundException('User not found');
+    const countryCode = user.countryCode.toUpperCase();
+    if (pkg.countryCode !== countryCode) throw new BadRequestException('That coin package is not available in your country');
+    const region = await this.prisma.regionalConfig.findUnique({ where: { countryCode } });
+    const methods = Array.isArray(region?.paymentMethods) ? region.paymentMethods.map(String) : [];
+    // Paystack is the Nigeria rail in the current rollout. Do not accidentally
+    // expose a Paystack checkout for another country merely because an admin
+    // toggled the generic payment-method flag.
+    if (!region?.active || !region.paymentsEnabled || !methods.includes(paymentMethod.toUpperCase())) {
+      throw new BadRequestException('That payment method is not available in your country');
+    }
+    if (paymentMethod.toUpperCase() === 'PAYSTACK' && countryCode !== 'NG') {
+      throw new BadRequestException('Paystack coin purchases are currently available only in Nigeria');
+    }
 
     const existing = await this.prisma.coinPurchase.findUnique({ where: { idempotencyKey } });
     if (existing) return existing; // idempotent on retry
@@ -29,7 +49,8 @@ export class CoinPurchaseService {
       currencyCode: pkg.currencyCode,
       userId,
       idempotencyKey,
-    });
+      method: paymentMethod.toUpperCase(),
+    } as any);
 
     // The provider's payment page. This used to be thrown away, so there was no
     // way for the app to send anyone to pay — a purchase could be started but
@@ -38,7 +59,7 @@ export class CoinPurchaseService {
       data: {
         userId,
         packageId,
-        provider: this.paymentProvider.constructor.name.toLowerCase().includes('paystack') ? 'paystack' : 'mock',
+        provider: paymentMethod.toUpperCase() === 'CRYPTO' ? 'nowpayments' : 'paystack',
         providerRef: payment.providerRef,
         checkoutUrl: payment.redirectUrl ?? null,
         amountMinor: pkg.priceMinor,
@@ -53,13 +74,48 @@ export class CoinPurchaseService {
   // The app polls this after sending the person to the payment page. It only
   // reports what the (signature-verified) webhook has recorded — nothing here
   // lets a client mark a purchase as paid.
+  private validateIdempotencyKey(key: string) {
+    if (typeof key !== 'string' || key.length < 16 || key.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(key)) {
+      throw new BadRequestException('Invalid idempotency key');
+    }
+  }
+
   async statusFor(userId: string, purchaseId: string) {
     const p = await this.prisma.coinPurchase.findUnique({
       where: { id: purchaseId },
       select: { id: true, userId: true, status: true, coinAmount: true, confirmedAt: true },
     });
     if (!p || p.userId !== userId) throw new NotFoundException('Purchase not found');
-    return { id: p.id, status: p.status, coinAmount: p.coinAmount, confirmedAt: p.confirmedAt };
+
+    // A pending payment can remain pending if a webhook is delayed or lost.
+    // Refresh it from the provider after a short grace period; the provider
+    // response is still server-authoritative and amount/currency are checked
+    // again by confirm(). This gives the client a safe recovery path without
+    // ever accepting a client-reported success.
+    if (p.status === 'PENDING') {
+      const created = await this.prisma.coinPurchase.findUnique({ where: { id: p.id }, select: { createdAt: true } });
+      if (created && Date.now() - created.createdAt.getTime() >= PENDING_REFRESH_AFTER_MS) {
+        try { await this.refreshPending(p.id); } catch { /* keep PENDING on provider/network errors */ }
+      }
+    }
+
+    const latest = await this.prisma.coinPurchase.findUniqueOrThrow({
+      where: { id: purchaseId },
+      select: { id: true, status: true, coinAmount: true, confirmedAt: true },
+    });
+    return latest;
+  }
+
+  private async refreshPending(purchaseId: string) {
+    const purchase = await this.prisma.coinPurchase.findUnique({ where: { id: purchaseId } });
+    if (!purchase || purchase.status !== 'PENDING' || !purchase.providerRef) return purchase;
+    const verification = await this.paymentProvider.verifyPayment(purchase.providerRef);
+    if (verification.verified) return this.confirm(purchase.providerRef);
+    const terminal = ['failed', 'abandoned', 'reversed', 'cancelled', 'canceled', 'expired', 'timeout'];
+    if (terminal.includes(String((verification as any).status ?? '').toLowerCase())) {
+      return this.prisma.coinPurchase.updateMany({ where: { id: purchase.id, status: 'PENDING' }, data: { status: 'FAILED' } });
+    }
+    return purchase;
   }
 
   // Called from the webhook handler, NEVER from a client-reported
@@ -71,8 +127,27 @@ export class CoinPurchaseService {
 
     const verification = await this.paymentProvider.verifyPayment(providerRef);
     if (!verification.verified) {
-      await this.prisma.coinPurchase.update({ where: { id: purchase.id }, data: { status: 'FAILED' } });
-      throw new BadRequestException('Payment could not be verified');
+      const terminal = ['failed', 'abandoned', 'reversed', 'cancelled', 'canceled', 'expired', 'timeout'];
+      if (terminal.includes(String((verification as any).status ?? '').toLowerCase())) {
+        await this.prisma.coinPurchase.updateMany({
+          where: { id: purchase.id, status: 'PENDING' },
+          data: { status: 'FAILED' },
+        });
+      }
+      throw new BadRequestException('Payment is not yet verified');
+    }
+
+    // Never trust a provider confirmation merely because it says "success".
+    // The verified amount and currency must exactly match the purchase we
+    // created. Otherwise a valid payment for a different amount/currency
+    // could accidentally credit the wrong coin package.
+    if (verification.amountMinor !== purchase.amountMinor ||
+        verification.currencyCode.toUpperCase() !== purchase.currencyCode.toUpperCase()) {
+      await this.prisma.coinPurchase.updateMany({
+        where: { id: purchase.id, status: 'PENDING' },
+        data: { status: 'FAILED' },
+      });
+      throw new BadRequestException('Verified payment amount or currency does not match the purchase');
     }
 
     // Credit and the CONFIRMED status update must commit together — same

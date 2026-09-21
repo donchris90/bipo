@@ -1,6 +1,7 @@
 import { PrismaClient, RoleName } from '@prisma/client';
 import * as argon2 from 'argon2';
 import * as crypto from 'crypto';
+import { GLOBAL_COUNTRIES } from '../src/config/countries';
 
 const prisma = new PrismaClient();
 
@@ -11,32 +12,28 @@ async function main() {
   // active as the initial launch market; the rest are seeded inactive so
   // the schema/UI can be exercised against multiple countries without
   // implying they're actually live.
-  const regions: Array<{
-    countryCode: string;
-    countryName: string;
-    currencyCode: string;
-    defaultLanguage: string;
-    active: boolean;
-  }> = [
-    { countryCode: 'NG', countryName: 'Nigeria', currencyCode: 'NGN', defaultLanguage: 'en', active: true },
-    { countryCode: 'GH', countryName: 'Ghana', currencyCode: 'GHS', defaultLanguage: 'en', active: false },
-    { countryCode: 'KE', countryName: 'Kenya', currencyCode: 'KES', defaultLanguage: 'en', active: false },
-    { countryCode: 'ZA', countryName: 'South Africa', currencyCode: 'ZAR', defaultLanguage: 'en', active: false },
-    { countryCode: 'GB', countryName: 'United Kingdom', currencyCode: 'GBP', defaultLanguage: 'en', active: false },
-    { countryCode: 'US', countryName: 'United States', currencyCode: 'USD', defaultLanguage: 'en', active: false },
-    { countryCode: 'IN', countryName: 'India', currencyCode: 'INR', defaultLanguage: 'en', active: false },
-    { countryCode: 'AE', countryName: 'United Arab Emirates', currencyCode: 'AED', defaultLanguage: 'ar', active: false },
-  ];
+  const regions = GLOBAL_COUNTRIES.map((country) => ({
+    ...country,
+    // Nigeria is the initial launch market. Every other country exists in the
+    // database from day one but stays inactive until an admin enables it.
+    active: country.countryCode === 'NG',
+    gamesEnabled: false,
+    paymentsEnabled: country.countryCode === 'NG',
+    paymentMethods: country.countryCode === 'NG' ? ['PAYSTACK', 'C2C'] : ['CRYPTO', 'C2C'],
+  }));
   for (const region of regions) {
     await prisma.regionalConfig.upsert({
       where: { countryCode: region.countryCode },
-      update: {},
-      create: {
-        ...region,
-        minAge: 18,
-        paymentsEnabled: false,
-        gamesEnabled: false,
+      update: {
+        countryName: region.countryName,
+        currencyCode: region.currencyCode,
+        defaultLanguage: region.defaultLanguage,
+        active: region.active,
+        paymentsEnabled: region.paymentsEnabled,
+        gamesEnabled: region.gamesEnabled,
+        paymentMethods: region.paymentMethods,
       },
+      create: { ...region, minAge: 18 },
     });
   }
 
@@ -85,6 +82,7 @@ async function main() {
     create: { id: 'seed-global-pk-score', countryCode: null, coinsPerPoint: 1 },
   });
 
+  // Starter Nigeria package only; all additional country packages are managed from Admin → Coin packages.
   await prisma.coinPackage.upsert({
     where: { id: 'seed-ng-1000' },
     update: {},

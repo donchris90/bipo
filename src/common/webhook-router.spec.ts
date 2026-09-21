@@ -32,7 +32,7 @@ describe('one Paystack URL for both payments and payouts', () => {
 
   const build = () => {
     const router = new WebhookRouterService();
-    const withdrawals: any = { confirmPaid: jest.fn(), confirmFailed: jest.fn() };
+    const withdrawals: any = { confirmPaid: jest.fn(), confirmFailed: jest.fn(), confirmReversed: jest.fn() };
     new PayoutEventsRegistrar(router, withdrawals, paystackProvider).onModuleInit();
     const coinPurchase: any = { confirm: jest.fn() };
     const paymentProvider: any = {
@@ -57,6 +57,9 @@ describe('one Paystack URL for both payments and payouts', () => {
     const payload = { event: 'transfer.failed', data: { transfer_code: 'TRF_2', reason: 'No such account' } };
     await ctl.handle(signed(payload), payload);
     expect(withdrawals.confirmFailed).toHaveBeenCalledWith('TRF_2', 'No such account');
+    const reversed = { event: 'transfer.reversed', data: { transfer_code: 'TRF_3' } };
+    await ctl.handle(signed(reversed), reversed);
+    expect(withdrawals.confirmReversed).toHaveBeenCalledWith('TRF_3', 'The transfer was reversed');
   });
 
   it('payments still work on the same URL', async () => {

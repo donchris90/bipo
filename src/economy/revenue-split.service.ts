@@ -27,14 +27,29 @@ export class RevenueSplitService {
       where: { scope: 'COUNTRY', scopeKey: countryCode, active: true },
       orderBy: { effectiveFrom: 'desc' },
     });
-    if (country) return country;
+    if (country) return this.validate(country);
 
     const global = await this.prisma.revenueSplitConfig.findFirst({
       where: { scope: 'GLOBAL', active: true },
       orderBy: { effectiveFrom: 'desc' },
     });
-    if (global) return global;
+    if (global) return this.validate(global);
 
     return FALLBACK_SPLIT;
+  }
+
+  private validate(split: ResolvedSplit): ResolvedSplit {
+    const values = [split.creatorShareBps, split.platformShareBps, split.agencyShareBps];
+    if (values.some((v) => !Number.isInteger(v) || v < 0 || v > 10_000)) {
+      throw new Error('Invalid revenue split configuration');
+    }
+    // agencyShareBps is retained as configuration metadata for future
+    // program-level rules; GiftService currently applies the agency's
+    // membership commission from the creator pool. The two primary shares
+    // must still account for the entire gift.
+    if (split.creatorShareBps + split.platformShareBps !== 10_000) {
+      throw new Error('Creator and platform shares must total 100%');
+    }
+    return split;
   }
 }

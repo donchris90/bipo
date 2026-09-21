@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createHash } from 'crypto';
 import { verifyPaystackSignature } from '../../economy/providers/paystack-signature';
 import type { PayoutProvider } from './payout-provider.interface';
 
@@ -8,9 +9,12 @@ const PAYSTACK_BASE_URL = 'https://api.paystack.co';
 // Paystack references must be 16-50 chars of lowercase letters, digits, - and _.
 // Ours (a UUID, possibly client-supplied) is normalised to that.
 export function toPaystackReference(idempotencyKey: string): string {
-  const cleaned = idempotencyKey.toLowerCase().replace(/[^a-z0-9_-]/g, '');
-  const ref = `wd_${cleaned}`.slice(0, 50);
-  return ref.length >= 16 ? ref : ref.padEnd(16, '0');
+  // Do not truncate the raw key: two long client keys could otherwise collide
+  // after the 50-character Paystack limit and become the same transfer. A
+  // stable digest gives us a compact, deterministic reference with the same
+  // idempotency identity every time.
+  const digest = createHash('sha256').update(idempotencyKey).digest('hex');
+  return `wd_${digest.slice(0, 47)}`;
 }
 
 // Sends money with Paystack Transfers, written against Paystack's public
@@ -75,7 +79,7 @@ export class PaystackPayoutProvider implements PayoutProvider {
     if (!ref) return null;
     if (event === 'transfer.success') return { providerRef: String(ref), status: 'paid' as const };
     if (event === 'transfer.failed') return { providerRef: String(ref), status: 'failed' as const, reason: String(payload?.data?.reason ?? 'The transfer failed') };
-    if (event === 'transfer.reversed') return { providerRef: String(ref), status: 'failed' as const, reason: 'The transfer was reversed' };
+    if (event === 'transfer.reversed') return { providerRef: String(ref), status: 'reversed' as const, reason: 'The transfer was reversed' };
     return null;
   }
 

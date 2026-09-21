@@ -63,10 +63,14 @@ export class SettlementService {
 
       if (isSumDice) {
         won = isWinningNumber(entry.selection as number[], drawResult.sum!);
+        const selected = entry.selection as number[];
+        const winningMultiplier = rules.numberPayouts && typeof rules.numberPayouts === 'object'
+          ? Number((rules.numberPayouts as Record<string, unknown>)[String(drawResult.sum!) ] ?? 0)
+          : payoutMultiplier;
         rewardAmount = computeSumDiceReward(
           entry.coinAmount,
-          (entry.selection as number[]).length,
-          payoutMultiplier,
+          selected.length,
+          winningMultiplier,
           won,
         );
       } else {

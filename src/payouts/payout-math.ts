@@ -51,6 +51,11 @@ export interface PayoutConfigInput extends PayoutRules {
   enabled: boolean;
   // Must the person have passed identity verification to withdraw? On unless an admin turns it off.
   requireKyc: boolean;
+  maxDailyWithdrawalCoins?: number | null;
+  maxMonthlyWithdrawalCoins?: number | null;
+  manualReviewAboveCoins?: number | null;
+  cooldownHours?: number;
+  allowedProviders?: string[] | null;
 }
 
 // Validates what an admin submits. Returns clean values or throws a 400 that
@@ -60,6 +65,12 @@ export function validatePayoutConfig(raw: any): PayoutConfigInput {
   const errors: string[] = [];
   if (typeof raw.enabled !== 'boolean') errors.push('enabled must be true or false');
   if (raw.requireKyc !== undefined && typeof raw.requireKyc !== 'boolean') errors.push('requireKyc must be true or false');
+  for (const [key, label, max] of [['maxDailyWithdrawalCoins', 'maxDailyWithdrawalCoins', 2_000_000_000], ['maxMonthlyWithdrawalCoins', 'maxMonthlyWithdrawalCoins', 10_000_000_000], ['manualReviewAboveCoins', 'manualReviewAboveCoins', 10_000_000_000]] as const) {
+    const v = raw[key];
+    if (v !== undefined && v !== null && v !== '' && (!Number.isInteger(v) || v < 1 || v > max)) errors.push(`${label} must be empty or a positive whole number`);
+  }
+  if (raw.cooldownHours !== undefined && (!Number.isInteger(raw.cooldownHours) || raw.cooldownHours < 0 || raw.cooldownHours > 168)) errors.push('cooldownHours must be a whole number from 0 to 168');
+  if (raw.allowedProviders !== undefined && raw.allowedProviders !== null && (!Array.isArray(raw.allowedProviders) || raw.allowedProviders.some((v: any) => !['PAYSTACK','CRYPTO','C2C','BANK'].includes(String(v).toUpperCase())))) errors.push('allowedProviders contains an unsupported provider');
   if (!isInt(raw.minorPer100Coins, 1, 100_000_000)) errors.push('minorPer100Coins must be a whole number of at least 1');
   if (!isInt(raw.minWithdrawalCoins, 1, 1_000_000_000)) errors.push('minWithdrawalCoins must be a whole number of at least 1');
   const max = raw.maxWithdrawalCoins === undefined || raw.maxWithdrawalCoins === null || raw.maxWithdrawalCoins === '' ? null : raw.maxWithdrawalCoins;
@@ -77,6 +88,11 @@ export function validatePayoutConfig(raw: any): PayoutConfigInput {
     maxWithdrawalCoins: max,
     feeBps: raw.feeBps ?? 0,
     feeFlatMinor: raw.feeFlatMinor ?? 0,
+    maxDailyWithdrawalCoins: raw.maxDailyWithdrawalCoins == null || raw.maxDailyWithdrawalCoins === '' ? null : raw.maxDailyWithdrawalCoins,
+    maxMonthlyWithdrawalCoins: raw.maxMonthlyWithdrawalCoins == null || raw.maxMonthlyWithdrawalCoins === '' ? null : raw.maxMonthlyWithdrawalCoins,
+    manualReviewAboveCoins: raw.manualReviewAboveCoins == null || raw.manualReviewAboveCoins === '' ? null : raw.manualReviewAboveCoins,
+    cooldownHours: raw.cooldownHours ?? 0,
+    allowedProviders: raw.allowedProviders == null ? null : ([...new Set(raw.allowedProviders.map((v: any) => String(v).toUpperCase()))] as string[]),
   };
   // Catch a configuration that could never pay anyone out.
   if (computePayout(clean.minWithdrawalCoins, clean).netMinor <= 0) {

@@ -31,6 +31,24 @@ export class WalletController {
     ]);
     return { coin: coin.toString(), creatorEarnings: earnings.toString(), bonus: bonus.toString() };
   }
+
+  @Get('transactions')
+  async transactions(
+    @Req() req: AuthedRequest,
+    @Query('walletType') walletType: string | undefined,
+    @Query('limit') limit: string | undefined,
+    @Query('before') before: string | undefined,
+  ) {
+    const type = walletType ? walletType.toUpperCase() as WalletType : WalletType.COIN;
+    if (![WalletType.COIN, WalletType.CREATOR_EARNINGS, WalletType.AGENCY_EARNINGS, WalletType.BONUS].includes(type)) {
+      throw new BadRequestException('Invalid wallet type');
+    }
+    const parsedLimit = limit === undefined ? 50 : Number(limit);
+    if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) {
+      throw new BadRequestException('limit must be an integer between 1 and 100');
+    }
+    return this.wallet.history(req.user.userId, type, parsedLimit, before);
+  }
 }
 
 @Controller('api/v1/coins')
@@ -45,16 +63,14 @@ export class CoinPurchaseController {
   // How coins can be paid for. Paystack (cards, bank transfer, USSD) is the live
   // provider; Stripe is listed as coming soon and cannot be chosen yet.
   @Get('payment-methods')
-  paymentMethods() {
+  async paymentMethods(@Req() req: AuthedRequest) {
+    const region = await this.prisma.regionalConfig.findUnique({ where: { countryCode: req.user.countryCode.toUpperCase() } });
+    const configured = Array.isArray(region?.paymentMethods) ? region.paymentMethods as string[] : [];
+    const has = (id: string) => configured.includes(id);
     return [
-      {
-        id: 'PAYSTACK',
-        name: 'Paystack',
-        description: 'Card, bank transfer or USSD',
-        available: !(this.paymentProvider instanceof UnavailablePaymentProvider),
-        comingSoon: false,
-      },
-      { id: 'STRIPE', name: 'Stripe', description: 'International cards', available: false, comingSoon: true },
+      { id: 'PAYSTACK', name: 'Paystack', description: 'Card, bank transfer or USSD', available: req.user.countryCode.toUpperCase() === 'NG' && has('PAYSTACK') && !(this.paymentProvider instanceof UnavailablePaymentProvider), comingSoon: false },
+      { id: 'CRYPTO', name: 'Crypto', description: 'Pay with supported cryptocurrency', available: has('CRYPTO') && Boolean((this.paymentProvider as any).cryptoConfigured ?? false), comingSoon: !Boolean((this.paymentProvider as any).cryptoConfigured ?? false) && has('CRYPTO') },
+      { id: 'C2C', name: 'C2C', description: 'Peer-to-peer coin purchase', available: false, comingSoon: has('C2C') },
     ];
   }
 
@@ -66,9 +82,10 @@ export class CoinPurchaseController {
   }
 
   @Get('packages')
-  async packages(@Query('countryCode') countryCode: string) {
+  async packages(@Req() req: AuthedRequest) {
+    const countryCode = req.user.countryCode.toUpperCase();
     const rows = await this.prisma.coinPackage.findMany({
-      where: { countryCode: countryCode?.toUpperCase(), active: true },
+      where: { countryCode, active: true },
       orderBy: { coinAmount: 'asc' },
     });
     return rows.map((p) => ({
@@ -89,9 +106,12 @@ export class CoinPurchaseController {
   purchase(
     @Body('packageId') packageId: string,
     @Body('idempotencyKey') idempotencyKey: string,
+    @Body('paymentMethod') paymentMethod: string | undefined,
     @Req() req: AuthedRequest,
   ) {
-    return this.coinPurchase.initiate(req.user.userId, packageId, idempotencyKey ?? uuid());
+    const method = (paymentMethod ?? 'PAYSTACK').toUpperCase();
+    if (!['PAYSTACK', 'CRYPTO'].includes(method)) throw new BadRequestException('Unsupported payment method');
+    return this.coinPurchase.initiate(req.user.userId, packageId, idempotencyKey ?? uuid(), method);
   }
 }
 
@@ -145,6 +165,7 @@ export class GiftController {
     @Body('contextId') contextId: string | undefined,
     @Body('pkBattleId') pkBattleId: string | undefined,
     @Body('idempotencyKey') idempotencyKey: string,
+    @Body('paymentMethod') paymentMethod: string | undefined,
     @Req() req: AuthedRequest,
   ) {
     // Gifts can be tied to a live stream, a party room, or a video (a "tip").

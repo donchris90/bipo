@@ -98,5 +98,13 @@ export class FakePrisma {
       null,
   };
 
-  $transaction = async (cb: (tx: any) => Promise<any>) => cb(this);
+  $transaction = async (cb: (tx: any) => Promise<any>, _options?: unknown) => cb(this);
+
+  // The wallet locks a row with `SELECT ... FOR UPDATE` before changing it. The fake has no
+  // concurrency to protect against, so it just answers with the current row.
+  $queryRaw = async (query: any) => {
+    const id = query?.values?.[0];
+    const w = [...this.wallets.values()].find((x) => x.id === id);
+    return w ? [{ id: w.id, balance: w.balance }] : [];
+  };
 }

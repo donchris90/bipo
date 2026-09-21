@@ -47,3 +47,25 @@ describe('verifyPaystackSignature', () => {
     expect(verifyPaystackSignature(Buffer.from(BODY, 'utf8'), signature, SECRET)).toBe(true);
   });
 });
+
+
+describe('Paystack payment references', () => {
+  it('normalizes arbitrary idempotency keys into a valid bounded reference', async () => {
+    const { toPaystackPaymentReference } = await import('./paystack-payment-provider');
+    const ref = toPaystackPaymentReference('UUID/with spaces and symbols!!!');
+    expect(ref).toMatch(/^[a-z0-9_-]+$/);
+    expect(ref.length).toBeGreaterThanOrEqual(16);
+    expect(ref.length).toBeLessThanOrEqual(50);
+  });
+});
+
+describe('Paystack payment reference collision resistance', () => {
+  it('keeps distinct long idempotency keys distinct', async () => {
+    const { toPaystackPaymentReference } = await import('./paystack-payment-provider');
+    const a = toPaystackPaymentReference('same-prefix-' + 'a'.repeat(200));
+    const b = toPaystackPaymentReference('same-prefix-' + 'b'.repeat(200));
+    expect(a).not.toBe(b);
+    expect(a.length).toBeLessThanOrEqual(50);
+    expect(b.length).toBeLessThanOrEqual(50);
+  });
+});

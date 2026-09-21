@@ -20,7 +20,7 @@ function build(over: { account?: any; quote?: (country: string, coins: number) =
   };
   const wallet: any = { getBalance: jest.fn().mockResolvedValue(over.balance ?? 10_000n), debit: jest.fn() };
   const risk: any = { scoreWithdrawal: jest.fn().mockResolvedValue({ needsReview: true, reasons: [] }) };
-  const payoutConfig: any = { requireQuote: jest.fn(over.quote ?? (async (_c: string, coins: number) => ({ currencyCode: 'NGN', ...quoteWithdrawal(coins, RULES) }))) };
+  const payoutConfig: any = { requireQuote: jest.fn(over.quote ?? (async (_c: string, coins: number) => ({ currencyCode: 'NGN', requireKyc: true, cooldownHours: 0, maxDailyWithdrawalCoins: null, maxMonthlyWithdrawalCoins: null, manualReviewAboveCoins: null, allowedProviders: null, ...quoteWithdrawal(coins, RULES) }))) };
   const payoutAccounts: any = {
     requireFor: jest.fn(async () => {
       if (over.account === null) throw new BadRequestException('Add a payout account before withdrawing');
@@ -74,7 +74,7 @@ describe('WithdrawalService.request with admin payout rules', () => {
 });
 
 describe('identity verification gate', () => {
-  const kycQuote = (requireKyc: boolean) => async (_c: string, coins: number) => ({ currencyCode: 'NGN', requireKyc, ...quoteWithdrawal(coins, RULES) });
+  const kycQuote = (requireKyc: boolean) => async (_c: string, coins: number) => ({ currencyCode: 'NGN', requireKyc, cooldownHours: 0, maxDailyWithdrawalCoins: null, maxMonthlyWithdrawalCoins: null, manualReviewAboveCoins: null, allowedProviders: null, ...quoteWithdrawal(coins, RULES) });
 
   it('refuses an unverified person when the admin requires verification, before reserving any coins', async () => {
     const { svc, wallet } = build({ quote: kycQuote(true), verified: false });
@@ -102,6 +102,7 @@ describe('WithdrawalService.processPayout', () => {
       withdrawalRequest: {
         findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'w1', creatorId: 'u1', walletType: 'CREATOR_EARNINGS', amountMinor: 1000, netMinor: 44_000, currencyCode: 'NGN', idempotencyKey: 'k', payoutTo: ACCOUNT }),
         update: jest.fn(async ({ data }: any) => data),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }), // claims APPROVED -> PROCESSING
       },
     };
     const svc = new WithdrawalService(prisma, {} as any, {} as any, {} as any, { initiatePayout } as any, {} as any, {} as any, {} as any);
@@ -114,7 +115,7 @@ describe('WithdrawalService.processPayout', () => {
     const credit = jest.fn();
     const tx = { withdrawalRequest: { update: jest.fn(async ({ data }: any) => data) } };
     const prisma: any = {
-      withdrawalRequest: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'w1', creatorId: 'u1', walletType: 'CREATOR_EARNINGS', amountMinor: 1000, netMinor: null, currencyCode: 'NGN', idempotencyKey: 'k' }) },
+      withdrawalRequest: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'w1', creatorId: 'u1', walletType: 'CREATOR_EARNINGS', amountMinor: 1000, netMinor: null, currencyCode: 'NGN', idempotencyKey: 'k' }), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
       $transaction: jest.fn(async (fn: any) => fn(tx)),
     };
     const svc = new WithdrawalService(prisma, { credit } as any, {} as any, {} as any, { initiatePayout } as any, { notifyOnce: jest.fn() } as any, {} as any, {} as any);
@@ -122,5 +123,37 @@ describe('WithdrawalService.processPayout', () => {
     expect(initiatePayout).not.toHaveBeenCalled();
     expect(credit).toHaveBeenCalled(); // the reserve was released
     expect(tx.withdrawalRequest.update.mock.calls[0][0].data.status).toBe('FAILED');
+  });
+});
+
+
+describe('WithdrawalService provider state races', () => {
+  it('does not release funds twice when duplicate failure webhooks race', async () => {
+    const credit = jest.fn();
+    const tx: any = {
+      withdrawalRequest: {
+        updateMany: jest.fn().mockResolvedValueOnce({ count: 1 }).mockResolvedValueOnce({ count: 0 }),
+        findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'w1', status: 'FAILED', creatorId: 'u1', walletType: 'CREATOR_EARNINGS', amountMinor: 1000, failureReason: 'Account closed' }),
+      },
+    };
+    const prisma: any = {
+      withdrawalRequest: { findFirst: jest.fn().mockResolvedValue({ id: 'w1', providerRef: 'TRF_1', status: 'PROCESSING', creatorId: 'u1', walletType: 'CREATOR_EARNINGS', amountMinor: 1000, idempotencyKey: 'k' }) },
+      $transaction: jest.fn(async (fn: any) => fn(tx)),
+    };
+    const svc = new WithdrawalService(prisma, { credit } as any, {} as any, {} as any, {} as any, { notifyOnce: jest.fn() } as any, {} as any, {} as any);
+    await svc.confirmFailed('TRF_1', 'Account closed');
+    expect(tx.withdrawalRequest.updateMany).toHaveBeenCalledTimes(1);
+    expect(credit).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not turn a failed withdrawal back into PAID on a late success webhook', async () => {
+    const prisma: any = {
+      withdrawalRequest: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'w1', providerRef: 'TRF_1', status: 'FAILED' }),
+      },
+    };
+    const svc = new WithdrawalService(prisma, {} as any, {} as any, {} as any, {} as any, {} as any, {} as any, {} as any);
+    const out = await svc.confirmPaid('TRF_1');
+    expect(out.status).toBe('FAILED');
   });
 });

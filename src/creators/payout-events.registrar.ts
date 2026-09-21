@@ -21,6 +21,7 @@ export class PayoutEventsRegistrar implements OnModuleInit {
     const result = this.provider.parseWebhook?.(payload);
     if (!result) return;
     if (result.status === 'paid') await this.withdrawals.confirmPaid(result.providerRef);
+    else if (result.status === 'reversed') await this.withdrawals.confirmReversed(result.providerRef, result.reason ?? 'The transfer was reversed');
     else await this.withdrawals.confirmFailed(result.providerRef, result.reason ?? 'Provider reported failure');
   }
 }

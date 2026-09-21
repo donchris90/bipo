@@ -87,6 +87,15 @@ export class WithdrawalService {
     // country (rate, minimum, maximum, fees) — the client's `currencyCode` is
     // ignored. And there must be somewhere to send the money.
     const quote = await this.payoutConfig.requireQuote(countryCode, amountCoins);
+    const now = new Date();
+    const [daily, monthly, latest] = await Promise.all([
+      quote.maxDailyWithdrawalCoins == null ? Promise.resolve({ _sum: { amountMinor: 0 } }) : this.prisma.withdrawalRequest.aggregate({ where: { creatorId, walletType, status: { not: 'REJECTED' }, requestedAt: { gte: new Date(now.getTime() - 24 * 60 * 60 * 1000) } }, _sum: { amountMinor: true } }),
+      quote.maxMonthlyWithdrawalCoins == null ? Promise.resolve({ _sum: { amountMinor: 0 } }) : this.prisma.withdrawalRequest.aggregate({ where: { creatorId, walletType, status: { not: 'REJECTED' }, requestedAt: { gte: new Date(new Date(now).setMonth(now.getMonth() - 1)) } }, _sum: { amountMinor: true } }),
+      quote.cooldownHours <= 0 ? Promise.resolve(null) : this.prisma.withdrawalRequest.findFirst({ where: { creatorId, walletType }, orderBy: { requestedAt: 'desc' }, select: { requestedAt: true } }),
+    ]);
+    if (quote.maxDailyWithdrawalCoins != null && Number(daily._sum.amountMinor ?? 0) + amountCoins > quote.maxDailyWithdrawalCoins) throw new BadRequestException('Daily withdrawal limit exceeded');
+    if (quote.maxMonthlyWithdrawalCoins != null && Number(monthly._sum.amountMinor ?? 0) + amountCoins > quote.maxMonthlyWithdrawalCoins) throw new BadRequestException('Monthly withdrawal limit exceeded');
+    if (latest && now.getTime() - new Date(latest.requestedAt).getTime() < quote.cooldownHours * 60 * 60 * 1000) throw new BadRequestException(`Please wait ${quote.cooldownHours} hours between withdrawals`);
     // Money only goes to someone whose identity has been checked (an admin
     // setting, on by default).
     if (quote.requireKyc) {
@@ -94,6 +103,9 @@ export class WithdrawalService {
       if (!person?.kycVerified) throw new ForbiddenException('Verify your identity before withdrawing');
     }
     const account = await this.payoutAccounts.requireFor(creatorId);
+    if (quote.allowedProviders?.length && !quote.allowedProviders.includes(String(account.provider).toUpperCase())) {
+      throw new BadRequestException('Your payout method is not enabled for your country');
+    }
 
     const balance = await this.wallet.getBalance(creatorId, WalletType[walletType]);
     if (balance < BigInt(amountCoins)) throw new BadRequestException('Insufficient cleared balance');
@@ -103,6 +115,7 @@ export class WithdrawalService {
     // withdrawal's own reserve affects, so it doesn't need to be inside
     // the atomic block.
     const risk = await this.risk.scoreWithdrawal(creatorId, amountCoins, walletType);
+    const manualReview = quote.manualReviewAboveCoins != null && amountCoins >= quote.manualReviewAboveCoins;
 
     // Same fix as EntryService.place()/GiftService.send(): the reserve
     // debit and the WithdrawalRequest record it justifies must commit
@@ -143,8 +156,8 @@ export class WithdrawalService {
             accountName: account.accountName,
             recipientCode: account.recipientCode,
           },
-          status: risk.needsReview ? 'PENDING_REVIEW' : 'APPROVED',
-          riskFlags: risk.needsReview ? risk.reasons : undefined,
+          status: risk.needsReview || manualReview ? 'PENDING_REVIEW' : 'APPROVED',
+          riskFlags: (risk.needsReview || manualReview) ? [...risk.reasons, ...(manualReview ? ['ADMIN_THRESHOLD'] : [])] : undefined,
           idempotencyKey,
         },
       });
@@ -229,6 +242,15 @@ export class WithdrawalService {
   }
 
   private async processPayout(withdrawalId: string) {
+    // Claim atomically so two approvals/retries cannot submit the same payout.
+    const claimed = await this.prisma.withdrawalRequest.updateMany({
+      where: { id: withdrawalId, status: 'APPROVED' },
+      data: { status: 'PROCESSING' },
+    });
+    if (claimed.count === 0) {
+      return this.prisma.withdrawalRequest.findUniqueOrThrow({ where: { id: withdrawalId } });
+    }
+
     const withdrawal = await this.prisma.withdrawalRequest.findUniqueOrThrow({ where: { id: withdrawalId } });
 
     try {
@@ -243,14 +265,16 @@ export class WithdrawalService {
         idempotencyKey: withdrawal.idempotencyKey,
         recipientCode: to.recipientCode,
       });
-      return this.prisma.withdrawalRequest.update({
-        where: { id: withdrawalId },
+      // Never regress a webhook-set PAID state. Attach provider metadata only
+      // while this worker still owns the PROCESSING state.
+      await this.prisma.withdrawalRequest.updateMany({
+        where: { id: withdrawalId, status: 'PROCESSING' },
         data: {
-          status: 'PROCESSING',
           payoutProvider: this.payoutProvider.constructor.name.toLowerCase().includes('paystack') ? 'paystack' : 'mock',
           providerRef: payout.providerRef,
         },
       });
+      return this.prisma.withdrawalRequest.findUniqueOrThrow({ where: { id: withdrawalId } });
     } catch (e: any) {
       this.logger.warn(`Payout for withdrawal ${withdrawalId} could not be started: ${e?.message ?? e}`);
       // Same fix — release and the FAILED status update commit together.
@@ -271,7 +295,20 @@ export class WithdrawalService {
     const withdrawal = await this.prisma.withdrawalRequest.findFirst({ where: { providerRef } });
     if (!withdrawal) throw new NotFoundException('Withdrawal not found for providerRef');
     if (withdrawal.status === 'PAID') return withdrawal; // idempotent
-    const paid = await this.prisma.withdrawalRequest.update({ where: { id: withdrawal.id }, data: { status: 'PAID' } });
+    if (withdrawal.status === 'FAILED' || withdrawal.status === 'REJECTED') return withdrawal;
+
+    // Only PROCESSING can become PAID. This is deliberately a conditional
+    // transition: a late success webhook must never resurrect a withdrawal
+    // that has already been failed/released by another webhook or worker.
+    const claimed = await this.prisma.withdrawalRequest.updateMany({
+      where: { id: withdrawal.id, status: 'PROCESSING' },
+      data: { status: 'PAID' },
+    });
+    if (claimed.count === 0) {
+      return this.prisma.withdrawalRequest.findUniqueOrThrow({ where: { id: withdrawal.id } });
+    }
+
+    const paid = await this.prisma.withdrawalRequest.findUniqueOrThrow({ where: { id: withdrawal.id } });
     await this.notifyStatus(paid);
     return paid;
   }
@@ -279,17 +316,63 @@ export class WithdrawalService {
   async confirmFailed(providerRef: string, reason: string) {
     const withdrawal = await this.prisma.withdrawalRequest.findFirst({ where: { providerRef } });
     if (!withdrawal) throw new NotFoundException('Withdrawal not found for providerRef');
-    if (withdrawal.status === 'FAILED') return withdrawal; // idempotent
-    // Same fix — release and the FAILED status update commit together.
+    if (withdrawal.status === 'FAILED' || withdrawal.status === 'REJECTED') return withdrawal; // idempotent
+    if (withdrawal.status === 'PAID') return withdrawal; // a late failure/reversal must not refund a paid transfer here
+
+    // Release the reserve only if this call wins the PROCESSING -> FAILED
+    // transition. This closes the double-release race between duplicate
+    // provider webhooks and workers. The status change and wallet credit are
+    // committed together.
     const failed = await this.prisma.$transaction(async (tx) => {
-      await this.releaseReserve(withdrawal.creatorId, withdrawal.walletType, withdrawal.amountMinor, withdrawal.idempotencyKey, tx);
-      return tx.withdrawalRequest.update({
-        where: { id: withdrawal.id },
+      const claimed = await tx.withdrawalRequest.updateMany({
+        where: { id: withdrawal.id, status: 'PROCESSING' },
         data: { status: 'FAILED', failureReason: reason },
       });
+      if (claimed.count === 0) {
+        return tx.withdrawalRequest.findUniqueOrThrow({ where: { id: withdrawal.id } });
+      }
+
+      await this.releaseReserve(withdrawal.creatorId, withdrawal.walletType, withdrawal.amountMinor, withdrawal.idempotencyKey, tx);
+      return tx.withdrawalRequest.findUniqueOrThrow({ where: { id: withdrawal.id } });
     }, EXTENDED_TX_OPTIONS);
-    await this.notifyStatus(failed);
+
+    if (failed.status === 'FAILED' && withdrawal.status === 'PROCESSING') {
+      await this.notifyStatus(failed);
+    }
     return failed;
+  }
+
+  async confirmReversed(providerRef: string, reason: string) {
+    const withdrawal = await this.prisma.withdrawalRequest.findFirst({ where: { providerRef } });
+    if (!withdrawal) throw new NotFoundException('Withdrawal not found for providerRef');
+    if (withdrawal.status === 'REVERSED' || withdrawal.status === 'FAILED' || withdrawal.status === 'REJECTED') return withdrawal;
+    if (withdrawal.status !== 'PAID') {
+      // A reversal is only meaningful after the provider has reported the
+      // transfer as paid. If it races an initial failure, the failure path owns
+      // the reserve release; do not release it a second time.
+      return withdrawal;
+    }
+
+    // The transfer was already marked PAID, so the original coin reserve has
+    // already left the user's wallet. A later provider reversal means the cash
+    // came back to the platform and the user's reserved coins must be restored.
+    // Only PAID -> REVERSED can win this release, making duplicate reversal
+    // webhooks harmless.
+    const reversed = await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.withdrawalRequest.updateMany({
+        where: { id: withdrawal.id, status: 'PAID' },
+        data: { status: 'REVERSED', failureReason: reason },
+      });
+      if (claimed.count === 0) {
+        return tx.withdrawalRequest.findUniqueOrThrow({ where: { id: withdrawal.id } });
+      }
+
+      await this.releaseReserve(withdrawal.creatorId, withdrawal.walletType, withdrawal.amountMinor, withdrawal.idempotencyKey, tx);
+      return tx.withdrawalRequest.findUniqueOrThrow({ where: { id: withdrawal.id } });
+    }, EXTENDED_TX_OPTIONS);
+
+    if (reversed.status === 'REVERSED') await this.notifyStatus(reversed);
+    return reversed;
   }
 
   // The requester's own withdrawal history, newest first. Deliberately a
