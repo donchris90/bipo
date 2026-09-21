@@ -11,6 +11,7 @@ import { ConfigService } from '@nestjs/config';
 import { Prisma } from '@prisma/client';
 import { v4 as uuid } from 'uuid';
 import { PrismaService } from '../prisma/prisma.service';
+import { assertNotBlocked } from '../common/blocks';
 import { STORAGE_PROVIDER, type StorageProvider } from './providers/storage-provider.interface';
 import {
   DEFAULT_MAX_VIDEO_BYTES,
@@ -34,6 +35,9 @@ interface VideoRow {
   status: string;
   viewCount: number;
   likeCount: number;
+  shareCount: number;
+  musicTitle: string | null;
+  thumbnailUrl: string | null;
   createdAt: Date;
 }
 
@@ -175,20 +179,133 @@ export class VideosService {
   // ── Viewing ─────────────────────────────────────────────────────
 
   // Newest first. `before` (createdAt of the last item loaded) pages back.
-  async feed(viewerId: string, limit?: number, before?: string) {
-    const take = Math.min(Math.max(Math.floor(limit ?? 20) || 20, 1), 50);
+  // The Explore feed. Tabs:
+  //   (none)    newest first                       — paged with `before` (a timestamp)
+  //   following videos from people you follow      — newest first, paged with `before`
+  //   popular   most liked, then most watched      — paged with `offset`
+  //   hot       what is trending in the last week  — paged with `offset`
+  // Videos from anyone you have blocked (or who blocked you) never appear.
+  async feed(viewerId: string, opts: { limit?: number; before?: string; tab?: string; offset?: number } = {}) {
+    const take = Math.min(Math.max(Math.floor(opts.limit ?? 20) || 20, 1), 50);
+    const offset = Math.max(Math.floor(Number(opts.offset)) || 0, 0);
+    let beforeDate: Date | undefined;
+    if (opts.before) {
+      beforeDate = new Date(opts.before);
+      if (Number.isNaN(beforeDate.getTime())) throw new BadRequestException('before must be an ISO timestamp');
+    }
+
+    const blocks = await this.prisma.block.findMany({ where: { OR: [{ blockerId: viewerId }, { blockedId: viewerId }] }, select: { blockerId: true, blockedId: true } });
+    const blocked = [...new Set(blocks.flatMap((b) => [b.blockerId, b.blockedId]).filter((id) => id !== viewerId))];
+    const notBlocked = blocked.length ? { creatorId: { notIn: blocked } } : {};
+    const base = { status: 'PUBLISHED' as const, ...notBlocked };
+
+    if (opts.tab === 'popular') {
+      const rows = await this.prisma.video.findMany({ where: base, orderBy: [{ likeCount: 'desc' }, { viewCount: 'desc' }, { createdAt: 'desc' }], skip: offset, take });
+      return this.toViewerViews(viewerId, rows);
+    }
+
+    if (opts.tab === 'hot') {
+      const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const pool = await this.prisma.video.findMany({ where: { ...base, createdAt: { gte: since } }, orderBy: [{ viewCount: 'desc' }, { likeCount: 'desc' }], take: 300 });
+      const ranked = pool.sort((a, b) => hotScore(b) - hotScore(a) || b.createdAt.getTime() - a.createdAt.getTime()).slice(offset, offset + take);
+      return this.toViewerViews(viewerId, ranked);
+    }
+
+    let creatorFilter = {};
+    if (opts.tab === 'following') {
+      const follows = await this.prisma.follow.findMany({ where: { followerId: viewerId }, select: { followingId: true }, take: 5000 });
+      const ids = follows.map((f) => f.followingId).filter((id) => !blocked.includes(id));
+      if (ids.length === 0) return [];
+      creatorFilter = { creatorId: { in: ids } };
+    }
+    const rows = await this.prisma.video.findMany({
+      where: { ...base, ...creatorFilter, ...(beforeDate ? { createdAt: { lt: beforeDate } } : {}) },
+      orderBy: { createdAt: 'desc' },
+      take,
+    });
+    return this.toViewerViews(viewerId, rows);
+  }
+
+  // Videos by title, caption, hashtag or creator name.
+  async search(viewerId: string, q: unknown) {
+    const term = typeof q === 'string' ? q.trim().replace(/^#/, '') : '';
+    if (term.length < 2) throw new BadRequestException('Type at least 2 characters to search');
+    if (term.length > 50) throw new BadRequestException('That search is too long');
+    const people = await this.prisma.user.findMany({ where: { displayName: { contains: term, mode: 'insensitive' } }, select: { id: true }, take: 50 });
+    const rows = await this.prisma.video.findMany({
+      where: {
+        status: 'PUBLISHED',
+        OR: [
+          { title: { contains: term, mode: 'insensitive' } },
+          { caption: { contains: term, mode: 'insensitive' } },
+          { tag: { contains: term, mode: 'insensitive' } },
+          ...(people.length ? [{ creatorId: { in: people.map((p) => p.id) } }] : []),
+        ],
+      },
+      orderBy: [{ likeCount: 'desc' }, { createdAt: 'desc' }],
+      take: 30,
+    });
+    return this.toViewerViews(viewerId, rows);
+  }
+
+  // ── comments ──────────────────────────────────────────────────
+
+  async listComments(viewerId: string, videoId: string, limit?: number, before?: string) {
+    await this.assertPublished(videoId);
+    const take = Math.min(Math.max(Math.floor(limit ?? 30) || 30, 1), 100);
     let beforeDate: Date | undefined;
     if (before) {
       beforeDate = new Date(before);
       if (Number.isNaN(beforeDate.getTime())) throw new BadRequestException('before must be an ISO timestamp');
     }
-
-    const videos = await this.prisma.video.findMany({
-      where: { status: 'PUBLISHED', ...(beforeDate ? { createdAt: { lt: beforeDate } } : {}) },
+    const rows = await this.prisma.videoComment.findMany({
+      where: { videoId, ...(beforeDate ? { createdAt: { lt: beforeDate } } : {}) },
       orderBy: { createdAt: 'desc' },
       take,
     });
-    return this.toViewerViews(viewerId, videos);
+    return this.toCommentViews(viewerId, rows);
+  }
+
+  async addComment(userId: string, videoId: string, text: unknown) {
+    const clean = typeof text === 'string' ? text.trim().replace(/\s+/g, ' ') : '';
+    if (clean.length < 1) throw new BadRequestException('Write something first');
+    if (clean.length > 300) throw new BadRequestException('Comments can be at most 300 characters');
+    const video = await this.prisma.video.findUnique({ where: { id: videoId }, select: { creatorId: true, status: true } });
+    if (!video || video.status !== 'PUBLISHED') throw new NotFoundException('Video not found');
+    await assertNotBlocked(this.prisma as any, userId, video.creatorId, "You can't comment on this video");
+    const row = await this.prisma.videoComment.create({ data: { videoId, userId, text: clean } });
+    return (await this.toCommentViews(userId, [row]))[0];
+  }
+
+  // The author can delete their own comment; so can the video's creator (their video, their comments).
+  async deleteComment(userId: string, videoId: string, commentId: string) {
+    const comment = await this.prisma.videoComment.findUnique({ where: { id: commentId } });
+    if (!comment || comment.videoId !== videoId) throw new NotFoundException('Comment not found');
+    if (comment.userId !== userId) {
+      const video = await this.prisma.video.findUnique({ where: { id: videoId }, select: { creatorId: true } });
+      if (video?.creatorId !== userId) throw new ForbiddenException('You can only delete your own comments');
+    }
+    await this.prisma.videoComment.delete({ where: { id: commentId } });
+    return { deleted: true };
+  }
+
+  async share(videoId: string) {
+    await this.assertPublished(videoId);
+    const updated = await this.prisma.video.update({ where: { id: videoId }, data: { shareCount: { increment: 1 } }, select: { shareCount: true } });
+    return { shareCount: updated.shareCount };
+  }
+
+  private async toCommentViews(viewerId: string, rows: { id: string; userId: string; text: string; createdAt: Date }[]) {
+    if (rows.length === 0) return [];
+    const users = await this.prisma.user.findMany({ where: { id: { in: [...new Set(rows.map((r) => r.userId))] } }, select: { id: true, displayName: true, avatarUrl: true } });
+    const byId = new Map(users.map((u) => [u.id, u]));
+    return rows.map((r) => ({
+      id: r.id,
+      text: r.text,
+      createdAt: r.createdAt,
+      mine: r.userId === viewerId,
+      user: { id: r.userId, displayName: byId.get(r.userId)?.displayName ?? null, avatarUrl: byId.get(r.userId)?.avatarUrl ?? null },
+    }));
   }
 
   async get(viewerId: string, videoId: string) {
@@ -273,29 +390,47 @@ export class VideosService {
       allowGifts: v.allowGifts,
       viewCount: v.viewCount,
       likeCount: v.likeCount,
+      shareCount: v.shareCount,
+      musicTitle: v.musicTitle,
+      thumbnailUrl: v.thumbnailUrl,
       createdAt: v.createdAt,
     };
   }
 
   private async toViewerViews(viewerId: string, videos: VideoRow[]) {
     if (videos.length === 0) return [];
-    const [creators, liked] = await Promise.all([
-      this.prisma.user.findMany({
-        where: { id: { in: [...new Set(videos.map((v) => v.creatorId))] } },
-        select: { id: true, displayName: true },
-      }),
-      this.prisma.videoLike.findMany({
-        where: { userId: viewerId, videoId: { in: videos.map((v) => v.id) } },
-        select: { videoId: true },
-      }),
+    const ids = videos.map((v) => v.id);
+    const creatorIds = [...new Set(videos.map((v) => v.creatorId))];
+    const [creators, liked, followed, comments, gifts] = await Promise.all([
+      this.prisma.user.findMany({ where: { id: { in: creatorIds } }, select: { id: true, displayName: true, avatarUrl: true } }),
+      this.prisma.videoLike.findMany({ where: { userId: viewerId, videoId: { in: ids } }, select: { videoId: true } }),
+      this.prisma.follow.findMany({ where: { followerId: viewerId, followingId: { in: creatorIds } }, select: { followingId: true } }),
+      this.prisma.videoComment.groupBy({ by: ['videoId'], where: { videoId: { in: ids } }, _count: { _all: true } }),
+      // gifts sent to a video are tips: counted from the gift records themselves
+      this.prisma.giftTransaction.groupBy({ by: ['contextId'], where: { context: 'VIDEO', contextId: { in: ids } }, _count: { _all: true } }),
     ]);
-    const nameById = new Map(creators.map((c) => [c.id, c.displayName]));
+    const creatorById = new Map(creators.map((c) => [c.id, c]));
     const likedIds = new Set(liked.map((l) => l.videoId));
+    const followedIds = new Set(followed.map((f) => f.followingId));
+    const commentCounts = new Map(comments.map((c) => [c.videoId, c._count._all]));
+    const giftCounts = new Map(gifts.map((g) => [g.contextId as string, g._count._all]));
 
-    return videos.map((v) => ({
-      ...this.toOwnerView(v),
-      creator: { id: v.creatorId, displayName: nameById.get(v.creatorId) ?? null },
-      likedByMe: likedIds.has(v.id),
-    }));
+    return videos.map((v) => {
+      const c = creatorById.get(v.creatorId);
+      return {
+        ...this.toOwnerView(v),
+        creator: { id: v.creatorId, displayName: c?.displayName ?? null, avatarUrl: c?.avatarUrl ?? null, followedByMe: followedIds.has(v.creatorId) },
+        likedByMe: likedIds.has(v.id),
+        commentCount: commentCounts.get(v.id) ?? 0,
+        giftCount: giftCounts.get(v.id) ?? 0,
+      };
+    });
   }
+}
+
+// What is trending: watching counts once, a like three times, and a video that is
+// only hours old is worth more than one that has had all week to collect them.
+export function hotScore(v: { viewCount: number; likeCount: number; createdAt: Date }, now = Date.now()): number {
+  const ageHours = Math.max(0, (now - v.createdAt.getTime()) / 3_600_000);
+  return (v.viewCount + v.likeCount * 3) / Math.pow(ageHours + 2, 0.8);
 }

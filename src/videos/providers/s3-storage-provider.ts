@@ -1,3 +1,5 @@
+import { createReadStream } from 'fs';
+import { stat } from 'fs/promises';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { DeleteObjectCommand, GetObjectCommand, HeadBucketCommand, HeadObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
@@ -134,6 +136,11 @@ export class S3StorageProvider implements StorageProvider {
         (status === 403 ? hints.AccessDenied : status === 404 ? hints.NoSuchBucket : 'Check S3_ENDPOINT, S3_BUCKET and both keys.');
       return { ok: false, ...base, errorName: name, errorMessage: String(e?.message ?? e).slice(0, 300), hint };
     }
+  }
+
+  async putFile(key: string, path: string, contentType: string): Promise<void> {
+    const { size } = await stat(path);
+    await this.client.send(new PutObjectCommand({ Bucket: this.bucket, Key: key, Body: createReadStream(path), ContentLength: size, ContentType: contentType }));
   }
 
   async deleteObject(key: string) {

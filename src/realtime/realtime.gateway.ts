@@ -75,6 +75,19 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     }
   }
 
+  // A phone that loses signal reconnects and re-joins; without this each reconnect
+  // would post another "Ada joined" line and crowd the chat. One notice per person
+  // per room per 30 seconds.
+  private readonly lastJoinNotice = new Map<string, number>();
+  private shouldAnnounceJoin(userId: string, room: string, now = Date.now()): boolean {
+    const key = `${userId}|${room}`;
+    const last = this.lastJoinNotice.get(key);
+    if (last !== undefined && now - last < 30_000) return false;
+    this.lastJoinNotice.set(key, now);
+    if (this.lastJoinNotice.size > 5000) for (const [k, t] of this.lastJoinNotice) if (now - t > 30_000) this.lastJoinNotice.delete(k);
+    return true;
+  }
+
   @SubscribeMessage('join')
   async handleJoin(
     @MessageBody() data: { context: ChatContext; contextId: string },
@@ -94,6 +107,32 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       return { error: 'banned' };
     }
     client.join(`${data.context}:${data.contextId}`);
+
+    // Let everyone already watching know someone new just arrived — a
+    // system line in the same chat feed, e.g. "Ada joined" (spec: the host
+    // should be notified of new joiners in the comment section). Sent to
+    // the room only (not back to the joiner — they don't need to see their
+    // own arrival), and never persisted to chat history: it's a
+    // here-and-now arrival notice, not something someone joining later
+    // needs played back. Only LIVE/ROOM have an actual chat feed for this
+    // to appear in — 'pk' and other free-form contexts reuse this handler
+    // too but have nowhere to show it.
+    if ((data.context === 'ROOM' || data.context === 'LIVE') && this.shouldAnnounceJoin(userId, `${data.context}:${data.contextId}`)) {
+      try {
+        const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true } });
+        client.to(`${data.context}:${data.contextId}`).emit('chat:message', {
+          id: `join:${userId}:${Date.now()}`,
+          senderId: 'system',
+          senderName: null,
+          content: `${user?.displayName?.trim() || 'Someone'} joined`,
+          createdAt: new Date().toISOString(),
+          system: true,
+        });
+      } catch {
+        /* an arrival notice must never stop someone joining */
+      }
+    }
+
     return { joined: true };
   }
 
@@ -181,6 +220,11 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(`LIVE:${sessionId}`).emit('live:like', payload);
   }
 
+  // The host's shared video changed (loaded, played, paused, moved, stopped).
+  broadcastLiveMedia(sessionId: string, payload: unknown) {
+    this.server.to(`LIVE:${sessionId}`).emit('live:media', payload);
+  }
+
   broadcastLiveViewerCount(sessionId: string, payload: unknown) {
     this.server.to(`LIVE:${sessionId}`).emit('live:viewer_count', payload);
   }
@@ -239,6 +283,19 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   async isUserOnline(userId: string): Promise<boolean> {
     const sockets = await this.server.in(`user:${userId}`).fetchSockets();
     return sockets.length > 0;
+  }
+
+  // Every user with a live socket right now (one pass over the connected sockets).
+  // Used to list people who are actually online — e.g. PK opponents. Single backend
+  // instance only, like the other presence checks.
+  async onlineUserIds(): Promise<Set<string>> {
+    const sockets = await this.server.fetchSockets();
+    const ids = new Set<string>();
+    for (const s of sockets) {
+      const id = (s.data as { userId?: string } | undefined)?.userId;
+      if (id) ids.add(id);
+    }
+    return ids;
   }
 
   // Whether `userId` currently has a live socket inside `room` (e.g. the host

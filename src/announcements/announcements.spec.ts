@@ -40,16 +40,15 @@ describe('AnnouncementsService.banner', () => {
     expect(await build().svc.banner()).toEqual([]);
   });
 
-  it("puts the admin's messages first, then the real biggest win and gift", async () => {
+  it("puts the admin's messages first, then the real biggest win — gifts are not in this banner", async () => {
     const { svc } = build({
       custom: [{ id: 'c1', text: 'Weekend PK tournament!' }],
       wins: [{ id: 'e1', userId: 'u1', roundId: 'r1', rewardAmount: 12500 }],
       gifts: [{ id: 't1', senderId: 'u2', recipientId: 'u1', giftId: 'g1', coinAmount: 500 }],
     });
     const items = await svc.banner();
-    expect(items.map((i) => i.kind)).toEqual(['CUSTOM', 'BIG_WIN', 'TOP_GIFT']);
+    expect(items.map((i) => i.kind)).toEqual(['CUSTOM', 'BIG_WIN']);
     expect(items[1].text).toBe('🏆 Ada just won 12,500 coins in Crash');
-    expect(items[2].text).toBe('🎁 Bo sent Rose (500 coins) to Ada');
   });
 
   it('only asks for messages that are active and inside their date window', async () => {

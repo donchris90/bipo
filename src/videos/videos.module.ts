@@ -1,3 +1,5 @@
+import { VideoEditService } from './video-edit.service';
+import { NotificationsModule } from '../notifications/notifications.module';
 import { Logger, Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { VideosService } from './videos.service';
@@ -10,9 +12,10 @@ import { S3StorageProvider } from './providers/s3-storage-provider';
 const logger = new Logger('VideosModule');
 
 @Module({
-  imports: [ConfigModule],
+  imports: [ConfigModule, NotificationsModule],
   providers: [
     VideosService,
+    VideoEditService,
     {
       provide: STORAGE_PROVIDER,
       inject: [ConfigService],

@@ -37,6 +37,25 @@ export class PkController {
     return toResponse(await this.pk.challenge(req.user.userId, opponentId));
   }
 
+  // Who you can challenge, online right now: ?category=friends | agency | random
+  @Get('candidates')
+  candidates(@Query('category') category: string | undefined, @Req() req: AuthedRequest) {
+    const cat = category === 'agency' || category === 'random' ? category : 'friends';
+    return this.pk.candidates(req.user.userId, cat);
+  }
+
+  // "Random match": challenge one online creator picked for you.
+  @Post('random')
+  async random(@Req() req: AuthedRequest) {
+    const { battle, opponent } = await this.pk.randomChallenge(req.user.userId);
+    return { battle: toResponse(battle), opponent };
+  }
+
+  @Post(':id/decline')
+  async decline(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return toResponse(await this.pk.decline(id, req.user.userId));
+  }
+
   @Post(':id/accept')
   async accept(@Param('id') id: string, @Req() req: AuthedRequest) {
     return toResponse(await this.pk.accept(id, req.user.userId));

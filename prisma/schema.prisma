@@ -344,6 +344,8 @@ model Gift {
   name      String
   coinPrice Int
   category  String?
+  // What the app draws for this gift (an emoji). Editable in the admin.
+  icon      String?
   active    Boolean  @default(true)
   createdAt DateTime @default(now())
 }
@@ -672,6 +674,7 @@ enum NotificationType {
   COIN_PURCHASE
   CREATOR_APPLICATION
   MISSED_CALL
+  PROFILE_VISIT
 }
 
 enum LiveStatus {
@@ -773,6 +776,11 @@ model Video {
   status          VideoStatus @default(PUBLISHED)
   viewCount       Int         @default(0)
   likeCount       Int         @default(0)
+  shareCount      Int         @default(0)
+  // A still from the video (made when it is rendered in the editor).
+  thumbnailUrl    String?
+  // "Song - Artist" shown under the video. Empty for original sound.
+  musicTitle      String?
   countryCode     String
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
@@ -921,4 +929,49 @@ model Announcement {
   updatedAt DateTime  @updatedAt
 
   @@index([active, priority])
+}
+
+model VideoComment {
+  id        String   @id @default(uuid())
+  videoId   String
+  userId    String
+  text      String
+  createdAt DateTime @default(now())
+
+  @@index([videoId, createdAt])
+  @@index([userId])
+}
+
+enum VideoEditStatus {
+  QUEUED
+  PROCESSING
+  DONE
+  FAILED
+}
+
+// A video being edited on the server: the creator's original upload plus the
+// choices they made (trim, filter, effect, text and stickers as one image, music),
+// rendered into the final video, which is then published.
+model VideoEditJob {
+  id            String          @id @default(uuid())
+  userId        String
+  countryCode   String
+  status        VideoEditStatus @default(QUEUED)
+  sourceKey     String
+  overlayKey    String?
+  musicKey      String?
+  spec          Json
+  title         String
+  caption       String?
+  tag           String?
+  allowGifts    Boolean         @default(true)
+  musicTitle    String?
+  videoId       String?
+  error         String?
+  createdAt     DateTime        @default(now())
+  startedAt     DateTime?
+  finishedAt    DateTime?
+
+  @@index([userId, createdAt])
+  @@index([status])
 }

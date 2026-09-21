@@ -48,8 +48,12 @@ export class AnnouncementsService {
   ) {}
 
   // What the app's scrolling strip shows: the admin's own messages first, then
-  // what really just happened on the platform (the biggest recent win and gift).
-  // Nothing is invented — with no activity the strip is simply empty.
+  // the biggest recent win. Gifts are deliberately left out of this banner —
+  // a big gift already gets its own on-screen moment via GiftTicker in the
+  // room itself, and repeating it here just crowds the header strip with the
+  // same news twice. Nothing is invented — with no activity the strip is
+  // simply empty. topGifts() is kept below (unused by banner()) in case a
+  // separate "top gifters" surface wants it later.
   async banner(now = Date.now()): Promise<BannerItem[]> {
     if (this.cache && now - this.cache.at < CACHE_MS) return this.cache.items;
     const at = new Date(now);
@@ -65,7 +69,7 @@ export class AnnouncementsService {
     });
 
     const items: BannerItem[] = custom.map((a) => ({ id: `a:${a.id}`, kind: 'CUSTOM', text: a.text }));
-    items.push(...(await this.bigWins(since)), ...(await this.topGifts(since)));
+    items.push(...(await this.bigWins(since)));
 
     this.cache = { at: now, items };
     return items;

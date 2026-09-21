@@ -1,6 +1,8 @@
+import { LiveMediaService } from './live-media.service';
 import {
   BadRequestException,
   ForbiddenException,
+  Optional,
   HttpException,
   HttpStatus,
   Inject,
@@ -23,6 +25,7 @@ export class LiveService {
     @Inject(RTC_PROVIDER) private readonly rtc: RtcProvider,
     private readonly featureFlags: FeatureFlagsService,
     private readonly realtime: RealtimeGateway,
+    @Optional() private readonly media?: LiveMediaService,
   ) {}
 
   // Per-user like throttle: recent (timestamp, count) entries within the
@@ -139,6 +142,8 @@ export class LiveService {
     if (session.status === 'ENDED') {
       return this.prisma.liveSession.findUniqueOrThrow({ where: { id: session.id } });
     }
+    // A video being shared in this live ends with it.
+    this.media?.clear(session.id);
 
     await this.rtc.destroyChannel(session.providerChannel);
 
@@ -282,6 +287,9 @@ export class LiveService {
   // ── Likes, summary, chat history ────────────────────────────────
 
   async like(sessionId: string, userId: string, count?: number) {
+    // Likes are how an audience shows appreciation; a host can't like their own stream.
+    const owner = await this.prisma.liveSession.findUnique({ where: { id: sessionId }, select: { hostId: true } });
+    if (owner && owner.hostId === userId) throw new ForbiddenException("You can't like your own live");
     const n = Math.min(Math.max(Math.floor(Number(count)) || 1, 1), this.LIKE_MAX_PER_REQUEST);
 
     const now = Date.now();

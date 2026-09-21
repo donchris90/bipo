@@ -9,6 +9,15 @@ import { assertNotBlocked } from '../common/blocks';
 const COUNTDOWN_MS = 10_000;
 const DEFAULT_BATTLE_DURATION_MS = 3 * 60_000;
 
+function shuffle<T>(items: T[]): T[] {
+  const a = [...items];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 @Injectable()
 export class PkService {
   constructor(
@@ -21,6 +30,19 @@ export class PkService {
   async challenge(challengerId: string, opponentId: string) {
     if (challengerId === opponentId) throw new BadRequestException('Cannot challenge yourself');
     await assertNotBlocked(this.prisma, challengerId, opponentId, "You can't challenge this user");
+
+    // Only someone who is online can be challenged (otherwise the challenge just
+    // sits unseen), and not someone already in a battle.
+    if (!(await this.realtime.isUserOnline(opponentId))) throw new BadRequestException("They aren't online right now");
+    const busy = await this.prisma.pKBattle.findFirst({
+      where: { status: { in: ['ACCEPTED', 'COUNTDOWN', 'ACTIVE'] }, OR: [{ challengerId: opponentId }, { opponentId }] },
+      select: { id: true },
+    });
+    if (busy) throw new BadRequestException('They are in a PK battle right now');
+    // Tapping Challenge twice must not send two challenges.
+    const pending = await this.prisma.pKBattle.findFirst({ where: { challengerId, opponentId, status: 'CHALLENGED' } });
+    if (pending) return pending;
+
     const battle = await this.prisma.pKBattle.create({
       data: { challengerId, opponentId, status: 'CHALLENGED' },
     });
@@ -30,15 +52,114 @@ export class PkService {
     // follow-up lookup.
     const challenger = await this.prisma.user.findUnique({
       where: { id: challengerId },
-      select: { displayName: true },
+      select: { displayName: true, avatarUrl: true },
     });
     await this.notifications.notify(opponentId, 'PK_CHALLENGE', {
       battleId: battle.id,
       challengerId,
       challengerDisplayName: challenger?.displayName ?? null,
     });
+    // Instantly, to wherever they are in the app, so the challenge can appear on
+    // their screen as a banner (the inbox item above is the record of it).
+    this.realtime.emitToUser(opponentId, 'pk:challenge', {
+      battleId: battle.id,
+      challengerId,
+      challengerDisplayName: challenger?.displayName ?? null,
+      challengerAvatarUrl: challenger?.avatarUrl ?? null,
+    });
 
     return battle;
+  }
+
+  // ── choosing an opponent ─────────────────────────────────────────
+
+  // Who you can challenge, in one of three groups — always people who are online
+  // right now, never yourself, anyone you have blocked (or who blocked you), or
+  // anyone already in a battle.
+  //   friends — people you follow who follow you back
+  //   agency  — the other creators in your agency (and its owner)
+  //   random  — creators who are online, in no particular order
+  async candidates(userId: string, category: 'friends' | 'agency' | 'random') {
+    const online = await this.realtime.onlineUserIds();
+    online.delete(userId);
+
+    let pool: Set<string>;
+    if (category === 'friends') {
+      const following = await this.prisma.follow.findMany({ where: { followerId: userId }, select: { followingId: true }, take: 2000 });
+      const followingIds = following.map((f) => f.followingId).filter((id) => online.has(id));
+      const back = followingIds.length
+        ? await this.prisma.follow.findMany({ where: { followerId: { in: followingIds }, followingId: userId }, select: { followerId: true } })
+        : [];
+      pool = new Set(back.map((f) => f.followerId));
+    } else if (category === 'agency') {
+      pool = await this.agencyMates(userId);
+    } else {
+      const creators = await this.prisma.userRole.findMany({ where: { role: 'CREATOR', userId: { in: [...online] } }, select: { userId: true }, take: 2000 });
+      pool = new Set(creators.map((c) => c.userId));
+    }
+    pool = new Set([...pool].filter((id) => id !== userId && online.has(id)));
+
+    if (pool.size > 0) {
+      const [blocks, busy] = await Promise.all([
+        this.prisma.block.findMany({ where: { OR: [{ blockerId: userId }, { blockedId: userId }] }, select: { blockerId: true, blockedId: true } }),
+        this.prisma.pKBattle.findMany({ where: { status: { in: ['ACCEPTED', 'COUNTDOWN', 'ACTIVE'] } }, select: { challengerId: true, opponentId: true } }),
+      ]);
+      for (const b of blocks) {
+        pool.delete(b.blockerId);
+        pool.delete(b.blockedId);
+      }
+      for (const b of busy) {
+        pool.delete(b.challengerId);
+        pool.delete(b.opponentId);
+      }
+    }
+
+    const ids = [...pool].slice(0, 300);
+    const [users, live] = ids.length
+      ? await Promise.all([
+          this.prisma.user.findMany({ where: { id: { in: ids }, status: 'ACTIVE' }, select: { id: true, displayName: true, avatarUrl: true } }),
+          this.prisma.liveSession.findMany({ where: { hostId: { in: ids }, status: 'LIVE' }, select: { id: true, hostId: true, title: true } }),
+        ])
+      : [[], []];
+    const liveByHost = new Map(live.map((l) => [l.hostId, { sessionId: l.id, title: l.title }]));
+    let list = users.map((u) => ({ userId: u.id, displayName: u.displayName, avatarUrl: u.avatarUrl, live: liveByHost.get(u.id) ?? null }));
+
+    if (category === 'random') list = shuffle(list).slice(0, 30);
+    else list.sort((a, b) => Number(!!b.live) - Number(!!a.live) || (a.displayName ?? '').localeCompare(b.displayName ?? ''));
+
+    return { category, onlineCount: list.length, candidates: list };
+  }
+
+  private async agencyMates(userId: string): Promise<Set<string>> {
+    const mine = await this.prisma.agencyMembership.findFirst({ where: { creatorId: userId, status: 'ACTIVE' }, select: { agencyId: true } });
+    const owned = await this.prisma.agency.findFirst({ where: { ownerId: userId }, select: { id: true } });
+    const agencyId = mine?.agencyId ?? owned?.id;
+    if (!agencyId) return new Set();
+    const [members, agency] = await Promise.all([
+      this.prisma.agencyMembership.findMany({ where: { agencyId, status: 'ACTIVE' }, select: { creatorId: true } }),
+      this.prisma.agency.findUnique({ where: { id: agencyId }, select: { ownerId: true } }),
+    ]);
+    const ids = new Set(members.map((m) => m.creatorId));
+    if (agency?.ownerId) ids.add(agency.ownerId);
+    return ids;
+  }
+
+  // "Random match": picks one online creator and challenges them.
+  async randomChallenge(userId: string) {
+    const { candidates } = await this.candidates(userId, 'random');
+    if (candidates.length === 0) throw new NotFoundException('No one is available for a PK right now. Try again in a moment.');
+    const pick = candidates[Math.floor(Math.random() * candidates.length)];
+    const battle = await this.challenge(userId, pick.userId);
+    return { battle, opponent: { userId: pick.userId, displayName: pick.displayName, avatarUrl: pick.avatarUrl } };
+  }
+
+  // The challenged person says no.
+  async decline(battleId: string, userId: string) {
+    const battle = await this.prisma.pKBattle.findUnique({ where: { id: battleId } });
+    if (!battle) throw new NotFoundException('Battle not found');
+    if (battle.opponentId !== userId) throw new ForbiddenException('Only the challenged creator can decline');
+    if (battle.status !== 'CHALLENGED') throw new BadRequestException('Battle is not awaiting a reply');
+    return this.prisma.pKBattle.update({ where: { id: battleId }, data: { status: 'CANCELLED' } });
   }
 
   // Without this, a challenged user has no way to ever discover the

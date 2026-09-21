@@ -1,3 +1,4 @@
+import { VideoEditService } from './video-edit.service';
 import {
   Body,
   Controller,
@@ -32,7 +33,10 @@ function assertCreator(req: AuthedRequest) {
 @Controller('api/v1/videos')
 @UseGuards(JwtAuthGuard)
 export class VideosController {
-  constructor(private readonly videos: VideosService) {}
+  constructor(
+    private readonly videos: VideosService,
+    private readonly edits: VideoEditService,
+  ) {}
 
   // ── Creator ──
 
@@ -95,8 +99,43 @@ export class VideosController {
   // ── Everyone ──
 
   @Get()
-  feed(@Req() req: AuthedRequest, @Query('limit') limit?: string, @Query('before') before?: string) {
-    return this.videos.feed(req.user.userId, limit ? Number(limit) : undefined, before);
+  feed(
+    @Req() req: AuthedRequest,
+    @Query('limit') limit?: string,
+    @Query('before') before?: string,
+    @Query('tab') tab?: string,
+    @Query('offset') offset?: string,
+  ) {
+    return this.videos.feed(req.user.userId, { limit: limit ? Number(limit) : undefined, before, tab, offset: offset ? Number(offset) : undefined });
+  }
+
+  // ── Editing (creators): upload the pieces, ask for a render, follow its progress ──
+
+  @Post('edits/uploads')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  editUpload(@Body() body: { asset?: unknown; contentType?: string; sizeBytes?: number }, @Req() req: AuthedRequest) {
+    assertCreator(req);
+    return this.edits.requestAssetUpload(req.user.userId, body?.asset, body?.contentType as string, body?.sizeBytes as number);
+  }
+
+  @Post('edits')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  createEdit(@Body() body: any, @Req() req: AuthedRequest) {
+    assertCreator(req);
+    return this.edits.create(req.user.userId, req.user.countryCode, body ?? {});
+  }
+
+  @Get('edits/:jobId')
+  editStatus(@Param('jobId') jobId: string, @Req() req: AuthedRequest) {
+    return this.edits.get(req.user.userId, jobId);
+  }
+
+  // Must come before @Get(':id') below.
+  @Get('search')
+  search(@Query('q') q: string | undefined, @Req() req: AuthedRequest) {
+    return this.videos.search(req.user.userId, q);
   }
 
   @Get(':id')
@@ -107,6 +146,30 @@ export class VideosController {
   @Post(':id/view')
   view(@Param('id') id: string, @Req() req: AuthedRequest) {
     return this.videos.recordView(req.user.userId, id);
+  }
+
+  @Get(':id/comments')
+  comments(@Param('id') id: string, @Req() req: AuthedRequest, @Query('limit') limit?: string, @Query('before') before?: string) {
+    return this.videos.listComments(req.user.userId, id, limit ? Number(limit) : undefined, before);
+  }
+
+  @Post(':id/comments')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  addComment(@Param('id') id: string, @Body('text') text: string, @Req() req: AuthedRequest) {
+    return this.videos.addComment(req.user.userId, id, text);
+  }
+
+  @Delete(':id/comments/:commentId')
+  deleteComment(@Param('id') id: string, @Param('commentId') commentId: string, @Req() req: AuthedRequest) {
+    return this.videos.deleteComment(req.user.userId, id, commentId);
+  }
+
+  @Post(':id/share')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  share(@Param('id') id: string) {
+    return this.videos.share(id);
   }
 
   @Post(':id/like')

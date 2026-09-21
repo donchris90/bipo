@@ -1,4 +1,7 @@
 import { Body, Controller, Get, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
+import { UserThrottlerGuard } from '../common/guards/user-throttler.guard';
+import { LiveMediaService } from './live-media.service';
 import { Request } from 'express';
 import { LiveService } from './live.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -11,7 +14,10 @@ interface AuthedRequest extends Request {
 @Controller('api/v1/live')
 @UseGuards(JwtAuthGuard)
 export class LiveController {
-  constructor(private readonly live: LiveService) {}
+  constructor(
+    private readonly live: LiveService,
+    private readonly media: LiveMediaService,
+  ) {}
 
   @Get()
   list() {
@@ -42,6 +48,20 @@ export class LiveController {
   @Post(':id/join')
   join(@Param('id') id: string, @Req() req: AuthedRequest) {
     return this.live.joinToken(id, req.user.userId);
+  }
+
+  // The video the host is sharing right now (so someone who joins late catches up).
+  @Get(':id/media')
+  currentMedia(@Param('id') id: string) {
+    return this.media.get(id);
+  }
+
+  // Host only: load a published video into the live, play, pause, seek, stop.
+  @Post(':id/media')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 60, ttl: 60_000 } })
+  controlMedia(@Param('id') id: string, @Body() body: { action?: unknown; videoId?: unknown; positionMs?: unknown }, @Req() req: AuthedRequest) {
+    return this.media.act(id, req.user.userId, body ?? {});
   }
 
   @Post(':id/end')

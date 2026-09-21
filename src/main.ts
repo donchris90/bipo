@@ -1,8 +1,9 @@
-import { NestFactory } from '@nestjs/core';
+import { HttpAdapterHost, NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { ThrottlerExceptionFilter } from './common/filters/throttler-exception.filter';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { isOriginAllowed, parseOrigins } from './common/cors';
 import { checkEnv } from './common/env-check';
 
@@ -23,7 +24,9 @@ async function bootstrap() {
   // other than the true raw body is not a real signature check.
   const app = await NestFactory.create<NestExpressApplication>(AppModule, { rawBody: true });
 
-  app.useGlobalFilters(new ThrottlerExceptionFilter());
+  // Order matters: the last filter registered is asked first, so the specific
+  // throttle filter sits after the catch-all that adds the request to error logs.
+  app.useGlobalFilters(new AllExceptionsFilter(app.get(HttpAdapterHost).httpAdapter), new ThrottlerExceptionFilter());
 
   // Browsers block a web page (the admin dashboard) from calling this API unless
   // the API says it may. There was no CORS setting at all before, so the admin

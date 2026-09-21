@@ -13,3 +13,9 @@ describe('security push messages', () => {
     expect(describeForPush('SECURITY' as any, {})?.title).toBe('Security alert');
   });
 });
+
+describe('profile visits', () => {
+  it('never buzz the phone — a popular profile would notify all day; they show in the inbox only', () => {
+    expect(describeForPush('PROFILE_VISIT' as any, { visitorName: 'Bo' })).toBeNull();
+  });
+});

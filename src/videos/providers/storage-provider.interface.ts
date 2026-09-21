@@ -25,6 +25,9 @@ export interface StorageProvider {
   // such as "bytes=0-1023". Null when the object does not exist.
   readObject?(key: string, range?: string): Promise<ObjectRead | null>;
 
+  // Stores a file from the server's own disk (used for videos the server renders).
+  putFile?(key: string, path: string, contentType: string): Promise<void>;
+
   // A safe self-test for admins: can we reach the bucket with these credentials?
   check?(): Promise<StorageCheck>;
 }
@@ -67,6 +70,9 @@ export class UnavailableStorageProvider implements StorageProvider {
     /* nothing stored */
   }
   async readObject(): Promise<never> {
+    return notConfigured('Video storage', this.reason);
+  }
+  async putFile(): Promise<never> {
     return notConfigured('Video storage', this.reason);
   }
   async check(): Promise<StorageCheck> {

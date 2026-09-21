@@ -31,6 +31,7 @@ import { AdminModule } from './admin/admin.module';
 import { PayoutsModule } from './payouts/payouts.module';
 import { KycModule } from './kyc/kyc.module';
 import { AnnouncementsModule } from './announcements/announcements.module';
+import { ProfilesModule } from './profiles/profiles.module';
 import { WebhookRouterModule } from './common/webhook-router.service';
 
 @Module({
@@ -67,6 +68,7 @@ import { WebhookRouterModule } from './common/webhook-router.service';
     PayoutsModule,
     KycModule,
     AnnouncementsModule,
+    ProfilesModule,
     WebhookRouterModule,
   ],
 })

@@ -105,3 +105,24 @@ describe('GiftService', () => {
     expect(await wallet.getBalance('agency-owner', WalletType.AGENCY_EARNINGS)).toBe(14n);
   });
 });
+
+describe('gifts do not create notifications', () => {
+  it('a successful gift never calls the notification service (no inbox item, no phone push)', async () => {
+    const prisma = new FakePrisma();
+    const wallet = new WalletService(prisma as any);
+    const notifications: any = { notifyGift: jest.fn(), notify: jest.fn(), notifyOnce: jest.fn() };
+    const gifts = new GiftService(prisma as any, wallet, new RevenueSplitService(prisma as any), notifications);
+    prisma.users.set('sender', { id: 'sender', countryCode: 'NG' });
+    prisma.users.set('recipient', { id: 'recipient', countryCode: 'NG' });
+    prisma.gifts.set('rose', { id: 'rose', coinPrice: 100, active: true });
+    await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+
+    await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'g-1' });
+
+    expect(notifications.notifyGift).not.toHaveBeenCalled();
+    expect(notifications.notify).not.toHaveBeenCalled();
+    expect(notifications.notifyOnce).not.toHaveBeenCalled();
+    // ...while the money still moves exactly as before
+    expect(await wallet.getBalance('recipient', WalletType.CREATOR_EARNINGS)).toBe(70n);
+  });
+});

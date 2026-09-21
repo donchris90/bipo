@@ -184,13 +184,12 @@ export class GiftService {
       await this.applyPkScore(params.pkBattleId, params.senderId, coinAmount);
     }
 
-    // Only reached for a gift that was actually just made (an idempotent
-    // replay returned early above), so a retry can't notify twice.
-    void this.notifications?.notifyGift(
-      params.recipientId,
-      { id: sender.id, displayName: sender.displayName ?? null },
-      coinAmount,
-    );
+    // Deliberately NO notification here. A busy stream can receive hundreds of
+    // gifts; each one used to add to the recipient's inbox and buzz their phone,
+    // burying everything else. A gift is shown where it happens — the on-screen
+    // gift moment in the live / room — and counted in the creator's earnings.
+    // (Existing gift notifications in old inboxes still display; new ones are
+    // not created.)
 
     // Broadcasting the gift event to the live/room WebSocket channel happens
     // in the controller/gateway layer, which has access to the Socket.IO

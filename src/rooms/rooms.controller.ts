@@ -1,3 +1,4 @@
+import { cleanRoomInput } from './room-input';
 import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { Request } from 'express';
 import { RoomsService } from './rooms.service';
@@ -49,16 +50,11 @@ export class RoomsController {
   }
 
   @Post()
-  create(
-    @Body('title') title: string,
-    @Body('privacy') privacy: RoomPrivacy = 'PUBLIC',
-    @Body('seatCount') seatCount = 8,
-    @Body('category') category: string | undefined,
-    @Body('themeColor') themeColor: string | undefined,
-    @Body('mode') mode: string | undefined,
-    @Req() req: AuthedRequest,
-  ) {
-    return this.rooms.create(req.user.userId, title, privacy, seatCount, req.user.countryCode, category, themeColor, mode);
+  create(@Body() body: Record<string, unknown>, @Req() req: AuthedRequest) {
+    // Validated and defaulted first: a blank or odd value is fixed or answered with
+    // a 400 that names the problem, never passed on to fail inside the database.
+    const input = cleanRoomInput(body ?? {});
+    return this.rooms.create(req.user.userId, input.title, input.privacy, input.seatCount, req.user.countryCode, input.category, input.themeColor, input.mode);
   }
 
   @Post(':id/seats/:seatNumber')

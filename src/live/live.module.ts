@@ -1,3 +1,4 @@
+import { LiveMediaService } from './live-media.service';
 import { Logger, Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { LiveService, RTC_PROVIDER } from './live.service';
@@ -15,6 +16,7 @@ const logger = new Logger('LiveModule');
   imports: [FeatureFlagsModule, ConfigModule, RealtimeModule],
   providers: [
     LiveService,
+    LiveMediaService,
     LiveReaperService,
     {
       provide: RTC_PROVIDER,
@@ -36,6 +38,6 @@ const logger = new Logger('LiveModule');
     },
   ],
   controllers: [LiveController],
-  exports: [LiveService, RTC_PROVIDER],
+  exports: [LiveService, LiveMediaService, RTC_PROVIDER],
 })
 export class LiveModule {}
