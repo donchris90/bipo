@@ -1,3 +1,4 @@
+import { GamesReadinessService } from './games-readiness';
 import { Body, Controller, Get, Param, Post, Put, Req, UseGuards } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { UserThrottlerGuard } from '../common/guards/user-throttler.guard';
@@ -261,7 +262,14 @@ export class GameOperatorController {
     private readonly rounds: RoundService,
     private readonly settlement: SettlementService,
     private readonly gameAdmin: GameAdminService,
+    private readonly readiness: GamesReadinessService,
   ) {}
+
+  // "Why can't people play?" — every condition a game needs, and which is missing.
+  @Get('readiness')
+  readinessReport() {
+    return this.readiness.report();
+  }
 
   // Restricted to SUPER_ADMIN, not GAME_OPERATOR — flipping a game live is
   // the legal-clearance gate from spec §96, a bigger decision than the

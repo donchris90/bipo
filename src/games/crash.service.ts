@@ -14,6 +14,16 @@ import {
 } from './crash-rules';
 import { WalletType, LedgerEntryType } from '@prisma/client';
 
+export interface CrashStatusView {
+  status: 'SCHEDULED' | 'OPEN' | 'LIVE' | 'CRASHED';
+  multiplier: number | null;
+  // While LIVE: how the app can draw the flight between checks.
+  growthRate?: number;
+  elapsedMs?: number;
+  // The server's clock when this was answered.
+  serverNow: number;
+}
+
 interface CrashRules {
   houseEdge: number;
   growthRate: number;
@@ -63,32 +73,39 @@ export class CrashService {
   // the crash point ahead of official settlement, even in the brief window
   // after the round has technically crashed but the settlement job hasn't
   // run yet (a real race, given job execution isn't instantaneous).
-  async getStatus(
-    roundId: string,
-  ): Promise<{ status: 'SCHEDULED' | 'OPEN' | 'LIVE' | 'CRASHED'; multiplier: number | null }> {
+  async getStatus(roundId: string, now: number = Date.now()): Promise<CrashStatusView> {
     const round = await this.prisma.gameRound.findUniqueOrThrow({ where: { id: roundId } });
 
     if (round.status === 'SETTLED') {
       const result = round.result as any;
-      return { status: 'CRASHED', multiplier: result?.crashPoint ?? null };
+      return { status: 'CRASHED', multiplier: result?.crashPoint ?? null, serverNow: now };
     }
     if (round.status !== 'LOCKED') {
-      return { status: round.status as 'SCHEDULED' | 'OPEN', multiplier: 1.0 };
+      return { status: round.status as 'SCHEDULED' | 'OPEN', multiplier: 1.0, serverNow: now };
     }
 
     const rules = await this.crashRulesFor(round.gameCode);
     const hidden = round.hiddenState as any;
-    if (!rules || !hidden?.crashPoint) return { status: 'LIVE', multiplier: 1.0 };
+    if (!rules || !hidden?.crashPoint) return { status: 'LIVE', multiplier: 1.0, serverNow: now };
 
-    const elapsedSeconds = (Date.now() - round.lockAt.getTime()) / 1000;
+    const elapsedSeconds = (now - round.lockAt.getTime()) / 1000;
     const crashAt = crashTimeSeconds(hidden.crashPoint, rules.growthRate);
     if (elapsedSeconds >= crashAt) {
       // Already crashed by wall-clock time but the settlement job hasn't
       // finalized it yet — report the fact of the crash, not the exact
       // point, since that's only official once settlement writes `result`.
-      return { status: 'CRASHED', multiplier: null };
+      return { status: 'CRASHED', multiplier: null, serverNow: now };
     }
-    return { status: 'LIVE', multiplier: currentMultiplier(elapsedSeconds, rules.growthRate) };
+    // `growthRate` and `elapsedMs` let the app draw the flight smoothly between
+    // checks (the multiplier is exp(growthRate x seconds), a known curve). They give
+    // away nothing about WHEN it will crash: that stays hidden until it has.
+    return {
+      status: 'LIVE',
+      multiplier: currentMultiplier(elapsedSeconds, rules.growthRate),
+      growthRate: rules.growthRate,
+      elapsedMs: Math.max(0, Math.round(elapsedSeconds * 1000)),
+      serverNow: now,
+    };
   }
 
   // A manual cash-out request — the one action in this whole game that's a

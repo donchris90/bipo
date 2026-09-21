@@ -1,3 +1,5 @@
+import { GiftAdminController } from './gift-admin.controller';
+import { GiftAdminService } from './gift-admin';
 import { Logger, Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { WalletService } from './wallet.service';
@@ -18,7 +20,7 @@ const logger = new Logger('EconomyModule');
 
 @Module({
   imports: [ConfigModule, RealtimeModule, NotificationsModule],
-  providers: [
+  providers: [GiftAdminService, 
     WalletService,
     RevenueSplitService,
     CoinPurchaseService,
@@ -47,7 +49,7 @@ const logger = new Logger('EconomyModule');
       },
     },
   ],
-  controllers: [WalletController, CoinPurchaseController, GiftController, PaymentWebhookController],
+  controllers: [WalletController, CoinPurchaseController, GiftController, GiftAdminController, PaymentWebhookController],
   exports: [WalletService, RevenueSplitService, GiftService, ChargebackService],
 })
 export class EconomyModule {}

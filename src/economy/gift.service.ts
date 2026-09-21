@@ -1,3 +1,4 @@
+import { DAY_MS, DEFAULT_DAY_OFFSET_MINUTES, dayPeriod } from '../common/day-period';
 import { BadRequestException, Injectable, NotFoundException, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from './wallet.service';
@@ -38,6 +39,73 @@ export interface SendGiftParams {
   idempotencyKey: string;
 }
 
+export interface BackpackGift {
+  giftId: string;
+  code: string | null;
+  name: string;
+  icon: string | null;
+  count: number;
+  coinValue: number;
+  senders: { userId: string; displayName: string | null; count: number }[];
+}
+export interface BackpackDay {
+  date: string; // YYYY-MM-DD in Nigeria time
+  isToday: boolean;
+  totalCount: number;
+  totalCoins: number;
+  gifts: BackpackGift[];
+}
+
+const dayKey = (d: Date, offsetMinutes: number) => new Date(d.getTime() + offsetMinutes * 60_000).toISOString().slice(0, 10);
+
+// Pure, so the grouping has direct tests. Every day in the span is returned (a day
+// with nothing received is an empty day), newest first.
+export function groupBackpack(
+  rows: { giftId: string; senderId: string; coinAmount: number; createdAt: Date }[],
+  giftById: Map<string, { id: string; code: string; name: string; icon: string | null }>,
+  nameById: Map<string, string | null>,
+  todayStart: Date,
+  offsetMinutes: number,
+  span: number,
+): BackpackDay[] {
+  const days = new Map<string, BackpackDay>();
+  const todayKey = dayKey(todayStart, offsetMinutes);
+  for (let i = 0; i < span; i++) {
+    const key = dayKey(new Date(todayStart.getTime() - i * DAY_MS), offsetMinutes);
+    days.set(key, { date: key, isToday: key === todayKey, totalCount: 0, totalCoins: 0, gifts: [] });
+  }
+  const perDayGift = new Map<string, BackpackGift>();
+  const perDayGiftSender = new Map<string, Map<string, number>>();
+  for (const r of rows) {
+    const key = dayKey(r.createdAt, offsetMinutes);
+    const day = days.get(key);
+    if (!day) continue;
+    const gk = `${key}|${r.giftId}`;
+    let g = perDayGift.get(gk);
+    if (!g) {
+      const info = giftById.get(r.giftId);
+      g = { giftId: r.giftId, code: info?.code ?? null, name: info?.name ?? 'Gift', icon: info?.icon ?? null, count: 0, coinValue: 0, senders: [] };
+      perDayGift.set(gk, g);
+      day.gifts.push(g);
+      perDayGiftSender.set(gk, new Map());
+    }
+    g.count += 1;
+    g.coinValue += r.coinAmount;
+    day.totalCount += 1;
+    day.totalCoins += r.coinAmount;
+    const sm = perDayGiftSender.get(gk)!;
+    sm.set(r.senderId, (sm.get(r.senderId) ?? 0) + 1);
+  }
+  for (const [gk, g] of perDayGift) {
+    g.senders = [...perDayGiftSender.get(gk)!.entries()]
+      .map(([userId, count]) => ({ userId, displayName: nameById.get(userId) ?? null, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
+  }
+  for (const day of days.values()) day.gifts.sort((a, b) => b.coinValue - a.coinValue);
+  return [...days.values()];
+}
+
 @Injectable()
 export class GiftService {
   constructor(
@@ -58,7 +126,7 @@ export class GiftService {
     return this.prisma.gift.findMany({
       where: { active: true },
       orderBy: { coinPrice: 'asc' },
-      select: { id: true, code: true, name: true, coinPrice: true, category: true },
+      select: { id: true, code: true, name: true, coinPrice: true, category: true, icon: true },
     });
   }
 
@@ -235,6 +303,31 @@ export class GiftService {
   // the thousands for an active creator; "you have 12x Rose, 3x Crown"
   // is what an inventory view actually needs). Same groupBy + join
   // pattern as ranking() above.
+  // The backpack: what this person RECEIVED, day by day (Nigeria time), newest day
+  // first — each day lists every gift with how many, what they were worth, and who
+  // sent them. This is where received gifts are shown (they no longer create
+  // notifications or appear in the header banner).
+  async backpack(userId: string, days = 7, now = new Date(), offsetMinutes = DEFAULT_DAY_OFFSET_MINUTES) {
+    const span = Math.min(Math.max(Math.floor(days) || 7, 1), 60);
+    const today = dayPeriod(now, offsetMinutes);
+    const since = new Date(today.start.getTime() - (span - 1) * DAY_MS);
+    const rows = await this.prisma.giftTransaction.findMany({
+      where: { recipientId: userId, createdAt: { gte: since } },
+      orderBy: { createdAt: 'desc' },
+      take: 5000,
+      select: { giftId: true, senderId: true, coinAmount: true, createdAt: true },
+    });
+    const giftIds = [...new Set(rows.map((r) => r.giftId))];
+    const senderIds = [...new Set(rows.map((r) => r.senderId))];
+    const [gifts, senders] = await Promise.all([
+      giftIds.length ? this.prisma.gift.findMany({ where: { id: { in: giftIds } }, select: { id: true, code: true, name: true, icon: true } }) : [],
+      senderIds.length ? this.prisma.user.findMany({ where: { id: { in: senderIds } }, select: { id: true, displayName: true } }) : [],
+    ]);
+    const giftById = new Map(gifts.map((g) => [g.id, g]));
+    const nameById = new Map(senders.map((s) => [s.id, s.displayName]));
+    return groupBackpack(rows, giftById, nameById, today.start, offsetMinutes, span);
+  }
+
   async received(userId: string) {
     const grouped = await this.prisma.giftTransaction.groupBy({
       by: ['giftId'],

@@ -100,7 +100,7 @@ async function main() {
   await prisma.gift.upsert({
     where: { code: 'ROSE' },
     update: {},
-    create: { code: 'ROSE', name: 'Rose', coinPrice: 10, category: 'classic' },
+    create: { code: 'ROSE', name: 'Rose', coinPrice: 10, category: 'classic', icon: '🌹' },
   });
 
   // Registered DISABLED by default — flip to ACTIVE only after Phase 0

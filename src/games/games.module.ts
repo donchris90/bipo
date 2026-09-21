@@ -1,3 +1,4 @@
+import { GamesReadinessService } from './games-readiness';
 import { Module } from '@nestjs/common';
 import { RngService } from './rng.service';
 import { RoundService } from './round.service';
@@ -13,7 +14,7 @@ import { FeatureFlagsModule } from '../feature-flags/feature-flags.module';
 
 @Module({
   imports: [EconomyModule, RegionalConfigModule, FeatureFlagsModule],
-  providers: [RngService, RoundService, EntryService, SettlementService, CrashService, GameAdminService, RoundSchedulerService],
+  providers: [RngService, RoundService, EntryService, SettlementService, CrashService, GameAdminService, RoundSchedulerService, GamesReadinessService],
   controllers: [GamesController, GameOperatorController],
   exports: [RoundService, SettlementService, CrashService],
 })

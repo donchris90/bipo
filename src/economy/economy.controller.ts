@@ -129,6 +129,12 @@ export class GiftController {
     return this.gifts.received(req.user.userId);
   }
 
+  // The backpack: gifts received, day by day (today first), with who sent them.
+  @Get('backpack')
+  backpack(@Query('days') days: string | undefined, @Req() req: AuthedRequest) {
+    return this.gifts.backpack(req.user.userId, days ? Number(days) : 7);
+  }
+
   @Post('send')
   @UseGuards(UserThrottlerGuard)
   @Throttle({ default: { limit: 120, ttl: 60_000 } })
@@ -168,11 +174,25 @@ export class GiftController {
     // broadcast plumbing existing. Only fires when the gift is actually
     // tied to a live room (context+contextId present); a gift sent
     // outside any room has nowhere to broadcast to.
-    if (context && contextId) {
+    if ((context === 'LIVE' || context === 'ROOM') && contextId) {
+      // Everything a screen needs to animate the gift from the sender to the
+      // receiver (and label it) without another lookup.
+      const [gift, people] = await Promise.all([
+        this.prisma.gift.findUnique({ where: { id: giftId }, select: { name: true, icon: true } }),
+        this.prisma.user.findMany({ where: { id: { in: [req.user.userId, recipientId] } }, select: { id: true, displayName: true, avatarUrl: true } }),
+      ]);
+      const sender = people.find((p) => p.id === req.user.userId);
+      const recipient = people.find((p) => p.id === recipientId);
       this.realtime.broadcastGift(context, contextId, {
+        id: transaction.id,
         senderId: req.user.userId,
+        senderName: sender?.displayName ?? null,
+        senderAvatarUrl: sender?.avatarUrl ?? null,
         recipientId,
+        recipientName: recipient?.displayName ?? null,
         giftId,
+        giftName: gift?.name ?? null,
+        giftIcon: gift?.icon ?? null,
         coinAmount: transaction.coinAmount,
       });
     }
