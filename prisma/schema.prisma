@@ -222,6 +222,17 @@ model RoomSeat {
   @@unique([roomId, userId])
 }
 
+
+model RoomSeatLock {
+  id         String   @id @default(uuid())
+  roomId     String
+  seatNumber Int
+  createdAt  DateTime @default(now())
+
+  @@unique([roomId, seatNumber])
+  @@index([roomId])
+}
+
 model SeatRequest {
   id            String            @id @default(uuid())
   roomId        String

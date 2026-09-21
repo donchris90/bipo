@@ -1,6 +1,6 @@
 import { WalletType } from '@prisma/client';
 import { FakePrisma } from '../test-utils/fake-prisma';
-import { grantCoins } from './grant-coins';
+import { grantCoins, parseGrantArgs } from './grant-coins';
 
 function build(existing = 0n) {
   const prisma: any = new FakePrisma();
@@ -59,5 +59,29 @@ describe('grantCoins', () => {
     await grantCoins(prisma, { email: 'donchris4life2006@gmail.com', amount: 100, apply: true });
     await grantCoins(prisma, { email: 'donchris4life2006@gmail.com', amount: 100, apply: true });
     expect(prisma.wallets.get('u1:COIN').balance).toBe(200n);
+  });
+});
+
+describe('parseGrantArgs — the command line', () => {
+  it('a plain preview', () => {
+    expect(parseGrantArgs(['a@b.co', '10000'])).toEqual({ email: 'a@b.co', amount: 10000, wallet: 'COIN', note: undefined, apply: false });
+  });
+
+  it('the plain words work (npm on Windows swallows --yes and --note)', () => {
+    expect(parseGrantArgs(['a@b.co', '500', 'apply', 'bonus', 'note=support gift'])).toMatchObject({ amount: 500, wallet: 'BONUS', note: 'support gift', apply: true });
+  });
+
+  it('the dashed forms still work when they do arrive', () => {
+    expect(parseGrantArgs(['a@b.co', '500', '--yes', '--note', 'reason', '--bonus'])).toMatchObject({ apply: true, note: 'reason', wallet: 'BONUS' });
+    expect(parseGrantArgs(['a@b.co', '1,000', '-y'])).toMatchObject({ amount: 1000, apply: true });
+  });
+
+  it('an orphaned word (what was left when npm ate "--note") is an error, not a silent preview', () => {
+    expect(() => parseGrantArgs(['a@b.co', '10000', 'reason'])).toThrow(/Did not understand "reason"/);
+  });
+
+  it('needs an email and an amount', () => {
+    expect(() => parseGrantArgs(['a@b.co'])).toThrow(/Usage/);
+    expect(() => parseGrantArgs(['10000'])).toThrow(/Usage/);
   });
 });

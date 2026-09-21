@@ -21,24 +21,44 @@ export class ImageUploadService {
 
     const { base64 } = decodeImage(base64Input); // validates size + real image type
 
-    const form = new FormData();
-    form.append('image', base64);
+    // ImgBB accepts the image as a normal form field. URL-encoded requests are
+    // simpler and more reliable with Node's fetch than relying on multipart
+    // boundary handling through different Node/undici versions. Retry transient
+    // upstream failures because a 502/503 from the image host is not the user's
+    // connection failing.
+    const endpoint = `https://api.imgbb.com/1/upload?key=${encodeURIComponent(key)}`;
+    let lastStatus = 0;
+    let lastMessage = 'no detail';
 
-    let response: Response;
-    try {
-      response = await fetch(`https://api.imgbb.com/1/upload?key=${encodeURIComponent(key)}`, { method: 'POST', body: form });
-    } catch (e: any) {
-      this.logger.warn(`ImgBB request failed: ${e?.message ?? e}`);
-      throw new BadGatewayException('Image host is unreachable');
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const form = new URLSearchParams();
+        form.set('image', base64);
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: form.toString(),
+          signal: AbortSignal.timeout(30_000),
+        });
+        lastStatus = response.status;
+        const json: any = await response.json().catch(() => null);
+        const url = json?.data?.url;
+        if (response.ok && typeof url === 'string') return { url };
+        lastMessage = json?.error?.message ?? 'no detail';
+        // Retry only transient upstream failures. Validation/auth failures will
+        // not become better on the next attempt.
+        if (![408, 429, 500, 502, 503, 504].includes(response.status)) break;
+      } catch (e: any) {
+        lastMessage = e?.message ?? String(e);
+        if (attempt === 2) {
+          this.logger.warn(`ImgBB request failed: ${lastMessage}`);
+          throw new BadGatewayException('Image host is unreachable');
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
     }
 
-    const json: any = await response.json().catch(() => null);
-    const url = json?.data?.url;
-    if (!response.ok || typeof url !== 'string') {
-      // Log the host's reason; give the client a generic one (it may mention the key).
-      this.logger.warn(`ImgBB rejected the upload (${response.status}): ${json?.error?.message ?? 'no detail'}`);
-      throw new BadGatewayException('Image upload failed');
-    }
-    return { url };
+    this.logger.warn(`ImgBB rejected the upload (${lastStatus}): ${lastMessage}`);
+    throw new BadGatewayException('Image upload failed at the image host. Please retry.');
   }
 }

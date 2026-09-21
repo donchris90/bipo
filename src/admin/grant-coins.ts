@@ -50,3 +50,32 @@ export async function grantCoins(prisma: any, input: GrantCoinsInput) {
   const after = await wallets.getBalance(user.id, walletType);
   return { applied: true as const, user, walletType, before, after };
 }
+
+// Reads the command line. `--yes` and `--note` can be swallowed by npm on Windows
+// (npm treats them as its own options, and the coins were then only previewed), so
+// every option also has a plain-word form that npm leaves alone:
+//   apply  (or --yes / -y)      really do it
+//   bonus  (or --bonus)         game-only bonus coins
+//   note=some words             (or --note "some words")
+// Anything it does not recognise is an error rather than being ignored, so a lost
+// option can never silently turn into a different action.
+export function parseGrantArgs(args: string[]): { email: string; amount: number; wallet: 'COIN' | 'BONUS'; note?: string; apply: boolean } {
+  let email = '';
+  let amountText = '';
+  let wallet: 'COIN' | 'BONUS' = 'COIN';
+  let note: string | undefined;
+  let apply = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const lower = a.toLowerCase();
+    if (['--yes', '-y', 'apply', '--apply'].includes(lower)) apply = true;
+    else if (['--bonus', 'bonus'].includes(lower)) wallet = 'BONUS';
+    else if (lower === '--note') note = args[++i];
+    else if (lower.startsWith('note=')) note = a.slice(5);
+    else if (a.includes('@') && !email) email = a;
+    else if (/^[\d,_]+$/.test(a) && !amountText) amountText = a.replace(/[,_]/g, '');
+    else throw new Error(`Did not understand "${a}". Use: <email> <amount> [apply] [bonus] [note=words]`);
+  }
+  if (!email || !amountText) throw new Error('Usage: <email> <amount> [apply] [bonus] [note=words]');
+  return { email, amount: Number(amountText), wallet, note, apply };
+}

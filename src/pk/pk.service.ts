@@ -31,9 +31,18 @@ export class PkService {
     if (challengerId === opponentId) throw new BadRequestException('Cannot challenge yourself');
     await assertNotBlocked(this.prisma, challengerId, opponentId, "You can't challenge this user");
 
-    // Only someone who is online can be challenged (otherwise the challenge just
-    // sits unseen), and not someone already in a battle.
-    if (!(await this.realtime.isUserOnline(opponentId))) throw new BadRequestException("They aren't online right now");
+    // A PK opponent must be actively broadcasting, not merely online in the app.
+    // A normal online presence is not enough to create the second live video tile.
+    const opponentLive = await this.prisma.liveSession.findFirst({
+      where: { hostId: opponentId, status: 'LIVE' },
+      select: { id: true },
+    });
+    if (!opponentLive) throw new BadRequestException("They aren't live right now");
+    const challengerLive = await this.prisma.liveSession.findFirst({
+      where: { hostId: challengerId, status: 'LIVE' },
+      select: { id: true },
+    });
+    if (!challengerLive) throw new BadRequestException('You must be live before starting a PK');
     const busy = await this.prisma.pKBattle.findFirst({
       where: { status: { in: ['ACCEPTED', 'COUNTDOWN', 'ACTIVE'] }, OR: [{ challengerId: opponentId }, { opponentId }] },
       select: { id: true },
@@ -83,10 +92,17 @@ export class PkService {
     const online = await this.realtime.onlineUserIds();
     online.delete(userId);
 
+    // PK discovery is based on active broadcasts. A user can be online in the
+    // app without having a live room, and such a user cannot be a PK opponent.
+    const liveSessions = await this.prisma.liveSession.findMany({
+      where: { hostId: { in: [...online] }, status: 'LIVE' },
+      select: { hostId: true },
+    });
+    const liveHostIds = new Set(liveSessions.map((s) => s.hostId));
     let pool: Set<string>;
     if (category === 'friends') {
       const following = await this.prisma.follow.findMany({ where: { followerId: userId }, select: { followingId: true }, take: 2000 });
-      const followingIds = following.map((f) => f.followingId).filter((id) => online.has(id));
+      const followingIds = following.map((f) => f.followingId).filter((id) => liveHostIds.has(id));
       const back = followingIds.length
         ? await this.prisma.follow.findMany({ where: { followerId: { in: followingIds }, followingId: userId }, select: { followerId: true } })
         : [];
@@ -97,7 +113,8 @@ export class PkService {
       const creators = await this.prisma.userRole.findMany({ where: { role: 'CREATOR', userId: { in: [...online] } }, select: { userId: true }, take: 2000 });
       pool = new Set(creators.map((c) => c.userId));
     }
-    pool = new Set([...pool].filter((id) => id !== userId && online.has(id)));
+    pool = new Set([...pool].filter((id) => id !== userId && liveHostIds.has(id)));
+    if (pool.size === 0) return { category, onlineCount: 0, candidates: [] };
 
     if (pool.size > 0) {
       const [blocks, busy] = await Promise.all([
@@ -222,6 +239,16 @@ export class PkService {
     if (!battle) throw new NotFoundException('Battle not found');
     if (battle.opponentId !== opponentId) throw new ForbiddenException('Only the challenged creator can accept');
     if (battle.status !== 'CHALLENGED') throw new BadRequestException('Battle is not awaiting acceptance');
+
+    // Both creators must still be broadcasting when the invitation is accepted.
+    // This prevents an accepted PK from entering COUNTDOWN with no second channel.
+    const [challengerLive, opponentLive] = await Promise.all([
+      this.prisma.liveSession.findFirst({ where: { hostId: battle.challengerId, status: 'LIVE' }, select: { id: true } }),
+      this.prisma.liveSession.findFirst({ where: { hostId: battle.opponentId, status: 'LIVE' }, select: { id: true } }),
+    ]);
+    if (!challengerLive || !opponentLive) {
+      throw new BadRequestException('Both creators must be live to start a PK');
+    }
 
     const now = new Date();
     const startedAt = new Date(now.getTime() + COUNTDOWN_MS);

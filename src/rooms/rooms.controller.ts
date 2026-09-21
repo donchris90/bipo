@@ -137,6 +137,16 @@ export class RoomsController {
     return this.rooms.lock(id, req.user.userId, false);
   }
 
+  @Post(':id/seats/:seatNumber/lock')
+  lockSeat(@Param('id') id: string, @Param('seatNumber') seatNumber: string, @Req() req: AuthedRequest) {
+    return this.rooms.setSeatLocked(id, req.user.userId, Number(seatNumber), true);
+  }
+
+  @Post(':id/seats/:seatNumber/unlock')
+  unlockSeat(@Param('id') id: string, @Param('seatNumber') seatNumber: string, @Req() req: AuthedRequest) {
+    return this.rooms.setSeatLocked(id, req.user.userId, Number(seatNumber), false);
+  }
+
   @Post(':id/close')
   close(@Param('id') id: string, @Req() req: AuthedRequest) {
     return this.rooms.close(id, req.user.userId);

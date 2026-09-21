@@ -91,10 +91,11 @@ export class CrashService {
     const elapsedSeconds = (now - round.lockAt.getTime()) / 1000;
     const crashAt = crashTimeSeconds(hidden.crashPoint, rules.growthRate);
     if (elapsedSeconds >= crashAt) {
-      // Already crashed by wall-clock time but the settlement job hasn't
-      // finalized it yet — report the fact of the crash, not the exact
-      // point, since that's only official once settlement writes `result`.
-      return { status: 'CRASHED', multiplier: null, serverNow: now };
+      // The round has already crossed its server-authoritative crash time.
+      // The hidden point is safe to reveal now because the outcome is over;
+      // returning it here prevents the client from freezing at a lower
+      // locally-estimated multiplier while the settlement worker catches up.
+      return { status: 'CRASHED', multiplier: hidden.crashPoint, serverNow: now };
     }
     // `growthRate` and `elapsedMs` let the app draw the flight smoothly between
     // checks (the multiplier is exp(growthRate x seconds), a known curve). They give
