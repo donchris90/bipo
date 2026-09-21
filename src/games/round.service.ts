@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { RegionalConfigService } from '../config/regional-config.service';
 import { FeatureFlagsService } from '../feature-flags/feature-flags.service';
@@ -8,8 +8,30 @@ import { CrashService } from './crash.service';
 import type { Queue } from 'bullmq';
 import { GAME_QUEUE } from '../queue/queue.module';
 
+// How long createRound waits for Redis to accept the transition jobs before
+// carrying on without them. See the comment where it is used.
+const QUEUE_TIMEOUT_MS = 3000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
 @Injectable()
 export class RoundService {
+  private readonly logger = new Logger(RoundService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly regionalConfig: RegionalConfigService,
@@ -100,45 +122,59 @@ export class RoundService {
     });
 
     const now = Date.now();
-    // Same rollback pattern as PkService.accept(): if scheduling fails, a
-    // SCHEDULED round with no job to ever open it is just as stuck as a
-    // stranded PK battle. Mark it CANCELLED rather than leaving it
-    // dangling — an admin re-creates the round rather than this method
-    // retrying automatically, since a partially-failed schedule this early
-    // is worth a human noticing.
-    try {
-      await this.gameQueue.add(
-        'open',
-        { roundId: created.id },
-        { delay: Math.max(params.openAt.getTime() - now, 0), jobId: `open-${created.id}` },
-      );
-      await this.gameQueue.add(
-        'lock',
-        { roundId: created.id },
-        { delay: Math.max(params.lockAt.getTime() - now, 0), jobId: `lock-${created.id}` },
-      );
 
-      if (isCrash) {
-        // The crash point is generated here, at creation time, rather than
-        // at lock time — the server needs to know exactly when to reveal
-        // it in order to schedule this job at all, which means it has to
-        // exist (hidden) from the very start. This is the one meaningful
-        // difference from Lucky Number/Sum Dice, where the draw itself
-        // isn't generated until settlement.
-        const crashAt = await this.crash.initializeCrashRound(
+    // The crash point is generated here, at creation time, rather than at lock
+    // time — the server needs to know exactly when the round will crash in
+    // order to schedule the job that reveals it, which means it has to exist
+    // (hidden) from the very start. This is the one meaningful difference from
+    // Lucky Number/Sum Dice, where the draw isn't generated until settlement.
+    // It is a database-only step, so it happens before anything touches Redis.
+    let crashAt: Date | null = null;
+    if (isCrash) {
+      try {
+        crashAt = await this.crash.initializeCrashRound(
           created.id,
           { houseEdge: rules.houseEdge, growthRate: rules.growthRate },
           params.lockAt,
         );
-        await this.gameQueue.add(
-          'crash',
-          { roundId: created.id },
-          { delay: Math.max(crashAt.getTime() - now, 0), jobId: `crash-${created.id}` },
-        );
+      } catch (e) {
+        // A Crash round with no crash point can never be settled honestly.
+        // Nothing has been opened yet, so no entries exist to refund.
+        await this.prisma.gameRound.update({ where: { id: created.id }, data: { status: 'CANCELLED' } });
+        throw e;
       }
-    } catch (e) {
-      await this.prisma.gameRound.update({ where: { id: created.id }, data: { status: 'CANCELLED' } });
-      throw e;
+    }
+
+    // Queue the open/lock(/crash) jobs — best effort, with a time limit.
+    //
+    // This used to be awaited with no limit and, on failure, cancelled the
+    // round. But the Redis client is configured to retry forever, so when
+    // Redis was unreachable `queue.add()` never returned: the round stayed
+    // SCHEDULED, this method never finished, and the scheduler (which will not
+    // open a new round while one is unfinished) froze the game for good.
+    //
+    // Rounds no longer depend on these jobs to progress: RoundSchedulerService
+    // opens, locks and settles anything that is due, straight from the
+    // database, and refunds anything left overdue. The jobs remain the
+    // precise-timing fast path when Redis is healthy; if they can't be queued
+    // we say so loudly and carry on.
+    try {
+      await withTimeout(
+        Promise.all([
+          this.gameQueue.add('open', { roundId: created.id }, { delay: Math.max(params.openAt.getTime() - now, 0), jobId: `open-${created.id}` }),
+          this.gameQueue.add('lock', { roundId: created.id }, { delay: Math.max(params.lockAt.getTime() - now, 0), jobId: `lock-${created.id}` }),
+          ...(crashAt
+            ? [this.gameQueue.add('crash', { roundId: created.id }, { delay: Math.max(crashAt.getTime() - now, 0), jobId: `crash-${created.id}` })]
+            : []),
+        ]),
+        QUEUE_TIMEOUT_MS,
+        'Queuing round jobs',
+      );
+    } catch (e: any) {
+      this.logger.warn(
+        `Could not queue jobs for round ${created.id} (${params.gameCode}): ${e?.message}. ` +
+          `The round scheduler will drive it instead — but check that REDIS_URL is correct and reachable.`,
+      );
     }
     // Settlement isn't scheduled by time here for non-Crash games — the
     // 'lock' job handler in JobsModule calls lock() and then
@@ -162,7 +198,11 @@ export class RoundService {
     const round = await this.prisma.gameRound.findUnique({ where: { id: roundId } });
     if (!round) throw new NotFoundException('Round not found');
     if (round.status !== 'SCHEDULED') throw new BadRequestException('Round is not in SCHEDULED state');
-    const updated = await this.prisma.gameRound.update({ where: { id: roundId }, data: { status: 'OPEN' } });
+    // Atomic: the queue worker and the round scheduler can both try this, and a
+    // round cancelled in between must not be resurrected.
+    const moved = await this.prisma.gameRound.updateMany({ where: { id: roundId, status: 'SCHEDULED' }, data: { status: 'OPEN' } });
+    if (moved.count === 0) throw new BadRequestException('Round is not in SCHEDULED state');
+    const updated = await this.prisma.gameRound.findUniqueOrThrow({ where: { id: roundId } });
     // Same redaction as createRound() — a Crash round's hiddenState is
     // already populated by this point (generated at creation), so a bare
     // return here would leak the crash point to anyone calling the admin
@@ -175,7 +215,9 @@ export class RoundService {
     const round = await this.prisma.gameRound.findUnique({ where: { id: roundId } });
     if (!round) throw new NotFoundException('Round not found');
     if (round.status !== 'OPEN') throw new BadRequestException('Round is not OPEN');
-    const updated = await this.prisma.gameRound.update({ where: { id: roundId }, data: { status: 'LOCKED' } });
+    const moved = await this.prisma.gameRound.updateMany({ where: { id: roundId, status: 'OPEN' }, data: { status: 'LOCKED' } });
+    if (moved.count === 0) throw new BadRequestException('Round is not OPEN');
+    const updated = await this.prisma.gameRound.findUniqueOrThrow({ where: { id: roundId } });
     // Same redaction, and more important here than in open(): this is the
     // exact moment a Crash round's live phase begins — the crash point has
     // been sitting in hiddenState since creation, and this return value

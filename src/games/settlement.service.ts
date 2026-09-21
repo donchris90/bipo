@@ -35,7 +35,13 @@ export class SettlementService {
     if (round.status === 'SETTLED') return round; // idempotent — settlement never runs twice
     if (round.status !== 'LOCKED') throw new BadRequestException('Round must be LOCKED before settling');
 
-    await this.prisma.gameRound.update({ where: { id: roundId }, data: { status: 'RESOLVING' } });
+    // Atomic claim: the queue worker and the round scheduler can both reach
+    // this point for the same round (and so could a second server instance).
+    // Only the caller that actually moves LOCKED -> RESOLVING may draw the
+    // result and pay out; anyone else must not, or the round would be drawn
+    // and paid twice with different results.
+    const claimed = await this.prisma.gameRound.updateMany({ where: { id: roundId, status: 'LOCKED' }, data: { status: 'RESOLVING' } });
+    if (claimed.count === 0) return this.prisma.gameRound.findUniqueOrThrow({ where: { id: roundId } });
 
     const game = await this.prisma.gameDefinition.findUnique({ where: { code: round.gameCode } });
     const rules = (game?.rulesJson as any) ?? {};
@@ -48,7 +54,8 @@ export class SettlementService {
         )
       : { dice: this.generateResult(round), sum: null as number | null };
 
-    const entries = await this.prisma.gameEntry.findMany({ where: { roundId } });
+    // Only live entries: anything already refunded/settled must never be paid again.
+    const entries = await this.prisma.gameEntry.findMany({ where: { roundId, status: 'PLACED' } });
 
     for (const entry of entries) {
       let won: boolean;
@@ -105,6 +112,54 @@ export class SettlementService {
       where: { id: roundId },
       data: { status: 'SETTLED', result: storedResult as any, settledAt: new Date() },
     });
+  }
+
+  // Cancels a round that was left unfinished by an outage and gives every
+  // player their stake back. Used by the round scheduler only for rounds that
+  // are far overdue (see round-recovery.ts): settling them now would decide
+  // money outcomes long after players saw the round, and for Crash the players
+  // could not have cashed out in time.
+  //
+  // The round is claimed first (SCHEDULED/OPEN/LOCKED -> RESOLVING) so it can
+  // never be settled and refunded at the same time. Each refund is one
+  // transaction (credit + REFUNDED status) and is idempotent on the entry, so if
+  // this stops halfway, running it again pays nobody twice. If it does stop
+  // halfway the round stays RESOLVING rather than CANCELLED, which is what the
+  // scheduler reports on.
+  async voidRound(roundId: string): Promise<{ refunded: number }> {
+    const claimed = await this.prisma.gameRound.updateMany({
+      where: { id: roundId, status: { in: ['SCHEDULED', 'OPEN', 'LOCKED'] } },
+      data: { status: 'RESOLVING' },
+    });
+    if (claimed.count === 0) return { refunded: 0 };
+
+    const entries = await this.prisma.gameEntry.findMany({ where: { roundId, status: 'PLACED' } });
+    let refunded = 0;
+    for (const entry of entries) {
+      // What was staked from bonus coins goes back to the bonus wallet, so a
+      // refund can never turn free-play credit into spendable coins.
+      const bonus = Math.min(entry.bonusAmount, entry.coinAmount);
+      const coin = entry.coinAmount - bonus;
+      await this.prisma.$transaction(async (tx) => {
+        if (coin > 0) {
+          await this.wallet.credit(
+            { userId: entry.userId, walletType: WalletType.COIN, amount: BigInt(coin), ledgerType: LedgerEntryType.REFUND, reference: entry.id, idempotencyKey: `game_refund:${entry.id}` },
+            tx,
+          );
+        }
+        if (bonus > 0) {
+          await this.wallet.credit(
+            { userId: entry.userId, walletType: WalletType.BONUS, amount: BigInt(bonus), ledgerType: LedgerEntryType.REFUND, reference: entry.id, idempotencyKey: `game_refund_bonus:${entry.id}` },
+            tx,
+          );
+        }
+        await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'REFUNDED', rewardAmount: 0 } });
+      }, EXTENDED_TX_OPTIONS);
+      refunded++;
+    }
+
+    await this.prisma.gameRound.update({ where: { id: roundId }, data: { status: 'CANCELLED' } });
+    return { refunded };
   }
 
   private generateResult(round: { numberRange: number | null; selectionCount: number | null }): number[] {

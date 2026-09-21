@@ -158,7 +158,10 @@ export class CrashService {
       throw new BadRequestException('Round must be LOCKED before crash-settling');
     }
 
-    await this.prisma.gameRound.update({ where: { id: roundId }, data: { status: 'RESOLVING' } });
+    // Atomic claim — see SettlementService.settle(). The queue worker and the
+    // round scheduler can both try to settle the same crashed round.
+    const claimed = await this.prisma.gameRound.updateMany({ where: { id: roundId, status: 'LOCKED' }, data: { status: 'RESOLVING' } });
+    if (claimed.count === 0) return this.prisma.gameRound.findUniqueOrThrow({ where: { id: roundId } });
 
     const hidden = round.hiddenState as any;
     const crashPoint = hidden.crashPoint;
