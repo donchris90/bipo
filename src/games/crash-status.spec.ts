@@ -34,7 +34,7 @@ describe('CrashService.getStatus — what the app needs to draw a smooth flight'
     expect(a).toEqual(b);
   });
 
-  it('once the crash time has passed it says CRASHED with no value (the point is only official after settlement)', async () => {
+  it('once the crash time has passed it says CRASHED with the server-authoritative crash point', async () => {
     const crashSecs = crashTimeSeconds(2, GROWTH);
     const s = await build(locked(2)).getStatus('r1', LOCK_AT.getTime() + (crashSecs + 0.1) * 1000);
     expect(s).toEqual({ status: 'CRASHED', multiplier: 2, serverNow: LOCK_AT.getTime() + (crashSecs + 0.1) * 1000 });

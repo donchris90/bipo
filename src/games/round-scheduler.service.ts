@@ -44,7 +44,7 @@ export class RoundSchedulerService implements OnModuleInit, OnModuleDestroy {
 
   // How long a fresh round stays OPEN for entries before it locks —
   // matches the reference UI copy this project was built against ("Fast
-  // 15s Betting Round" for Lucky Number/Sum Dice; Crash uses a shorter
+  // 30s Betting Round" for Lucky Number/Sum Dice; Crash uses a shorter
   // betting window since its own "round" is mostly the live climb that
   // follows). Read from rulesJson.openSeconds first so an operator can
   // retune a specific game without a code change; these are just the
@@ -52,7 +52,7 @@ export class RoundSchedulerService implements OnModuleInit, OnModuleDestroy {
   private static readonly DEFAULT_OPEN_SECONDS: Record<string, number> = {
     CRASH: 8,
     SUM_DICE: 15,
-    LUCKY_NUMBER: 15,
+    LUCKY_NUMBER: 30,
   };
   // Minimum stake / entry price for a freshly-created round, same
   // fallback pattern — see entryPrice's doc comment in round.service.ts
