@@ -41,10 +41,26 @@ export class LiveController {
     @Body('themeColor') themeColor: string | undefined,
     @Body('coverUrl') coverUrl: string | undefined,
     @Body('dailyTargetCoins') dailyTargetCoins: number | string | undefined,
+    @Body('privacy') privacy: 'PUBLIC' | 'PRIVATE' | undefined,
+    @Body('privatePriceCoins') privatePriceCoins: number | string | undefined,
+    @Body('privateDurationMinutes') privateDurationMinutes: number | string | undefined,
     @Req() req: AuthedRequest,
   ) {
     const target = dailyTargetCoins == null ? undefined : Number(dailyTargetCoins);
-    return this.live.create(req.user.userId, title, category, req.user.countryCode, themeColor, coverUrl, target);
+    const price = privatePriceCoins == null ? undefined : Number(privatePriceCoins);
+    const duration = privateDurationMinutes == null ? undefined : Number(privateDurationMinutes);
+    return this.live.create(
+      req.user.userId,
+      title,
+      category,
+      req.user.countryCode,
+      themeColor,
+      coverUrl,
+      target,
+      privacy === 'PRIVATE' ? 'PRIVATE' : 'PUBLIC',
+      price,
+      duration,
+    );
   }
 
   @Post(':id/join')
@@ -64,6 +80,33 @@ export class LiveController {
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
   controlMedia(@Param('id') id: string, @Body() body: { action?: unknown; videoId?: unknown; positionMs?: unknown }, @Req() req: AuthedRequest) {
     return this.media.act(id, req.user.userId, body ?? {});
+  }
+
+  // ── Paid private 1-on-1 live ────────────────────────────────
+
+  @Post(':id/private/request')
+  requestPrivate(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.live.requestPrivateAccess(id, req.user.userId);
+  }
+
+  @Get(':id/private/status')
+  privateStatus(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.live.privateStatus(id, req.user.userId);
+  }
+
+  @Get(':id/private/requests')
+  privateRequests(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.live.listPrivateRequests(id, req.user.userId);
+  }
+
+  @Post(':id/private/requests/:requestId/accept')
+  acceptPrivate(@Param('requestId') requestId: string, @Req() req: AuthedRequest) {
+    return this.live.acceptPrivateRequest(requestId, req.user.userId);
+  }
+
+  @Post(':id/private/requests/:requestId/decline')
+  declinePrivate(@Param('requestId') requestId: string, @Req() req: AuthedRequest) {
+    return this.live.declinePrivateRequest(requestId, req.user.userId);
   }
 
   @Post(':id/end')

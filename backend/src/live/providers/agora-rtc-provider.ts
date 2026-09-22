@@ -38,8 +38,8 @@ export class AgoraRtcProvider implements RtcProvider {
     return { channelName: `session_${sessionId}` };
   }
 
-  async generateToken(channelName: string, userId: string, role: 'host' | 'audience'): Promise<string> {
-    const rtcRole = role === 'host' ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
+  async generateToken(channelName: string, userId: string, role: 'host' | 'publisher' | 'audience'): Promise<string> {
+    const rtcRole = role === 'audience' ? RtcRole.SUBSCRIBER : RtcRole.PUBLISHER;
     return RtcTokenBuilder.buildTokenWithUserAccount(
       this.appId,
       this.appCertificate,
