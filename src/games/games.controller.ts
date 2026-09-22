@@ -134,6 +134,26 @@ export class GamesController {
   // condition is a full-set match, not "is my number among several I
   // picked," so attributing its stake per-number the same way would be
   // actively misleading, not just unavailable.
+  // Live dashboard metrics for the current round. These are derived directly
+  // from entries in the database, never seeded with UI defaults. Distinct users
+  // are counted as players so multiple entries from one player do not inflate
+  // the dashboard.
+  @Get('rounds/:roundId/live-stats')
+  async liveStats(@Param('roundId') roundId: string) {
+    const round = await this.prisma.gameRound.findUniqueOrThrow({
+      where: { id: roundId },
+      select: { id: true },
+    });
+    const entries = await this.prisma.gameEntry.findMany({
+      where: { roundId: round.id },
+      select: { userId: true, coinAmount: true },
+    });
+    return {
+      players: new Set(entries.map((entry) => entry.userId)).size,
+      totalWagered: entries.reduce((sum, entry) => sum + Number(entry.coinAmount), 0),
+    };
+  }
+
   @Get('rounds/:roundId/pool')
   async pool(@Param('roundId') roundId: string) {
     const round = await this.prisma.gameRound.findUniqueOrThrow({ where: { id: roundId }, select: ROUND_SELECT });
