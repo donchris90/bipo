@@ -168,6 +168,7 @@ model LiveSession {
   endedAt         DateTime?
   createdAt       DateTime     @default(now())
   themeColor      String?
+  dailyTargetCoins Int?
   likeCount       Int          @default(0)
   peakViewerCount Int          @default(0)
   durationSeconds Int?

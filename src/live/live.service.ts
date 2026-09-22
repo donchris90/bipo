@@ -62,6 +62,7 @@ export class LiveService {
     countryCode: string,
     themeColor?: string,
     coverUrl?: string,
+    dailyTargetCoins?: number,
   ) {
     if (await this.featureFlags.isEnabled('DISABLE_LIVE')) {
       throw new ForbiddenException('Live streaming is temporarily disabled');
@@ -92,6 +93,9 @@ export class LiveService {
         // guard against when rendering it as a color later.
         themeColor: themeColor && /^#[0-9A-Fa-f]{6}$/.test(themeColor) ? themeColor : null,
         coverUrl: LiveService.cleanCoverUrl(coverUrl),
+        dailyTargetCoins: Number.isFinite(dailyTargetCoins)
+          ? Math.max(100, Math.min(10_000_000, Math.floor(dailyTargetCoins!)))
+          : null,
         providerChannel: channelName,
         status: 'LIVE',
         startedAt: new Date(),
