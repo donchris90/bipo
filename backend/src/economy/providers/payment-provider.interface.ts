@@ -13,7 +13,6 @@ export interface VerifyPaymentResult {
   verified: boolean;
   amountMinor: number;
   currencyCode: string;
-  status?: string;
 }
 
 export interface PaymentProvider {
@@ -43,7 +42,7 @@ export interface PaymentProvider {
   // after verifyWebhookSignature (when the provider has one) has already
   // passed — a forged webhook is a direct path to "trust client-reported
   // payment success", which spec §26/§94 explicitly forbid.
-  handleWebhook(payload: unknown, signature?: string): Promise<{ providerRef: string; status: 'confirmed' | 'failed' | 'ignored' | 'refunded' }>;
+  handleWebhook(payload: unknown, signature?: string): Promise<{ providerRef: string; status: 'confirmed' | 'failed' | 'ignored' }>;
 }
 
 // Used in production when no payment provider is configured. Every call fails
@@ -61,7 +60,7 @@ export class UnavailablePaymentProvider implements PaymentProvider {
   async refundPayment(): Promise<{ refunded: boolean }> {
     return this.fail();
   }
-  async handleWebhook(): Promise<{ providerRef: string; status: 'confirmed' | 'failed' | 'ignored' | 'refunded' }> {
+  async handleWebhook(): Promise<{ providerRef: string; status: 'confirmed' | 'failed' | 'ignored' }> {
     return this.fail();
   }
 }

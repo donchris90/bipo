@@ -44,16 +44,6 @@ export class RoomsController {
     return this.rooms.setTheme(id, req.user.userId, themeColor);
   }
 
-  @Patch(':id/mode')
-  setMode(@Param('id') id: string, @Body('mode') mode: string, @Req() req: AuthedRequest) {
-    return this.rooms.setMode(id, req.user.userId, mode);
-  }
-
-  @Patch(':id/seat-count')
-  setSeatCount(@Param('id') id: string, @Body('seatCount') seatCount: unknown, @Req() req: AuthedRequest) {
-    return this.rooms.setSeatCount(id, req.user.userId, Number(seatCount));
-  }
-
   @Post(':id/join')
   join(@Param('id') id: string, @Req() req: AuthedRequest) {
     return this.rooms.joinToken(id, req.user.userId);

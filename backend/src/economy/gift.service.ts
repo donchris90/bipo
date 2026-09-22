@@ -146,7 +146,6 @@ export class GiftService {
   }
 
   async send(params: SendGiftParams) {
-    this.validateIdempotencyKey(params.idempotencyKey);
     if (params.senderId === params.recipientId) {
       throw new BadRequestException('Cannot send a gift to yourself');
     }
@@ -287,12 +286,6 @@ export class GiftService {
     // in the controller/gateway layer, which has access to the Socket.IO
     // server instance — this service stays transport-agnostic.
     return transaction;
-  }
-
-  private validateIdempotencyKey(key: string) {
-    if (typeof key !== 'string' || key.length < 16 || key.length > 128 || !/^[A-Za-z0-9._:-]+$/.test(key)) {
-      throw new BadRequestException('Invalid idempotency key');
-    }
   }
 
   private async applyPkScore(pkBattleId: string, senderId: string, coinAmount: number) {

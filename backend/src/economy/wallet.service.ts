@@ -40,49 +40,6 @@ export class WalletService {
     return wallet?.balance ?? 0n;
   }
 
-  // Read-only transaction history for the signed-in owner of a wallet.
-  // Balances remain server-authoritative; this endpoint exposes ledger facts
-  // without allowing clients to create or alter entries.
-  async history(userId: string, type: WalletType, limit = 50, before?: string) {
-    const take = Math.min(Math.max(Number.isInteger(limit) ? limit : 50, 1), 100);
-    const wallet = await this.prisma.wallet.findUnique({
-      where: { userId_type: { userId, type } },
-      select: { id: true, balance: true, currencyCode: true },
-    });
-    if (!wallet) return { walletType: type, balance: '0', currencyCode: 'COIN', items: [], nextBefore: null };
-
-    let beforeDate: Date | undefined;
-    if (before) {
-      const parsed = new Date(before);
-      if (Number.isNaN(parsed.getTime())) throw new BadRequestException('Invalid transaction history cursor');
-      beforeDate = parsed;
-    }
-
-    const rows = await this.prisma.ledgerEntry.findMany({
-      where: { walletId: wallet.id, ...(beforeDate ? { createdAt: { lt: beforeDate } } : {}) },
-      orderBy: { createdAt: 'desc' },
-      take: take + 1,
-      select: { id: true, type: true, amount: true, balanceAfter: true, reference: true, createdAt: true },
-    });
-    const hasMore = rows.length > take;
-    const items = rows.slice(0, take).map((row) => ({
-      id: row.id,
-      type: row.type,
-      amount: row.amount.toString(),
-      balanceAfter: row.balanceAfter?.toString() ?? null,
-      reference: row.reference,
-      createdAt: row.createdAt.toISOString(),
-    }));
-
-    return {
-      walletType: type,
-      balance: wallet.balance.toString(),
-      currencyCode: wallet.currencyCode,
-      items,
-      nextBefore: hasMore && items.length ? items[items.length - 1].createdAt : null,
-    };
-  }
-
   // Credits a wallet. Amount must be positive — this function always adds.
   // Idempotent: if idempotencyKey was already used, returns the existing
   // ledger entry instead of applying the movement twice.

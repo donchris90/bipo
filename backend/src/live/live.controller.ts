@@ -95,6 +95,31 @@ export class LiveController {
     return this.live.like(sessionId, req.user.userId, count);
   }
 
+  @Post(':id/kick/:userId')
+  kick(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
+    return this.live.kickViewer(id, req.user.userId, userId);
+  }
+
+  @Post(':id/mute/:userId')
+  mute(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
+    return this.live.muteViewer(id, req.user.userId, userId);
+  }
+
+  @Post(':id/unmute/:userId')
+  unmute(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
+    return this.live.unmuteViewer(id, req.user.userId, userId);
+  }
+
+  @Post(':id/ban/:userId')
+  ban(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
+    return this.live.banViewer(id, req.user.userId, userId);
+  }
+
+  @Post(':id/unban/:userId')
+  unban(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
+    return this.live.unbanViewer(id, req.user.userId, userId);
+  }
+
   @Post(':id/leave')
   async leave(@Param('id') sessionId: string, @Req() req: AuthedRequest) {
     await this.live.trackViewerLeave(sessionId, req.user.userId);

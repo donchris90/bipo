@@ -15,6 +15,7 @@ import type { RtcProvider } from './providers/rtc-provider.interface';
 import { FeatureFlagsService } from '../feature-flags/feature-flags.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { fetchChatHistory } from '../common/chat-history';
+import { ModerationService } from '../moderation/moderation.service';
 
 export const RTC_PROVIDER = 'RTC_PROVIDER';
 
@@ -25,6 +26,7 @@ export class LiveService {
     @Inject(RTC_PROVIDER) private readonly rtc: RtcProvider,
     private readonly featureFlags: FeatureFlagsService,
     private readonly realtime: RealtimeGateway,
+    private readonly moderation: ModerationService,
     @Optional() private readonly media?: LiveMediaService,
   ) {}
 
@@ -105,6 +107,10 @@ export class LiveService {
   async joinToken(sessionId: string, userId: string) {
     const session = await this.prisma.liveSession.findUnique({ where: { id: sessionId } });
     if (!session || session.status !== 'LIVE') throw new NotFoundException('Live session not found or not active');
+
+    if (await this.moderation.isBanned('LIVE', sessionId, userId)) {
+      throw new ForbiddenException('You are banned from this live');
+    }
 
     const token = await this.rtc.generateToken(session.providerChannel, userId, 'audience');
 
@@ -236,6 +242,9 @@ export class LiveService {
     if (!session) throw new NotFoundException('Session not found');
     if (session.status !== 'LIVE') {
       throw new BadRequestException('Session is not live');
+    }
+    if (await this.moderation.isBanned('LIVE', sessionId, userId)) {
+      throw new ForbiddenException('You are banned from this live');
     }
 
     // The host is not a viewer of their own session.
@@ -402,6 +411,80 @@ export class LiveService {
     const exists = await this.prisma.liveSession.findUnique({ where: { id: sessionId }, select: { id: true } });
     if (!exists) throw new NotFoundException('Live session not found');
     return fetchChatHistory(this.prisma, 'LIVE', sessionId, { limit, before });
+  }
+
+  private async assertLiveHost(sessionId: string, actorId: string) {
+    const session = await this.prisma.liveSession.findUnique({ where: { id: sessionId } });
+    if (!session) throw new NotFoundException('Live session not found');
+    if (session.hostId !== actorId) throw new ForbiddenException('Only the host can moderate viewers');
+    if (session.status !== 'LIVE') throw new BadRequestException('Live session is not active');
+    return session;
+  }
+
+  private async logLiveModeration(
+    actorId: string,
+    actionType: 'KICK' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
+    sessionId: string,
+    targetUserId: string,
+  ) {
+    await this.prisma.moderationAction.create({
+      data: { actorId, actionType, context: 'LIVE', contextId: sessionId, targetUserId },
+    });
+  }
+
+  private emitLiveModeration(
+    sessionId: string,
+    action: 'KICK' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
+    actorId: string,
+    targetUserId: string,
+  ) {
+    try {
+      this.realtime.broadcastLiveModeration(sessionId, { sessionId, action, targetUserId, actorId });
+    } catch {
+      /* audit row remains the source of truth; clients converge on refetch */
+    }
+  }
+
+  async kickViewer(sessionId: string, actorId: string, targetUserId: string) {
+    const session = await this.assertLiveHost(sessionId, actorId);
+    if (targetUserId === session.hostId) throw new BadRequestException('Cannot kick the host');
+    await this.prisma.liveViewer.updateMany({ where: { sessionId, userId: targetUserId, leftAt: null }, data: { leftAt: new Date() } });
+    await this.logLiveModeration(actorId, 'KICK', sessionId, targetUserId);
+    this.emitLiveModeration(sessionId, 'KICK', actorId, targetUserId);
+    await this.publishViewerCount(sessionId);
+    return { removed: true };
+  }
+
+  async muteViewer(sessionId: string, actorId: string, targetUserId: string) {
+    const session = await this.assertLiveHost(sessionId, actorId);
+    if (targetUserId === session.hostId) throw new BadRequestException('Cannot mute the host');
+    await this.logLiveModeration(actorId, 'MUTE', sessionId, targetUserId);
+    this.emitLiveModeration(sessionId, 'MUTE', actorId, targetUserId);
+    return { muted: true };
+  }
+
+  async unmuteViewer(sessionId: string, actorId: string, targetUserId: string) {
+    await this.assertLiveHost(sessionId, actorId);
+    await this.logLiveModeration(actorId, 'UNMUTE', sessionId, targetUserId);
+    this.emitLiveModeration(sessionId, 'UNMUTE', actorId, targetUserId);
+    return { muted: false };
+  }
+
+  async banViewer(sessionId: string, actorId: string, targetUserId: string) {
+    const session = await this.assertLiveHost(sessionId, actorId);
+    if (targetUserId === session.hostId) throw new BadRequestException('Cannot ban the host');
+    await this.prisma.liveViewer.updateMany({ where: { sessionId, userId: targetUserId, leftAt: null }, data: { leftAt: new Date() } });
+    await this.logLiveModeration(actorId, 'BAN', sessionId, targetUserId);
+    this.emitLiveModeration(sessionId, 'BAN', actorId, targetUserId);
+    await this.publishViewerCount(sessionId);
+    return { banned: true };
+  }
+
+  async unbanViewer(sessionId: string, actorId: string, targetUserId: string) {
+    await this.assertLiveHost(sessionId, actorId);
+    await this.logLiveModeration(actorId, 'UNBAN', sessionId, targetUserId);
+    this.emitLiveModeration(sessionId, 'UNBAN', actorId, targetUserId);
+    return { banned: false };
   }
 
   async listViewers(sessionId: string, hostId: string) {

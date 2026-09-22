@@ -30,7 +30,7 @@ describe('RoomReaperService', () => {
 describe('RoomsService closing', () => {
   const room = (status: string) => ({ id: 'r', hostId: 'h', providerChannel: 'c', status });
   const build = (status: string) => {
-    const prisma: any = { partyRoom: { findUnique: jest.fn().mockResolvedValue(room(status)), findUniqueOrThrow: jest.fn().mockResolvedValue(room('CLOSED')), updateMany: jest.fn().mockResolvedValue({ count: 1 }), update: jest.fn(async ({ data }: any) => data) } };
+    const prisma: any = { partyRoom: { findUnique: jest.fn().mockResolvedValue(room(status)), findUniqueOrThrow: jest.fn().mockResolvedValue(room('CLOSED')), update: jest.fn(async ({ data }: any) => data) } };
     const rtc: any = { destroyChannel: jest.fn() };
     const svc = new RoomsService(prisma, {} as any, {} as any, rtc, {} as any, {} as any);
     return { svc, prisma, rtc };
@@ -47,6 +47,6 @@ describe('RoomsService closing', () => {
     const { svc, prisma } = build('OPEN');
     await expect(svc.close('r', 'someone-else')).rejects.toThrow('Only the host');
     await svc.closeAbandoned('r');
-    expect(prisma.partyRoom.updateMany.mock.calls[0][0].data.status).toBe('CLOSED');
+    expect(prisma.partyRoom.update.mock.calls[0][0].data.status).toBe('CLOSED');
   });
 });

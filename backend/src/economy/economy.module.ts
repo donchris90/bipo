@@ -14,8 +14,6 @@ import { PaymentWebhookController } from './payment-webhook.controller';
 import { MockPaymentProvider, UnavailablePaymentProvider } from './providers/payment-provider.interface';
 import { isProduction } from '../common/provider-mode';
 import { PaystackPaymentProvider } from './providers/paystack-payment-provider';
-import { NowPaymentsPaymentProvider } from './providers/nowpayments-payment-provider';
-import { PaymentProviderRouter } from './providers/payment-provider-router';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { NotificationsModule } from '../notifications/notifications.module';
@@ -34,16 +32,21 @@ const logger = new Logger('EconomyModule');
       provide: PAYMENT_PROVIDER,
       inject: [ConfigService, PrismaService],
       useFactory: (config: ConfigService, prisma: PrismaService) => {
-        const paystack = new PaystackPaymentProvider(config, prisma);
-        const crypto = new NowPaymentsPaymentProvider(config);
-        if (config.get<string>('PAYSTACK_SECRET_KEY') || config.get<string>('NOWPAYMENTS_API_KEY')) {
-          return new PaymentProviderRouter(paystack, crypto);
+        if (config.get<string>('PAYSTACK_SECRET_KEY')) {
+          return new PaystackPaymentProvider(config, prisma);
         }
+        // In production a missing key must never fall back to a provider that
+        // reports every payment as successful — every payment call fails with
+        // a 503 instead.
         if (isProduction(config.get<string>('NODE_ENV'))) {
-          logger.error('No real payment provider is configured — coin purchases are DISABLED (503) until one is configured.');
+          logger.error('PAYSTACK_SECRET_KEY is not set — coin purchases are DISABLED (503) until it is configured.');
           return new UnavailablePaymentProvider();
         }
-        logger.warn('No real payment key configured — development may use MockPaymentProvider only.');
+        // Development only. Loudly logged, not silent.
+        logger.warn(
+          'PAYSTACK_SECRET_KEY not set — falling back to MockPaymentProvider. ' +
+            'Real payments will NOT work until this is configured.',
+        );
         return new MockPaymentProvider();
       },
     },

@@ -19,8 +19,6 @@ function build(w: World = {}) {
   const online = new Set(w.online ?? []);
   const follows = w.follows ?? [];
   const names = w.names ?? {};
-  // Since PK needs both creators to be LIVE, a person counts as live unless a test says who is.
-  const liveMap: Record<string, string> = w.live ?? Object.fromEntries([...online].map((u) => [u, `s-${u}`]));
   const prisma: any = {
     follow: {
       findMany: jest.fn(async ({ where }: any) => {
@@ -57,10 +55,7 @@ function build(w: World = {}) {
       findMany: jest.fn(async ({ where }: any) => where.id.in.map((id: string) => ({ id, displayName: names[id] ?? id, avatarUrl: null }))),
       findUnique: jest.fn(async () => ({ displayName: 'Challenger', avatarUrl: 'https://x/c.jpg' })),
     },
-    liveSession: {
-      findMany: jest.fn(async ({ where }: any) => Object.entries(liveMap).filter(([h]) => where.hostId.in.includes(h)).map(([hostId, id]) => ({ id, hostId, title: `${hostId} live` }))),
-      findFirst: jest.fn(async ({ where }: any) => (liveMap[where.hostId] ? { id: liveMap[where.hostId] } : null)),
-    },
+    liveSession: { findMany: jest.fn(async ({ where }: any) => Object.entries(w.live ?? {}).filter(([h]) => where.hostId.in.includes(h)).map(([hostId, id]) => ({ id, hostId, title: `${hostId} live` }))) },
   };
   const realtime: any = {
     onlineUserIds: jest.fn(async () => new Set(online)),
@@ -73,7 +68,7 @@ function build(w: World = {}) {
 
 const ids = (r: any) => r.candidates.map((c: any) => c.userId).sort();
 
-describe('PkService.candidates — only creators who are LIVE right now', () => {
+describe('PkService.candidates — only people who are online', () => {
   it('friends: mutual follows who are online', async () => {
     const { svc } = build({ online: ['me', 'a', 'b', 'c'], follows: [['me', 'a'], ['a', 'me'], ['me', 'b'], ['me', 'c'], ['c', 'me'], ['me', 'off'], ['off', 'me']] });
     // b does not follow back; "off" is a mutual friend but not online
@@ -101,24 +96,18 @@ describe('PkService.candidates — only creators who are LIVE right now', () => 
     expect(ids(await svc.candidates('me', 'random'))).toEqual(['d']);
   });
 
-  it('someone who is online in the app but not broadcasting is NOT a candidate (there would be no second video to show)', async () => {
-    const { svc } = build({ online: ['me', 'a', 'b'], follows: [['me', 'a'], ['a', 'me'], ['me', 'b'], ['b', 'me']], live: { me: 's-me', b: 's-b' }, names: { a: 'Ada', b: 'Bo' } });
+  it('puts people who are live right now first, with their session', async () => {
+    const { svc } = build({ online: ['me', 'a', 'b'], follows: [['me', 'a'], ['a', 'me'], ['me', 'b'], ['b', 'me']], live: { b: 's-b' }, names: { a: 'Ada', b: 'Bo' } });
     const res = await svc.candidates('me', 'friends');
-    expect(res.candidates.map((c) => c.userId)).toEqual(['b']);
+    expect(res.candidates.map((c) => c.userId)).toEqual(['b', 'a']);
     expect(res.candidates[0].live).toEqual({ sessionId: 's-b', title: 'b live' });
-  });
-
-  it('every candidate carries the session they are broadcasting, listed by name', async () => {
-    const { svc } = build({ online: ['me', 'a', 'b'], follows: [['me', 'a'], ['a', 'me'], ['me', 'b'], ['b', 'me']], names: { a: 'Ada', b: 'Bo' } });
-    const res = await svc.candidates('me', 'friends');
-    expect(res.candidates.map((c) => c.userId)).toEqual(['a', 'b']);
     expect(res.onlineCount).toBe(2);
   });
 });
 
 describe('PkService.challenge', () => {
   it('refuses someone who is offline, or already in a battle', async () => {
-    await expect(build({ online: ['me'] }).svc.challenge('me', 'them')).rejects.toThrow("They aren't live right now");
+    await expect(build({ online: ['me'] }).svc.challenge('me', 'them')).rejects.toThrow("They aren't online");
     await expect(build({ online: ['me', 'them'], busy: [['them', 'x']] }).svc.challenge('me', 'them')).rejects.toThrow(/in a PK battle/);
   });
 
@@ -136,14 +125,6 @@ describe('PkService.challenge', () => {
     expect(await svc.challenge('me', 'them')).toMatchObject({ id: 'existing' });
     expect(prisma.pKBattle.create).not.toHaveBeenCalled();
     expect(notifications.notify).not.toHaveBeenCalled();
-  });
-
-  it('the challenger must be live too: a PK needs two broadcasts', async () => {
-    await expect(build({ online: ['me', 'them'], live: { them: 's-them' } }).svc.challenge('me', 'them')).rejects.toThrow('You must be live before starting a PK');
-  });
-
-  it('someone who is online but not broadcasting cannot be challenged', async () => {
-    await expect(build({ online: ['me', 'them'], live: { me: 's-me' } }).svc.challenge('me', 'them')).rejects.toThrow("They aren't live right now");
   });
 
   it('cannot challenge yourself', async () => {

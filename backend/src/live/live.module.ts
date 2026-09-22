@@ -9,11 +9,12 @@ import { isProduction } from '../common/provider-mode';
 import { AgoraRtcProvider } from './providers/agora-rtc-provider';
 import { FeatureFlagsModule } from '../feature-flags/feature-flags.module';
 import { RealtimeModule } from '../realtime/realtime.module';
+import { ModerationModule } from '../moderation/moderation.module';
 
 const logger = new Logger('LiveModule');
 
 @Module({
-  imports: [FeatureFlagsModule, ConfigModule, RealtimeModule],
+  imports: [FeatureFlagsModule, ConfigModule, RealtimeModule, ModerationModule],
   providers: [
     LiveService,
     LiveMediaService,
