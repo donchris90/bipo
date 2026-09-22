@@ -64,6 +64,7 @@ export class LiveService {
     countryCode: string,
     themeColor?: string,
     coverUrl?: string,
+    dailyTargetCoins?: number,
   ) {
     if (await this.featureFlags.isEnabled('DISABLE_LIVE')) {
       throw new ForbiddenException('Live streaming is temporarily disabled');
@@ -80,6 +81,10 @@ export class LiveService {
     if (existing) throw new BadRequestException('You already have an active or scheduled live session');
 
     const sessionId = uuid();
+    const normalizedDailyTarget = dailyTargetCoins == null ? 1000 : Math.round(Number(dailyTargetCoins));
+    if (!Number.isFinite(normalizedDailyTarget) || normalizedDailyTarget < 0 || normalizedDailyTarget > 10_000_000) {
+      throw new BadRequestException('Daily target must be between 0 and 10,000,000 coins');
+    }
     const { channelName } = await this.rtc.createChannel(sessionId);
 
     const session = await this.prisma.liveSession.create({
@@ -93,6 +98,7 @@ export class LiveService {
         // dropped rather than saved as garbage a client would have to
         // guard against when rendering it as a color later.
         themeColor: themeColor && /^#[0-9A-Fa-f]{6}$/.test(themeColor) ? themeColor : null,
+        dailyTargetCoins: normalizedDailyTarget,
         coverUrl: LiveService.cleanCoverUrl(coverUrl),
         providerChannel: channelName,
         status: 'LIVE',

@@ -40,9 +40,11 @@ export class LiveController {
     @Body('category') category: string,
     @Body('themeColor') themeColor: string | undefined,
     @Body('coverUrl') coverUrl: string | undefined,
+    @Body('dailyTargetCoins') dailyTargetCoins: number | string | undefined,
     @Req() req: AuthedRequest,
   ) {
-    return this.live.create(req.user.userId, title, category, req.user.countryCode, themeColor, coverUrl);
+    const target = dailyTargetCoins == null ? undefined : Number(dailyTargetCoins);
+    return this.live.create(req.user.userId, title, category, req.user.countryCode, themeColor, coverUrl, target);
   }
 
   @Post(':id/join')
