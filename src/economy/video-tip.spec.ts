@@ -7,7 +7,7 @@ describe('tipping a video (POST /gifts/send with context VIDEO)', () => {
     const realtime: any = { broadcastGift: jest.fn(), broadcastPkScore: jest.fn() };
     const prisma: any = { video: { findUnique: jest.fn().mockResolvedValue(video) } };
     const ctl = new GiftController(gifts, realtime, prisma);
-    const send = (over: any = {}) => ctl.send(over.recipientId ?? 'creator', 'g1', over.context ?? 'VIDEO', over.contextId ?? 'v1', undefined, 'key', undefined, { user: { userId: 'fan' } } as any);
+    const send = (over: any = {}) => ctl.send(over.recipientId ?? 'creator', 'g1', over.context ?? 'VIDEO', over.contextId ?? 'v1', undefined, 'key', { user: { userId: 'fan' } } as any);
     return { send, gifts, prisma };
   };
   const ok = { creatorId: 'creator', status: 'PUBLISHED', allowGifts: true };

@@ -2,7 +2,7 @@ import { BadRequestException, ForbiddenException, Inject, Injectable, NotFoundEx
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { ModerationService } from '../moderation/moderation.service';
-import { RoomMode, RoomPrivacy } from '@prisma/client';
+import { RoomPrivacy } from '@prisma/client';
 import { RTC_PROVIDER } from '../live/live.service';
 import type { RtcProvider } from '../live/providers/rtc-provider.interface';
 import { fetchChatHistory } from '../common/chat-history';
@@ -98,7 +98,7 @@ export class RoomsService {
     const seats = await this.prisma.roomSeat.findMany({ where: { roomId }, orderBy: { seatNumber: 'asc' } });
     const users = await this.prisma.user.findMany({
       where: { id: { in: seats.map((s) => s.userId) } },
-      select: { id: true, displayName: true, avatarUrl: true },
+      select: { id: true, displayName: true },
     });
     const userById = new Map(users.map((u) => [u.id, u]));
 
@@ -123,7 +123,6 @@ export class RoomsService {
         seatNumber: s.seatNumber,
         userId: s.userId,
         displayName: userById.get(s.userId)?.displayName ?? null,
-        avatarUrl: userById.get(s.userId)?.avatarUrl ?? null,
         joinedAt: s.joinedAt,
         locked: lockedNumbers.has(s.seatNumber),
       })),
@@ -369,20 +368,8 @@ export class RoomsService {
   }
 
   async leaveSeat(roomId: string, userId: string) {
-    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { id: true, hostId: true, status: true, providerChannel: true } });
-    if (!room) throw new NotFoundException('Room not found');
-    if (room.status !== 'OPEN') return { left: false, closed: true };
-
-    // The host is the room owner. Removing the host seat would leave an OPEN
-    // room with no publisher and forces clients to guess whether the room is
-    // still usable. Host departure is therefore an explicit room close.
-    if (room.hostId === userId) {
-      await this.finishClose({ id: room.id, providerChannel: room.providerChannel, status: room.status });
-      return { left: true, closed: true };
-    }
-
     await this.prisma.roomSeat.deleteMany({ where: { roomId, userId } });
-    return { left: true, closed: false };
+    return { left: true };
   }
 
   // Separate from rejectSeatRequest on purpose — that one requires
@@ -447,23 +434,11 @@ export class RoomsService {
   // repeated call (or the sweeper racing the host) can't rewrite the close time.
   private async finishClose(room: { id: string; providerChannel: string; status: string }) {
     if (room.status === 'CLOSED') return this.prisma.partyRoom.findUniqueOrThrow({ where: { id: room.id } });
-
-    // Atomically claim the close so a host tap, navigation cleanup and the
-    // abandoned-room reaper cannot all try to destroy the same RTC channel.
-    const claimed = await this.prisma.partyRoom.updateMany({
-      where: { id: room.id, status: 'OPEN' },
+    await this.rtc.destroyChannel(room.providerChannel);
+    return this.prisma.partyRoom.update({
+      where: { id: room.id },
       data: { status: 'CLOSED', closedAt: new Date() },
     });
-    if (claimed.count === 0) return this.prisma.partyRoom.findUniqueOrThrow({ where: { id: room.id } });
-
-    try {
-      await this.rtc.destroyChannel(room.providerChannel);
-    } catch {
-      // The database remains the source of truth. RTC providers should make
-      // channel destruction idempotent; a transient provider failure must not
-      // resurrect an already-closed room.
-    }
-    return this.prisma.partyRoom.findUniqueOrThrow({ where: { id: room.id } });
   }
 
   async muteGuest(roomId: string, actorId: string, targetUserId: string) {
@@ -500,46 +475,6 @@ export class RoomsService {
   // Mid-session re-theme. Host only (a moderator runs the room, but the
   // stage's look is the host's call). Unlike create(), which silently
   // drops a bad color, this is an explicit edit, so a bad value is a 400.
-  async setMode(roomId: string, actorId: string, mode: string) {
-    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
-    if (!room) throw new NotFoundException('Room not found');
-    if (room.hostId !== actorId) throw new ForbiddenException('Only the host can change the room mode');
-    if (room.status !== 'OPEN') throw new BadRequestException('Room is closed');
-    if (mode !== 'VIDEO' && mode !== 'AUDIO') throw new BadRequestException('mode must be VIDEO or AUDIO');
-
-    const updated = await this.prisma.partyRoom.update({
-      where: { id: roomId },
-      data: { mode: mode as RoomMode },
-    });
-
-    return { mode: updated.mode };
-  }
-
-  async setSeatCount(roomId: string, actorId: string, seatCount: number) {
-    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
-    if (!room) throw new NotFoundException('Room not found');
-    if (room.hostId !== actorId) throw new ForbiddenException('Only the host can change the number of seats');
-    if (room.status !== 'OPEN') throw new BadRequestException('Room is closed');
-    if (!Number.isInteger(seatCount) || seatCount < 4 || seatCount > 12) {
-      throw new BadRequestException('seatCount must be between 4 and 12');
-    }
-
-    const occupied = await this.prisma.roomSeat.findMany({
-      where: { roomId },
-      select: { seatNumber: true },
-    });
-    const highestOccupied = occupied.reduce((max, seat) => Math.max(max, seat.seatNumber), -1);
-    if (highestOccupied >= seatCount) {
-      throw new BadRequestException(`Seat ${highestOccupied + 1} is occupied. Remove guests from higher seats first.`);
-    }
-
-    const updated = await this.prisma.partyRoom.update({
-      where: { id: roomId },
-      data: { seatCount },
-    });
-    return { seatCount: updated.seatCount };
-  }
-
   async setTheme(roomId: string, actorId: string, themeColor: string) {
     const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
     if (!room) throw new NotFoundException('Room not found');
@@ -595,7 +530,7 @@ export class RoomsService {
 
   private async logModeration(
     actorId: string,
-    actionType: 'KICK' | 'ADD_MODERATOR' | 'LOCK_ROOM' | 'UNLOCK_ROOM' | 'LOCK_SEAT' | 'UNLOCK_SEAT' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
+    actionType: 'KICK' | 'ADD_MODERATOR' | 'LOCK_ROOM' | 'UNLOCK_ROOM' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
     roomId: string,
     targetUserId?: string,
   ) {

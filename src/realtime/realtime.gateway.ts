@@ -229,6 +229,18 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(`LIVE:${sessionId}`).emit('live:viewer_count', payload);
   }
 
+  // Live moderation is broadcast to the current audience and directly to the target.
+  // KICK/BAN also remove the target's sockets from the live channel immediately.
+  broadcastLiveModeration(
+    sessionId: string,
+    payload: { sessionId: string; action: string; targetUserId: string; actorId: string },
+  ) {
+    this.server.to(`LIVE:${sessionId}`).to(`user:${payload.targetUserId}`).emit('live:moderation', payload);
+    if (payload.action === 'KICK' || payload.action === 'BAN') {
+      this.server.in(`user:${payload.targetUserId}`).socketsLeave(`LIVE:${sessionId}`);
+    }
+  }
+
   // Room moderation event. Goes to the whole room (so seat/mute state
   // updates for everyone) AND directly to the target's personal room (so it
   // still reaches them if their socket hasn't joined the room channel).

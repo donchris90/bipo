@@ -20,7 +20,7 @@ function build(over: { account?: any; quote?: (country: string, coins: number) =
   };
   const wallet: any = { getBalance: jest.fn().mockResolvedValue(over.balance ?? 10_000n), debit: jest.fn() };
   const risk: any = { scoreWithdrawal: jest.fn().mockResolvedValue({ needsReview: true, reasons: [] }) };
-  const payoutConfig: any = { requireQuote: jest.fn(over.quote ?? (async (_c: string, coins: number) => ({ currencyCode: 'NGN', requireKyc: true, cooldownHours: 0, maxDailyWithdrawalCoins: null, maxMonthlyWithdrawalCoins: null, manualReviewAboveCoins: null, allowedProviders: null, ...quoteWithdrawal(coins, RULES) }))) };
+  const payoutConfig: any = { requireQuote: jest.fn(over.quote ?? (async (_c: string, coins: number) => ({ currencyCode: 'NGN', ...quoteWithdrawal(coins, RULES) }))) };
   const payoutAccounts: any = {
     requireFor: jest.fn(async () => {
       if (over.account === null) throw new BadRequestException('Add a payout account before withdrawing');
@@ -74,7 +74,7 @@ describe('WithdrawalService.request with admin payout rules', () => {
 });
 
 describe('identity verification gate', () => {
-  const kycQuote = (requireKyc: boolean) => async (_c: string, coins: number) => ({ currencyCode: 'NGN', requireKyc, cooldownHours: 0, maxDailyWithdrawalCoins: null, maxMonthlyWithdrawalCoins: null, manualReviewAboveCoins: null, allowedProviders: null, ...quoteWithdrawal(coins, RULES) });
+  const kycQuote = (requireKyc: boolean) => async (_c: string, coins: number) => ({ currencyCode: 'NGN', requireKyc, ...quoteWithdrawal(coins, RULES) });
 
   it('refuses an unverified person when the admin requires verification, before reserving any coins', async () => {
     const { svc, wallet } = build({ quote: kycQuote(true), verified: false });
@@ -102,7 +102,6 @@ describe('WithdrawalService.processPayout', () => {
       withdrawalRequest: {
         findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'w1', creatorId: 'u1', walletType: 'CREATOR_EARNINGS', amountMinor: 1000, netMinor: 44_000, currencyCode: 'NGN', idempotencyKey: 'k', payoutTo: ACCOUNT }),
         update: jest.fn(async ({ data }: any) => data),
-        updateMany: jest.fn().mockResolvedValue({ count: 1 }), // claims APPROVED -> PROCESSING
       },
     };
     const svc = new WithdrawalService(prisma, {} as any, {} as any, {} as any, { initiatePayout } as any, {} as any, {} as any, {} as any);
@@ -115,7 +114,7 @@ describe('WithdrawalService.processPayout', () => {
     const credit = jest.fn();
     const tx = { withdrawalRequest: { update: jest.fn(async ({ data }: any) => data) } };
     const prisma: any = {
-      withdrawalRequest: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'w1', creatorId: 'u1', walletType: 'CREATOR_EARNINGS', amountMinor: 1000, netMinor: null, currencyCode: 'NGN', idempotencyKey: 'k' }), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      withdrawalRequest: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: 'w1', creatorId: 'u1', walletType: 'CREATOR_EARNINGS', amountMinor: 1000, netMinor: null, currencyCode: 'NGN', idempotencyKey: 'k' }) },
       $transaction: jest.fn(async (fn: any) => fn(tx)),
     };
     const svc = new WithdrawalService(prisma, { credit } as any, {} as any, {} as any, { initiatePayout } as any, { notifyOnce: jest.fn() } as any, {} as any, {} as any);

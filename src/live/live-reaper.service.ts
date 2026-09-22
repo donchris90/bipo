@@ -45,6 +45,9 @@ export class LiveReaperService implements OnModuleInit, OnModuleDestroy {
     if (this.sweeping) return [];
     this.sweeping = true;
     try {
+      // Paid private sessions have a hard server-side expiry. This is independent
+      // of socket presence so the timer cannot be bypassed by keeping the app open.
+      const expiredPrivate = await this.live.sweepPrivateSessions();
       const sessions = await this.prisma.liveSession.findMany({
         where: { status: 'LIVE' },
         select: { id: true, hostId: true },
@@ -66,7 +69,7 @@ export class LiveReaperService implements OnModuleInit, OnModuleDestroy {
         graceMs,
       });
 
-      const ended: string[] = [];
+      const ended: string[] = [...expiredPrivate];
       for (const id of abandoned) {
         try {
           await this.live.endAbandoned(id);

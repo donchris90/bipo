@@ -64,17 +64,9 @@ export class SettlementService {
       if (isSumDice) {
         won = isWinningNumber(entry.selection as number[], drawResult.sum!);
         const selected = entry.selection as number[];
-        // An admin can give specific numbers (0-27) their own payout — the rest
-        // keep using the game's shared multiplier. A number that was never
-        // individually set must fall back to that shared multiplier, NOT to 0:
-        // paying a winner nothing just because the admin left that one number
-        // alone would contradict the admin page's own promise ("leave this
-        // section unchanged to use the game's single default multiplier") and
-        // silently take a real win away from a player.
-        const customPayout = rules.numberPayouts && typeof rules.numberPayouts === 'object'
-          ? (rules.numberPayouts as Record<string, unknown>)[String(drawResult.sum!)]
-          : undefined;
-        const winningMultiplier = typeof customPayout === 'number' ? customPayout : payoutMultiplier;
+        const winningMultiplier = rules.numberPayouts && typeof rules.numberPayouts === 'object'
+          ? Number((rules.numberPayouts as Record<string, unknown>)[String(drawResult.sum!) ] ?? 0)
+          : payoutMultiplier;
         rewardAmount = computeSumDiceReward(
           entry.coinAmount,
           selected.length,

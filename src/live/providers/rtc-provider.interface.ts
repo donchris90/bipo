@@ -7,7 +7,7 @@ import { notConfigured } from '../../common/provider-mode';
 
 export interface RtcProvider {
   createChannel(sessionId: string): Promise<{ channelName: string }>;
-  generateToken(channelName: string, userId: string, role: 'host' | 'audience'): Promise<string>;
+  generateToken(channelName: string, userId: string, role: 'host' | 'publisher' | 'audience'): Promise<string>;
   destroyChannel(channelName: string): Promise<void>;
 }
 
@@ -30,7 +30,7 @@ export class MockRtcProvider implements RtcProvider {
     return { channelName: `mock_${sessionId}` };
   }
 
-  async generateToken(channelName: string, userId: string, role: 'host' | 'audience') {
+  async generateToken(channelName: string, userId: string, role: 'host' | 'publisher' | 'audience') {
     // Dev-only opaque token. A real provider issues a signed, time-limited
     // token — never a value the client could forge or replay indefinitely.
     return `mocktoken_${channelName}_${userId}_${role}_${randomBytes(4).toString('hex')}`;

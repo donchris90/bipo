@@ -26,6 +26,7 @@ model User {
   avatarUrl     String?
   bio           String?
   liveViews     LiveViewer[]
+  privateLiveRequests PrivateLiveRequest[]
   refreshTokens RefreshToken[]
   referredBy    User?          @relation("Referrals", fields: [referredById], references: [id])
   referrals     User[]         @relation("Referrals")
@@ -68,8 +69,6 @@ model RegionalConfig {
   // Country-level economy controls.
   creatorEarningMinorPer100Coins Int?
   coinUsdCentsPer100 Int?
-  // Server-controlled C2C fiat quote in the country currency per 100 coins.
-  c2cFiatMinorPer100Coins Int?
   paymentMethods Json?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
@@ -171,8 +170,13 @@ model LiveSession {
   dailyTargetCoins Int?
   likeCount       Int          @default(0)
   peakViewerCount Int          @default(0)
-  durationSeconds Int?
-  viewers         LiveViewer[]
+  durationSeconds        Int?
+  privatePriceCoins      Int?
+  privateDurationSeconds Int?
+  privateStartedAt       DateTime?
+  privateEndsAt          DateTime?
+  privateRequests        PrivateLiveRequest[]
+  viewers                LiveViewer[]
 
   @@index([hostId])
   @@index([status])
@@ -189,6 +193,27 @@ model LiveViewer {
 
   @@index([sessionId, leftAt])
   @@index([userId])
+}
+
+model PrivateLiveRequest {
+  id              String                    @id @default(uuid())
+  sessionId       String
+  viewerId        String
+  status          PrivateLiveRequestStatus  @default(PENDING)
+  priceCoins      Int
+  durationSeconds Int
+  createdAt       DateTime                  @default(now())
+  acceptedAt      DateTime?
+  startedAt       DateTime?
+  endsAt          DateTime?
+  settledAt       DateTime?
+  refundedAt      DateTime?
+  session         LiveSession               @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  viewer          User                      @relation(fields: [viewerId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, status])
+  @@index([viewerId, status])
+  @@index([sessionId, viewerId])
 }
 
 enum RoomMode {
@@ -555,46 +580,6 @@ model WithdrawalRequest {
   @@index([status])
 }
 
-
-model C2COrder {
-  id                String        @id @default(uuid())
-  buyerId           String
-  sellerId          String
-  coinAmount        Int
-  fiatAmountMinor   Int
-  currencyCode      String
-  status            C2COrderStatus @default(OPEN)
-  paymentReference  String?
-  paymentProofUrl   String?
-  paymentProofNote  String?
-  disputeReason     String?
-  adminNote         String?
-  expiresAt         DateTime
-  createdAt         DateTime      @default(now())
-  updatedAt         DateTime      @updatedAt
-  acceptedAt        DateTime?
-  paidAt            DateTime?
-  releasedAt        DateTime?
-  cancelledAt       DateTime?
-  disputedAt        DateTime?
-  resolvedAt        DateTime?
-
-  @@index([buyerId, status])
-  @@index([sellerId, status])
-  @@index([status, expiresAt])
-}
-
-enum C2COrderStatus {
-  OPEN
-  ACCEPTED
-  PAYMENT_SUBMITTED
-  RELEASED
-  CANCELLED
-  DISPUTED
-  REFUNDED
-  EXPIRED
-}
-
 model Agency {
   id        String       @id @default(uuid())
   name      String
@@ -757,6 +742,16 @@ enum LiveStatus {
   ENDED
 }
 
+enum PrivateLiveRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  ACTIVE
+  COMPLETED
+  REFUNDED
+}
+
 enum RoomPrivacy {
   PUBLIC
   PRIVATE
@@ -792,8 +787,6 @@ enum ModerationActionType {
   REMOVE_MODERATOR
   LOCK_ROOM
   UNLOCK_ROOM
-  LOCK_SEAT
-  UNLOCK_SEAT
 }
 
 enum WalletType {
@@ -817,9 +810,7 @@ enum LedgerEntryType {
   ADJUSTMENT
   AGENCY_COMMISSION
   PK_SCORE
-  C2C_ESCROW
-  C2C_RELEASE
-  C2C_REFUND
+  PRIVATE_LIVE_PAYMENT
 }
 
 enum PurchaseStatus {

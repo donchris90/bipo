@@ -92,7 +92,7 @@ export function validatePayoutConfig(raw: any): PayoutConfigInput {
     maxMonthlyWithdrawalCoins: raw.maxMonthlyWithdrawalCoins == null || raw.maxMonthlyWithdrawalCoins === '' ? null : raw.maxMonthlyWithdrawalCoins,
     manualReviewAboveCoins: raw.manualReviewAboveCoins == null || raw.manualReviewAboveCoins === '' ? null : raw.manualReviewAboveCoins,
     cooldownHours: raw.cooldownHours ?? 0,
-    allowedProviders: raw.allowedProviders == null ? null : ([...new Set(raw.allowedProviders.map((v: any) => String(v).toUpperCase()))] as string[]),
+    allowedProviders: raw.allowedProviders == null ? null : [...new Set(raw.allowedProviders.map((v: any) => String(v).toUpperCase()))],
   };
   // Catch a configuration that could never pay anyone out.
   if (computePayout(clean.minWithdrawalCoins, clean).netMinor <= 0) {

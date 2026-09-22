@@ -44,7 +44,6 @@ export class RegionalConfigService {
       active?: boolean;
       creatorEarningMinorPer100Coins?: number | null;
       coinUsdCentsPer100?: number | null;
-      c2cFiatMinorPer100Coins?: number | null;
       paymentMethods?: string[];
     },
     actorId: string,
@@ -56,17 +55,13 @@ export class RegionalConfigService {
       : undefined;
     const creatorEarningMinorPer100Coins = data.creatorEarningMinorPer100Coins == null ? data.creatorEarningMinorPer100Coins : Number(data.creatorEarningMinorPer100Coins);
     const coinUsdCentsPer100 = data.coinUsdCentsPer100 == null ? data.coinUsdCentsPer100 : Number(data.coinUsdCentsPer100);
-    const c2cFiatMinorPer100Coins = data.c2cFiatMinorPer100Coins == null ? data.c2cFiatMinorPer100Coins : Number(data.c2cFiatMinorPer100Coins);
     if (creatorEarningMinorPer100Coins != null && (!Number.isInteger(creatorEarningMinorPer100Coins) || creatorEarningMinorPer100Coins < 0)) {
       throw new BadRequestException('creatorEarningMinorPer100Coins must be a non-negative whole number');
     }
     if (coinUsdCentsPer100 != null && (!Number.isInteger(coinUsdCentsPer100) || coinUsdCentsPer100 < 0)) {
       throw new BadRequestException('coinUsdCentsPer100 must be a non-negative whole number');
     }
-    if (c2cFiatMinorPer100Coins != null && (!Number.isInteger(c2cFiatMinorPer100Coins) || c2cFiatMinorPer100Coins <= 0)) {
-      throw new BadRequestException('c2cFiatMinorPer100Coins must be a positive whole number');
-    }
-    const clean = { ...data, countryCode, ...(paymentMethods ? { paymentMethods } : {}), creatorEarningMinorPer100Coins, coinUsdCentsPer100, c2cFiatMinorPer100Coins };
+    const clean = { ...data, countryCode, ...(paymentMethods ? { paymentMethods } : {}), creatorEarningMinorPer100Coins, coinUsdCentsPer100 };
     const config = await this.prisma.regionalConfig.upsert({
       where: { countryCode },
       update: clean,
