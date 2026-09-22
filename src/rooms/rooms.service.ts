@@ -98,7 +98,7 @@ export class RoomsService {
     const seats = await this.prisma.roomSeat.findMany({ where: { roomId }, orderBy: { seatNumber: 'asc' } });
     const users = await this.prisma.user.findMany({
       where: { id: { in: seats.map((s) => s.userId) } },
-      select: { id: true, displayName: true },
+      select: { id: true, displayName: true, avatarUrl: true },
     });
     const userById = new Map(users.map((u) => [u.id, u]));
 
@@ -123,6 +123,7 @@ export class RoomsService {
         seatNumber: s.seatNumber,
         userId: s.userId,
         displayName: userById.get(s.userId)?.displayName ?? null,
+        avatarUrl: userById.get(s.userId)?.avatarUrl ?? null,
         joinedAt: s.joinedAt,
         locked: lockedNumbers.has(s.seatNumber),
       })),
