@@ -173,7 +173,15 @@ export class RoomsService {
     }
 
     if (room.privacy === 'INVITE_ONLY') {
-      throw new ForbiddenException('This room is invite-only');
+      const invite = await this.prisma.seatRequest.findFirst({
+        where: { roomId, userId, status: 'PENDING', invitedByHost: true },
+      });
+      if (!invite) throw new ForbiddenException('You must be invited to join this room');
+      if (firstAvailable === null) throw new BadRequestException('No available seat');
+      return this.acceptInvite(roomId, userId, firstAvailable).then((seat) => ({
+        joined: true,
+        seatNumber: seat.seatNumber,
+      }));
     }
     if (room.privacy === 'FOLLOWERS_ONLY') {
       const follows = await this.prisma.follow.findUnique({ where: { followerId_followingId: { followerId: userId, followingId: room.hostId } } });
@@ -225,7 +233,7 @@ export class RoomsService {
         where: { roomId, userId, status: 'PENDING', invitedByHost: true },
       });
       if (!invite) throw new ForbiddenException('You must be invited to take a seat in this room');
-      return invite;
+      return this.acceptInvite(roomId, userId, seatNumber);
     }
 
     if (room.privacy === 'PRIVATE') {
@@ -415,6 +423,9 @@ export class RoomsService {
       if (!request || request.roomId !== roomId || request.status !== 'PENDING' || request.invitedByHost) {
         throw new NotFoundException('No such pending request');
       }
+      if (await this.moderation.isBanned('ROOM', roomId, request.userId)) {
+        throw new ForbiddenException('This user is banned from the room');
+      }
 
       let seat;
       try {
@@ -506,6 +517,7 @@ export class RoomsService {
       create: { roomId, userId: targetUserId },
     });
     await this.logModeration(actorId, 'ADD_MODERATOR', roomId, targetUserId);
+    this.emitRoomState(roomId, 'MODERATOR_CHANGED', targetUserId, { moderator: true });
     return { added: true };
   }
 
@@ -515,6 +527,7 @@ export class RoomsService {
     if (room.hostId !== actorId) throw new ForbiddenException('Only the host can remove moderators');
     await this.prisma.roomModerator.deleteMany({ where: { roomId, userId: targetUserId } });
     await this.logModeration(actorId, 'REMOVE_MODERATOR', roomId, targetUserId);
+    this.emitRoomState(roomId, 'MODERATOR_CHANGED', targetUserId, { moderator: false });
     return { removed: true };
   }
 
@@ -675,7 +688,7 @@ export class RoomsService {
 
   private async logModeration(
     actorId: string,
-    actionType: 'KICK' | 'ADD_MODERATOR' | 'LOCK_ROOM' | 'UNLOCK_ROOM' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
+    actionType: 'KICK' | 'ADD_MODERATOR' | 'REMOVE_MODERATOR' | 'LOCK_ROOM' | 'UNLOCK_ROOM' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
     roomId: string,
     targetUserId?: string,
   ) {
