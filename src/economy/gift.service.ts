@@ -7,6 +7,7 @@ import { RevenueSplitService, ResolvedSplit } from './revenue-split.service';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { WalletType, LedgerEntryType, ChatContext } from '@prisma/client';
 import { pkPointsForCoins, pkSideForRecipient } from './pk-score';
+import { HostLevelsService } from '../host-levels/host-levels.service';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -135,6 +136,7 @@ export class GiftService {
     // without the notification stack; in the running app it is always
     // injected. Never awaited for its result and never able to fail a gift.
     @Optional() private readonly notifications?: NotificationsService,
+    @Optional() private readonly hostLevels?: HostLevelsService,
   ) {}
 
   // Backing for a gift-picker UI — before this, the only way a client
@@ -272,6 +274,10 @@ export class GiftService {
         },
       });
     }, EXTENDED_TX_OPTIONS);
+
+    if (this.hostLevels) {
+      try { await this.hostLevels.awardRule(params.recipientId, 'GIFT_100_COINS', Math.floor(coinAmount / 100)); } catch { /* progression must never fail a paid gift */ }
+    }
 
     // 4. If sent during an active PK battle, feed the score. Kept outside
     // the financial transaction above deliberately — a PK score is a

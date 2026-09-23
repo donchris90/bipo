@@ -40,9 +40,10 @@ export class UsersController {
     @Body('displayName') displayName: string | undefined,
     @Body('avatarUrl') avatarUrl: string | undefined,
     @Body('bio') bio: string | undefined,
+    @Body('oneOnOneEnabled') oneOnOneEnabled: boolean | undefined,
     @Req() req: AuthedRequest,
   ) {
-    return this.usersService.updateMe(req.user.userId, { displayName, avatarUrl, bio });
+    return this.usersService.updateMe(req.user.userId, { displayName, avatarUrl, bio, oneOnOneEnabled });
   }
 
   @Patch(':id/suspend')

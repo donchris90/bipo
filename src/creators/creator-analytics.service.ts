@@ -96,7 +96,8 @@ export class CreatorAnalyticsService {
       followersGained,
       giftAgg,
       topGifterRows,
-      earnedAgg,
+      giftEarnedAgg,
+      privateEarnedAgg,
       pk,
       validDays,
     ] = await Promise.all([
@@ -127,6 +128,12 @@ export class CreatorAnalyticsService {
       wallet
         ? this.prisma.ledgerEntry.aggregate({
             where: { walletId: wallet.id, type: LedgerEntryType.GIFT_RECEIVED, createdAt: { gte: since } },
+            _sum: { amount: true },
+          })
+        : Promise.resolve({ _sum: { amount: null as bigint | null } }),
+      wallet
+        ? this.prisma.ledgerEntry.aggregate({
+            where: { walletId: wallet.id, type: LedgerEntryType.PRIVATE_LIVE_PAYMENT, createdAt: { gte: since } },
             _sum: { amount: true },
           })
         : Promise.resolve({ _sum: { amount: null as bigint | null } }),
@@ -176,7 +183,11 @@ export class CreatorAnalyticsService {
         })),
       },
       // This creator's own share, after the platform (and any agency) split.
-      earnings: { creatorCoins: (earnedAgg._sum.amount ?? 0n).toString() },
+      earnings: {
+        creatorCoins: ((giftEarnedAgg._sum.amount ?? 0n) + (privateEarnedAgg._sum.amount ?? 0n)).toString(),
+        giftCoins: (giftEarnedAgg._sum.amount ?? 0n).toString(),
+        privateCoins: (privateEarnedAgg._sum.amount ?? 0n).toString(),
+      },
       pk,
       // Independent of `period`: always the current calendar month.
       validDays,

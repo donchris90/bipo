@@ -92,8 +92,8 @@ export class UsersService {
   // shouldn't have to resend an unchanged displayName. avatarUrl is trusted
   // as already-uploaded rather than a file this endpoint receives itself;
   // this only ever stores the resulting URL string. A blank bio clears it.
-  async updateMe(userId: string, updates: { displayName?: string; avatarUrl?: string; bio?: string }) {
-    const data: { displayName?: string; avatarUrl?: string | null; bio?: string | null } = {};
+  async updateMe(userId: string, updates: { displayName?: string; avatarUrl?: string; bio?: string; oneOnOneEnabled?: boolean }) {
+    const data: { displayName?: string; avatarUrl?: string | null; bio?: string | null; oneOnOneEnabled?: boolean } = {};
 
     if (updates.displayName !== undefined) {
       const trimmed = updates.displayName.trim();
@@ -118,6 +118,13 @@ export class UsersService {
         throw new BadRequestException(`Bio must be ${MAX_BIO_LENGTH} characters or fewer`);
       }
       data.bio = trimmed || null;
+    }
+
+    if (updates.oneOnOneEnabled !== undefined) {
+      if (typeof updates.oneOnOneEnabled !== 'boolean') throw new BadRequestException('oneOnOneEnabled must be true or false');
+      const creator = await this.prisma.userRole.findFirst({ where: { userId, role: RoleName.CREATOR } });
+      if (!creator) throw new BadRequestException('Only hosts can change 1-on-1 availability');
+      data.oneOnOneEnabled = updates.oneOnOneEnabled;
     }
 
     if (Object.keys(data).length === 0) {

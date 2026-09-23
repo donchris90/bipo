@@ -17,11 +17,12 @@ import { PaystackPaymentProvider } from './providers/paystack-payment-provider';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { HostLevelsModule } from '../host-levels/host-levels.module';
 
 const logger = new Logger('EconomyModule');
 
 @Module({
-  imports: [ConfigModule, RealtimeModule, NotificationsModule],
+  imports: [ConfigModule, RealtimeModule, NotificationsModule, HostLevelsModule],
   providers: [CoinPackageAdminService, GiftAdminService, 
     WalletService,
     RevenueSplitService,
