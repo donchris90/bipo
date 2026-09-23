@@ -11,6 +11,7 @@ import { SettlementService } from './settlement.service';
 import { CrashService } from './crash.service';
 import { GameAdminService } from './game-admin.service';
 import { classifyResult, computePerNumberPool } from './sum-dice-rules';
+import { buildRoundData } from './game-fairness';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
@@ -37,7 +38,6 @@ const ROUND_SELECT = {
   lockAt: true,
   result: true,
   commitmentHash: true,
-  revealData: true,
   status: true,
   createdAt: true,
   settledAt: true,
@@ -55,13 +55,15 @@ export class GamesController {
   ) {}
 
   @Get(':gameCode/rounds')
-  listRounds(@Param('gameCode') gameCode: string) {
-    return this.prisma.gameRound.findMany({
+  async listRounds(@Param('gameCode') gameCode: string) {
+    const rounds = await this.prisma.gameRound.findMany({
       where: { gameCode },
       orderBy: { createdAt: 'desc' },
       take: 20,
       select: ROUND_SELECT,
     });
+    const serverNow = Date.now();
+    return rounds.map((round) => ({ ...round, serverNow }));
   }
 
   // Matches the "Time | Result | Winners | Prize" history table observed
@@ -100,6 +102,7 @@ export class GamesController {
           roundId: round.id,
           settledAt: round.settledAt,
           result: round.result,
+          commitmentHash: round.commitmentHash,
           winners: wonAgg._count._all, // counts winning entries, not distinct users — a player who places 2 winning entries counts as 2 here
           prize: wonAgg._sum.rewardAmount ?? 0,
           players: totalAgg._count._all, // same caveat — entry count, not distinct-user count
@@ -204,8 +207,24 @@ export class GamesController {
 
   @Get('rounds/:roundId/reveal')
   async reveal(@Param('roundId') roundId: string) {
-    const round = await this.prisma.gameRound.findUniqueOrThrow({ where: { id: roundId }, select: ROUND_SELECT });
-    return this.rounds.reveal(round);
+    const round = await this.prisma.gameRound.findUniqueOrThrow({
+      where: { id: roundId },
+      select: { status: true, revealData: true, commitmentHash: true, gameCode: true, openAt: true, lockAt: true, numberRange: true, result: true },
+    });
+    const reveal = this.rounds.reveal(round);
+    return { ...reveal, roundData: buildRoundData(round), result: round.result };
+  }
+
+  @Get('rounds/:roundId/live-stats')
+  async liveStats(@Param('roundId') roundId: string) {
+    const entries = await this.prisma.gameEntry.findMany({
+      where: { roundId },
+      select: { userId: true, coinAmount: true },
+    });
+    return {
+      players: new Set(entries.map((entry) => entry.userId)).size,
+      totalWagered: entries.reduce((sum, entry) => sum + entry.coinAmount, 0),
+    };
   }
 
   // Crash only — live, poll-friendly multiplier for the client's

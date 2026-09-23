@@ -27,6 +27,28 @@ describe('RoomReaperService', () => {
   });
 });
 
+describe('RoomReaperService seats', () => {
+  const build = (present: string[]) => {
+    const prisma: any = {
+      partyRoom: { findMany: jest.fn().mockResolvedValue([{ id: 'r1', hostId: 'h1' }]) },
+      roomSeat: { findMany: jest.fn().mockResolvedValue([{ roomId: 'r1', userId: 'h1' }, { roomId: 'r1', userId: 'g1' }, { roomId: 'r1', userId: 'g2' }]) },
+    };
+    const realtime: any = { userIdsInRoom: jest.fn(async () => new Set(present)) };
+    const rooms: any = { releaseSeat: jest.fn().mockResolvedValue({ left: true }) };
+    return { svc: new RoomReaperService(prisma, realtime, rooms), rooms };
+  };
+
+  it('frees only the seat of a guest who has been gone past the grace period, never the host', async () => {
+    const { svc, rooms } = build(['g2']); // host h1 and guest g1 have no socket in the room
+    expect(await svc.sweepSeats(0, GRACE)).toEqual([]);
+    expect(await svc.sweepSeats(GRACE - 1, GRACE)).toEqual([]);
+    expect(await svc.sweepSeats(GRACE, GRACE)).toEqual(['r1|g1']);
+    expect(rooms.releaseSeat).toHaveBeenCalledWith('r1', 'g1');
+    expect(rooms.releaseSeat).not.toHaveBeenCalledWith('r1', 'h1');
+    expect(rooms.releaseSeat).not.toHaveBeenCalledWith('r1', 'g2');
+  });
+});
+
 describe('RoomsService closing', () => {
   const room = (status: string) => ({ id: 'r', hostId: 'h', providerChannel: 'c', status });
   const build = (status: string) => {

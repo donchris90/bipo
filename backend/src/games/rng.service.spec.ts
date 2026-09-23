@@ -33,4 +33,22 @@ describe('RngService', () => {
     const secrets = new Set(Array.from({ length: 100 }, () => rng.generateSecret()));
     expect(secrets.size).toBe(100);
   });
+  it('derives the same game value from the revealed secret and public context', () => {
+    const a = rng.randomInRangeFromSecret('secret-1', 'round-context:crash', 0, 2 ** 32 - 1);
+    const b = rng.randomInRangeFromSecret('secret-1', 'round-context:crash', 0, 2 ** 32 - 1);
+    const c = rng.randomInRangeFromSecret('secret-2', 'round-context:crash', 0, 2 ** 32 - 1);
+    expect(a).toBe(b);
+    expect(c).not.toBe(a);
+    expect(a).toBeGreaterThanOrEqual(0);
+    expect(a).toBeLessThanOrEqual(2 ** 32 - 1);
+  });
+
+  it('does not expose modulo bias through a small deterministic range', () => {
+    for (let i = 0; i < 100; i++) {
+      const n = rng.randomInRangeFromSecret('secret-' + i, 'dice:' + i, 0, 9);
+      expect(n).toBeGreaterThanOrEqual(0);
+      expect(n).toBeLessThanOrEqual(9);
+    }
+  });
+
 });

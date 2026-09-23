@@ -51,6 +51,19 @@ export class PkController {
     return { battle: toResponse(battle), opponent };
   }
 
+  // The challenger withdraws an unanswered invitation.
+  @Post(':id/cancel')
+  async cancel(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return toResponse(await this.pk.cancel(id, req.user.userId));
+  }
+
+  // A host ends the PK early: called off during the countdown, a loss once
+  // it has started.
+  @Post(':id/forfeit')
+  async forfeit(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return toResponse(await this.pk.forfeit(id, req.user.userId));
+  }
+
   @Post(':id/decline')
   async decline(@Param('id') id: string, @Req() req: AuthedRequest) {
     return toResponse(await this.pk.decline(id, req.user.userId));
@@ -67,6 +80,13 @@ export class PkController {
   @Get('history')
   history(@Req() req: AuthedRequest, @Query('limit') limit?: string, @Query('before') before?: string) {
     return this.pk.history(req.user.userId, limit ? Number(limit) : undefined, before);
+  }
+
+  // My invitation that is still waiting for an answer (or null). Before ':id'.
+  @Get('outgoing')
+  async outgoing(@Req() req: AuthedRequest) {
+    const result = await this.pk.outgoing(req.user.userId);
+    return result ? { ...result, battle: toResponse(result.battle) } : null;
   }
 
   // Must come before the @Get(':id') wildcard below — NestJS matches

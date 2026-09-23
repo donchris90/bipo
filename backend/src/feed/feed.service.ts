@@ -49,34 +49,58 @@ export class FeedService {
   // ordered by most-recently-started, honestly. Joins host displayName/
   // countryCode the same two-step way as attachLiveStatus, since
   // LiveSession has no relation to User.
+  // Who's live now, hottest first: most people watching, then newest. Each
+  // card also carries the live viewer count and whether the host is in a PK
+  // (both shown on the card, like BIGO/Poppo). The live viewer screen uses
+  // this same order for swiping up/down between lives.
   async liveNow(limit = 50) {
     const sessions = await this.prisma.liveSession.findMany({
       where: { status: 'LIVE' },
       orderBy: { startedAt: 'desc' },
-      take: limit,
-      select: { id: true, hostId: true, title: true, category: true, coverUrl: true, countryCode: true, startedAt: true },
+      take: 200,
+      select: { id: true, hostId: true, title: true, category: true, coverUrl: true, countryCode: true, startedAt: true, privacy: true },
     });
     if (sessions.length === 0) return [];
 
-    const hosts = await this.prisma.user.findMany({
-      where: { id: { in: sessions.map((s) => s.hostId) } },
-      select: { id: true, displayName: true, avatarUrl: true },
-    });
+    const hostIds = sessions.map((s) => s.hostId);
+    const [hosts, counts, battles] = await Promise.all([
+      this.prisma.user.findMany({
+        where: { id: { in: hostIds } },
+        select: { id: true, displayName: true, avatarUrl: true },
+      }),
+      this.prisma.liveViewer.groupBy({
+        by: ['sessionId'],
+        where: { sessionId: { in: sessions.map((s) => s.id) }, leftAt: null },
+        _count: { _all: true },
+      }),
+      this.prisma.pKBattle.findMany({
+        where: { status: { in: ['COUNTDOWN', 'ACTIVE'] }, OR: [{ challengerId: { in: hostIds } }, { opponentId: { in: hostIds } }] },
+        select: { challengerId: true, opponentId: true },
+      }),
+    ]);
     const hostById = new Map(hosts.map((h) => [h.id, h]));
+    const countBySession = new Map(counts.map((c) => [c.sessionId, c._count._all]));
+    const inPk = new Set(battles.flatMap((b) => [b.challengerId, b.opponentId]));
 
-    return sessions.map((s) => ({
-      id: s.id,
-      hostId: s.hostId,
-      hostDisplayName: hostById.get(s.hostId)?.displayName ?? null,
-      // The card's thumbnail is the host's chosen cover, or failing that their
-      // profile photo.
-      hostAvatarUrl: hostById.get(s.hostId)?.avatarUrl ?? null,
-      title: s.title,
-      category: s.category,
-      coverUrl: s.coverUrl,
-      countryCode: s.countryCode,
-      startedAt: s.startedAt,
-    }));
+    return sessions
+      .map((s) => ({
+        id: s.id,
+        hostId: s.hostId,
+        hostDisplayName: hostById.get(s.hostId)?.displayName ?? null,
+        // The card's thumbnail is the host's chosen cover, or failing that their
+        // profile photo.
+        hostAvatarUrl: hostById.get(s.hostId)?.avatarUrl ?? null,
+        title: s.title,
+        category: s.category,
+        coverUrl: s.coverUrl,
+        countryCode: s.countryCode,
+        startedAt: s.startedAt,
+        privacy: s.privacy,
+        viewerCount: countBySession.get(s.id) ?? 0,
+        inPk: inPk.has(s.hostId),
+      }))
+      .sort((a, b) => b.viewerCount - a.viewerCount || (b.startedAt?.getTime() ?? 0) - (a.startedAt?.getTime() ?? 0))
+      .slice(0, limit);
   }
 
   async discover(userId: string, limit = 20) {

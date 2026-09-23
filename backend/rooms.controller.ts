@@ -3,7 +3,7 @@ import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Req, UseGuard
 import { Request } from 'express';
 import { RoomsService } from './rooms.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { RoleName } from '@prisma/client';
+import { RoleName, RoomPrivacy } from '@prisma/client';
 
 interface AuthedRequest extends Request {
   user: { userId: string; roles: RoleName[]; countryCode: string };
@@ -30,8 +30,8 @@ export class RoomsController {
   }
 
   @Get(':id')
-  getDetails(@Param('id') id: string, @Req() req: AuthedRequest) {
-    return this.rooms.getRoomDetails(id, req.user.userId);
+  getDetails(@Param('id') id: string) {
+    return this.rooms.getRoomDetails(id);
   }
 
   @Get(':id/chat')
@@ -102,29 +102,14 @@ export class RoomsController {
     return this.rooms.rejectSeatRequest(id, req.user.userId, requestId);
   }
 
-  @Get(':id/invite-candidates')
-  inviteCandidates(
-    @Param('id') id: string,
-    @Query('category') category: string,
-    @Query('search') search: string | undefined,
-    @Req() req: AuthedRequest,
-  ) {
-    const value = category === 'fans' || category === 'agency' ? category : 'friends';
-    return this.rooms.inviteCandidates(id, req.user.userId, value as 'friends' | 'fans' | 'agency', search);
-  }
-
-  // MUST stay above ':id/invite/:userId'. Express matches routes in the order
-  // they are declared, so if the parameterised route came first, "accept"
-  // would be read as a userId and the guest would get "Requires host or
-  // moderator" instead of joining.
-  @Post(':id/invite/accept')
-  acceptInvite(@Param('id') id: string, @Req() req: AuthedRequest) {
-    return this.rooms.acceptInvite(id, req.user.userId);
-  }
-
   @Post(':id/invite/:userId')
   inviteToSeat(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
     return this.rooms.inviteToSeat(id, req.user.userId, userId);
+  }
+
+  @Post(':id/invite/accept')
+  acceptInvite(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.rooms.acceptInvite(id, req.user.userId);
   }
 
   @Post(':id/remove/:userId')

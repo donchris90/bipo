@@ -1,3 +1,4 @@
+import { loadPkSupporters } from './pk-score';
 import { BadRequestException, Body, Controller, Get, Inject, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { UnavailablePaymentProvider, type PaymentProvider } from './providers/payment-provider.interface';
 import { Throttle } from '@nestjs/throttler';
@@ -196,21 +197,36 @@ export class GiftController {
       });
     }
 
-    // broadcastPkScore existed on the gateway but nothing ever called it —
-    // PK score only ever updated in the database, forcing mobile to poll
-    // GET /pk/:id every few seconds to notice a change. GiftService.send
-    // already applied the score update (if any) before returning; re-read
-    // the battle here rather than changing GiftService's return contract,
-    // since send() also needs to keep working exactly as before for every
-    // caller that isn't PK-related.
-    if (pkBattleId) {
-      const battle = await this.prisma.pKBattle.findUnique({ where: { id: pkBattleId } });
-      if (battle && battle.status === 'ACTIVE') {
-        this.realtime.broadcastPkScore(pkBattleId, {
-          pkBattleId,
-          scoreChallenger: battle.scoreChallenger.toString(),
-          scoreOpponent: battle.scoreOpponent.toString(),
-        });
+    // The server decided which PK (if any) this gift counted for (see
+    // GiftService.resolvePkBattleId) and stored it on the transaction. Push
+    // the new score, with each side's top supporters, to the battle channel
+    // AND to both hosts' live rooms, so every viewer of either host sees the
+    // bar move without polling.
+    const battleId = (transaction as { pkBattleId?: string | null }).pkBattleId;
+    if (battleId) {
+      try {
+        const battle = await this.prisma.pKBattle.findUnique({ where: { id: battleId } });
+        if (battle && battle.status === 'ACTIVE') {
+          const [sessions, supporters] = await Promise.all([
+            this.prisma.liveSession.findMany({
+              where: { hostId: { in: [battle.challengerId, battle.opponentId] }, status: 'LIVE' },
+              select: { id: true },
+            }),
+            loadPkSupporters(this.prisma, battle),
+          ]);
+          this.realtime.broadcastPkScore(
+            battleId,
+            {
+              pkBattleId: battleId,
+              scoreChallenger: battle.scoreChallenger.toString(),
+              scoreOpponent: battle.scoreOpponent.toString(),
+              supporters,
+            },
+            sessions.map((s) => s.id),
+          );
+        }
+      } catch {
+        /* the score is saved; screens also refetch the battle */
       }
     }
 

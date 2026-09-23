@@ -4,8 +4,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
 import { RngService } from './rng.service';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
-import { rollDice, isWinningNumber, computeSumDiceReward, DiceConfig } from './sum-dice-rules';
+import { isWinningNumber, computeSumDiceReward, DiceConfig } from './sum-dice-rules';
 import { WalletType, LedgerEntryType } from '@prisma/client';
+import { buildRoundData } from './game-fairness';
 
 // Pure and exported specifically so it's unit-testable without a database —
 // this is the line between "you won" and "you didn't" for real money, so it
@@ -48,11 +49,19 @@ export class SettlementService {
     const payoutMultiplier = rules.payoutMultiplier ?? 20;
     const isSumDice = round.selectionCount == null && !!rules.diceCount && !!rules.diceSides;
 
+    const roundData = buildRoundData(round);
+    const secret = round.revealData;
+    if (!secret) throw new BadRequestException('Round has no fairness secret');
+
     const drawResult = isSumDice
-      ? rollDice({ diceCount: rules.diceCount, diceSides: rules.diceSides } as DiceConfig, () =>
-          this.rng.randomInRange(0, rules.diceSides - 1),
-        )
-      : { dice: this.generateResult(round), sum: null as number | null };
+      ? (() => {
+          const config = { diceCount: rules.diceCount, diceSides: rules.diceSides } as DiceConfig;
+          const dice = Array.from({ length: config.diceCount }, (_, index) =>
+            this.rng.randomInRangeFromSecret(secret, `dice:${roundData}:${index}`, 0, config.diceSides - 1),
+          );
+          return { dice, sum: dice.reduce((a, b) => a + b, 0) };
+        })()
+      : { dice: this.generateResult(round, secret, roundData), sum: null as number | null };
 
     // Only live entries: anything already refunded/settled must never be paid again.
     const entries = await this.prisma.gameEntry.findMany({ where: { roundId, status: 'PLACED' } });
@@ -166,11 +175,16 @@ export class SettlementService {
     return { refunded };
   }
 
-  private generateResult(round: { numberRange: number | null; selectionCount: number | null }): number[] {
+  private generateResult(
+    round: { gameCode: string; openAt: Date; lockAt: Date; numberRange: number | null; selectionCount: number | null },
+    secret: string,
+    roundData: string,
+  ): number[] {
     if (round.numberRange && round.selectionCount) {
       const drawn = new Set<number>();
+      let index = 0;
       while (drawn.size < round.selectionCount) {
-        drawn.add(this.rng.randomInRange(1, round.numberRange));
+        drawn.add(this.rng.randomInRangeFromSecret(secret, `pick:${roundData}:${index++}`, 1, round.numberRange));
       }
       return Array.from(drawn);
     }

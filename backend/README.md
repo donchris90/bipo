@@ -379,3 +379,8 @@ Each country has independent controls in **Admin → Settings → Countries & re
 Coin packages remain country-specific, and withdrawal conversion/limits/fees remain in `PayoutConfig`, so customer coin pricing and creator cash-out rules can differ by country.
 
 Nigeria is seeded with Paystack + C2C; other countries are seeded with Crypto + C2C. Crypto and C2C are surfaced as configured rails but remain unavailable in the purchase flow until their real transaction/escrow providers are connected. This prevents the app from pretending a payment succeeded without a real settlement mechanism.
+
+
+## Room invite queue behavior
+
+Accepting a host invitation does not bypass the host-controlled seat queue. It converts the invitation into an accepted seat request; the host still chooses the exact seat. Apply Prisma migrations before starting the backend.

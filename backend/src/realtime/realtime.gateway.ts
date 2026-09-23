@@ -117,7 +117,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     // needs played back. Only LIVE/ROOM have an actual chat feed for this
     // to appear in — 'pk' and other free-form contexts reuse this handler
     // too but have nowhere to show it.
-    if ((data.context === 'ROOM' || data.context === 'LIVE') && this.shouldAnnounceJoin(userId, `${data.context}:${data.contextId}`)) {
+    if (data.context === 'LIVE' && this.shouldAnnounceJoin(userId, `${data.context}:${data.contextId}`)) {
       try {
         const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true } });
         client.to(`${data.context}:${data.contextId}`).emit('chat:message', {
@@ -229,6 +229,13 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(`LIVE:${sessionId}`).emit('live:viewer_count', payload);
   }
 
+  // The host ended the live (or the reaper did). Viewers show the "live has
+  // ended" screen right away instead of staring at a frozen video.
+  broadcastLiveEnded(sessionId: string, payload: { sessionId: string; hostId: string }) {
+    this.server.to(`LIVE:${sessionId}`).emit('live:ended', payload);
+    this.server.in(`LIVE:${sessionId}`).socketsLeave(`LIVE:${sessionId}`);
+  }
+
   // Live moderation is broadcast to the current audience and directly to the target.
   // KICK/BAN also remove the target's sockets from the live channel immediately.
   broadcastLiveModeration(
@@ -247,7 +254,8 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   // Socket.IO delivers once per socket even when it matches both.
   // On BAN the target's sockets are then removed from the room channel so
   // they stop receiving its chat immediately, without waiting for the
-  // client to cooperate.
+  // client to cooperate. KICK in a party room means "taken off the mic":
+  // the guest stays in the room as a listener, so their socket stays too.
   broadcastRoomModeration(
     roomId: string,
     payload: { roomId: string; action: string; targetUserId: string; actorId: string },
@@ -256,6 +264,13 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     if (payload.action === 'BAN') {
       this.server.in(`user:${payload.targetUserId}`).socketsLeave(`ROOM:${roomId}`);
     }
+  }
+
+  // The host closed the room (or the reaper did). Everyone inside is told,
+  // then removed from the channel so no stray chat lands in a closed room.
+  broadcastRoomClosed(roomId: string, payload: { roomId: string }) {
+    this.server.to(`ROOM:${roomId}`).emit('room:closed', payload);
+    this.server.in(`ROOM:${roomId}`).socketsLeave(`ROOM:${roomId}`);
   }
 
   // PK lifecycle push (pk:countdown_start / pk:active / pk:settled). Sent to
@@ -279,14 +294,23 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     op.emit(event, payload);
   }
 
+  broadcastRoomState(roomId: string, payload: { roomId: string; action: string; targetUserId?: string; [key: string]: unknown }) {
+    this.server.to(`ROOM:${roomId}`).emit('room:state', payload);
+  }
+
   // Host changed the room theme mid-session — everyone in the room re-skins
   // immediately instead of waiting for their next room-details refetch.
   broadcastRoomTheme(roomId: string, payload: { roomId: string; themeColor: string }) {
     this.server.to(`ROOM:${roomId}`).emit('room:theme', payload);
   }
 
-  broadcastPkScore(pkBattleId: string, payload: unknown) {
-    this.server.to(`pk:${pkBattleId}`).emit('pk:score', payload);
+  // Score push after each counted gift. Goes to the battle channel and to
+  // both hosts' live rooms, so a viewer only needs to be in the live they
+  // are watching. Socket.IO delivers once per socket across these rooms.
+  broadcastPkScore(pkBattleId: string, payload: unknown, liveSessionIds: string[] = []) {
+    let op = this.server.to(`pk:${pkBattleId}`);
+    for (const sessionId of liveSessionIds) op = op.to(`LIVE:${sessionId}`);
+    op.emit('pk:score', payload);
   }
 
   // Whether the user has any live socket right now. Used to decide between
@@ -316,6 +340,18 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   async isUserInRoom(userId: string, room: string): Promise<boolean> {
     const sockets = await this.server.in(room).fetchSockets();
     return sockets.some((s) => (s.data as { userId?: string } | undefined)?.userId === userId);
+  }
+
+  // Every user with at least one socket inside `room`, in one fetch. Used by
+  // the room reaper to free seats held by guests whose app has gone away.
+  async userIdsInRoom(room: string): Promise<Set<string>> {
+    const sockets = await this.server.in(room).fetchSockets();
+    const ids = new Set<string>();
+    for (const s of sockets) {
+      const id = (s.data as { userId?: string } | undefined)?.userId;
+      if (id) ids.add(id);
+    }
+    return ids;
   }
 
   // The actual point of the personal-room change above — emits directly

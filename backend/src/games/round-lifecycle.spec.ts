@@ -24,7 +24,7 @@ describe('RoundService.createRound with an unreachable queue', () => {
     const { svc, prisma } = build(jest.fn().mockReturnValue(new Promise(() => {}))); // Redis never answers
 
     const now = Date.now();
-    const pending = svc.createRound({ gameCode: 'SUM_DICE', rulesVersion: 1, entryPrice: 10, openAt: new Date(now), lockAt: new Date(now + 15_000) });
+    const pending = svc.createRound({ gameCode: 'SUM_DICE', rulesVersion: 1, entryPrice: 10, openAt: new Date(now), lockAt: new Date(now + 30_000) });
     await jest.advanceTimersByTimeAsync(3500);
 
     await expect(pending).resolves.toMatchObject({ id: 'r1' });
@@ -35,14 +35,14 @@ describe('RoundService.createRound with an unreachable queue', () => {
     const { svc } = build(jest.fn().mockRejectedValue(new Error('ECONNREFUSED')));
     const now = Date.now();
     await expect(
-      svc.createRound({ gameCode: 'SUM_DICE', rulesVersion: 1, entryPrice: 10, openAt: new Date(now), lockAt: new Date(now + 15_000) }),
+      svc.createRound({ gameCode: 'SUM_DICE', rulesVersion: 1, entryPrice: 10, openAt: new Date(now), lockAt: new Date(now + 30_000) }),
     ).resolves.toMatchObject({ id: 'r1' });
   });
 
   it('never returns the crash point', async () => {
     const { svc } = build(jest.fn().mockResolvedValue({}));
     const now = Date.now();
-    const round = await svc.createRound({ gameCode: 'SUM_DICE', rulesVersion: 1, entryPrice: 10, openAt: new Date(now), lockAt: new Date(now + 15_000) });
+    const round = await svc.createRound({ gameCode: 'SUM_DICE', rulesVersion: 1, entryPrice: 10, openAt: new Date(now), lockAt: new Date(now + 30_000) });
     expect(round).not.toHaveProperty('hiddenState');
   });
 });

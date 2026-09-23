@@ -122,12 +122,12 @@ async function main() {
   // house edge comes from the aggregate distribution, not per-number odds.
   await prisma.gameDefinition.upsert({
     where: { code: 'SUM_DICE' },
-    update: {},
+    update: { rulesJson: { payoutMultiplier: 9, diceCount: 3, diceSides: 10, openSeconds: 30, minStake: 10 } },
     create: {
       code: 'SUM_DICE',
       name: 'Big Small Odd Even',
       status: 'DISABLED',
-      rulesJson: { payoutMultiplier: 9, diceCount: 3, diceSides: 10 },
+      rulesJson: { payoutMultiplier: 9, diceCount: 3, diceSides: 10, openSeconds: 30, minStake: 10 },
     },
   });
 

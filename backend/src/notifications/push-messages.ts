@@ -58,6 +58,11 @@ export function describeForPush(
         : { title: 'Creator application', body: 'Your creator application was not approved' };
     case 'MISSED_CALL':
       return { title: 'Missed call', body: `Missed call from ${payload.callerDisplayName ?? 'someone'}` };
+    case 'SYSTEM':
+      if (payload.event === 'PARTY_INVITE') {
+        return { title: 'Party invitation', body: `${payload.hostDisplayName ?? 'A host'} invited you to ${payload.roomTitle ?? 'a party room'}` };
+      }
+      return null;
     case 'SECURITY':
       switch (payload.event) {
         case 'kyc_approved':
