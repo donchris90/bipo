@@ -258,7 +258,20 @@ export class RoomsService {
     if (!Number.isInteger(seatNumber) || seatNumber < 0 || seatNumber >= room.seatCount) throw new BadRequestException('Invalid seat number');
     if (room.hostId === targetUserId && seatNumber !== 0) throw new BadRequestException('The host must remain in seat 1');
     if (seatNumber === 0 && targetUserId !== room.hostId) throw new BadRequestException('Seat 1 belongs to the host');
-    if (targetUserId !== actorId) await this.assertHostOrModerator(roomId, actorId);
+
+    if (targetUserId !== actorId) {
+      await this.assertHostOrModerator(roomId, actorId);
+      // A moderator can manage ordinary guests, but cannot move the host or
+      // another moderator. The host can manage moderators. Keep this check on
+      // the server so the permission boundary cannot be bypassed by calling
+      // the API directly instead of using the mobile action sheet.
+      if (targetUserId !== room.hostId && room.hostId !== actorId) {
+        const targetIsModerator = await this.prisma.roomModerator.findUnique({
+          where: { roomId_userId: { roomId, userId: targetUserId } },
+        });
+        if (targetIsModerator) throw new ForbiddenException('Moderators cannot move another moderator');
+      }
+    }
     const locked = await this.prisma.roomSeatLock.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber } } });
     if (locked) throw new ForbiddenException('This seat is locked by the host');
 
@@ -461,8 +474,21 @@ export class RoomsService {
     });
   }
 
-  async removeGuest(roomId: string, actorId: string, targetUserId: string) {
+  private async assertCanModerateTarget(roomId: string, actorId: string, targetUserId: string) {
     const room = await this.assertHostOrModerator(roomId, actorId);
+    if (targetUserId === actorId) throw new BadRequestException('You cannot moderate yourself');
+    if (targetUserId === room.hostId) throw new BadRequestException('Cannot moderate the host');
+    if (room.hostId !== actorId) {
+      const targetIsModerator = await this.prisma.roomModerator.findUnique({
+        where: { roomId_userId: { roomId, userId: targetUserId } },
+      });
+      if (targetIsModerator) throw new ForbiddenException('Moderators cannot moderate another moderator');
+    }
+    return room;
+  }
+
+  async removeGuest(roomId: string, actorId: string, targetUserId: string) {
+    const room = await this.assertCanModerateTarget(roomId, actorId, targetUserId);
     if (targetUserId === room.hostId) throw new BadRequestException('Cannot remove the host');
     await this.prisma.roomSeat.deleteMany({ where: { roomId, userId: targetUserId } });
     await this.logModeration(actorId, 'KICK', roomId, targetUserId);
@@ -550,23 +576,21 @@ export class RoomsService {
   }
 
   async muteGuest(roomId: string, actorId: string, targetUserId: string) {
-    const room = await this.assertHostOrModerator(roomId, actorId);
-    if (targetUserId === room.hostId) throw new BadRequestException('Cannot mute the host');
+    await this.assertCanModerateTarget(roomId, actorId, targetUserId);
     await this.logModeration(actorId, 'MUTE', roomId, targetUserId);
     this.emitModeration(roomId, 'MUTE', actorId, targetUserId);
     return { muted: true };
   }
 
   async unmuteGuest(roomId: string, actorId: string, targetUserId: string) {
-    await this.assertHostOrModerator(roomId, actorId);
+    await this.assertCanModerateTarget(roomId, actorId, targetUserId);
     await this.logModeration(actorId, 'UNMUTE', roomId, targetUserId);
     this.emitModeration(roomId, 'UNMUTE', actorId, targetUserId);
     return { muted: false };
   }
 
   async banGuest(roomId: string, actorId: string, targetUserId: string) {
-    const room = await this.assertHostOrModerator(roomId, actorId);
-    if (targetUserId === room.hostId) throw new BadRequestException('Cannot ban the host');
+    await this.assertCanModerateTarget(roomId, actorId, targetUserId);
     await this.prisma.roomSeat.deleteMany({ where: { roomId, userId: targetUserId } });
     await this.logModeration(actorId, 'BAN', roomId, targetUserId);
     this.emitModeration(roomId, 'BAN', actorId, targetUserId);
