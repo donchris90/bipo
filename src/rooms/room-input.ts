@@ -3,6 +3,21 @@ import { BadRequestException } from '@nestjs/common';
 export const ROOM_PRIVACY = ['PUBLIC', 'PRIVATE', 'FOLLOWERS_ONLY', 'INVITE_ONLY'] as const;
 export type RoomPrivacyValue = (typeof ROOM_PRIVACY)[number];
 
+// The only seat layouts the app draws. Create, the in-room picker and
+// setSeatCount all use this one list so a room can never end up with a count
+// the host can't select again later.
+export const ROOM_SEAT_COUNTS = [4, 6, 8, 9, 12] as const;
+export const DEFAULT_SEAT_COUNT = 8;
+
+// Nearest allowed layout; a tie goes to the larger one (5 -> 6, 7 -> 8).
+export function snapSeatCount(n: number): number {
+  let best: number = ROOM_SEAT_COUNTS[0];
+  for (const c of ROOM_SEAT_COUNTS) {
+    if (Math.abs(c - n) < Math.abs(best - n) || (Math.abs(c - n) === Math.abs(best - n) && c > best)) best = c;
+  }
+  return best;
+}
+
 export interface CleanRoomInput {
   title: string;
   privacy: RoomPrivacyValue;
@@ -35,12 +50,13 @@ export function cleanRoomInput(body: Record<string, unknown>): CleanRoomInput {
     privacy = p as RoomPrivacyValue;
   }
 
-  // seatCount: a whole number (the app or a form may send it as text), 4 to 12
-  let seatCount = 8;
+  // seatCount: a whole number (the app or a form may send it as text), snapped
+  // to one of the layouts the app can draw (4, 6, 8, 9, 12).
+  let seatCount = DEFAULT_SEAT_COUNT;
   if (!blank(body.seatCount)) {
     const n = Number(body.seatCount);
     if (!Number.isInteger(n)) throw new BadRequestException('seatCount must be a whole number');
-    seatCount = Math.min(Math.max(n, 4), 12);
+    seatCount = snapSeatCount(n);
   }
 
   // category

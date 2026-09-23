@@ -247,15 +247,23 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   // Socket.IO delivers once per socket even when it matches both.
   // On BAN the target's sockets are then removed from the room channel so
   // they stop receiving its chat immediately, without waiting for the
-  // client to cooperate.
+  // client to cooperate. KICK in a party room means "taken off the mic":
+  // the guest stays in the room as a listener, so their socket stays too.
   broadcastRoomModeration(
     roomId: string,
     payload: { roomId: string; action: string; targetUserId: string; actorId: string },
   ) {
     this.server.to(`ROOM:${roomId}`).to(`user:${payload.targetUserId}`).emit('room:moderation', payload);
-    if (payload.action === 'BAN' || payload.action === 'KICK') {
+    if (payload.action === 'BAN') {
       this.server.in(`user:${payload.targetUserId}`).socketsLeave(`ROOM:${roomId}`);
     }
+  }
+
+  // The host closed the room (or the reaper did). Everyone inside is told,
+  // then removed from the channel so no stray chat lands in a closed room.
+  broadcastRoomClosed(roomId: string, payload: { roomId: string }) {
+    this.server.to(`ROOM:${roomId}`).emit('room:closed', payload);
+    this.server.in(`ROOM:${roomId}`).socketsLeave(`ROOM:${roomId}`);
   }
 
   // PK lifecycle push (pk:countdown_start / pk:active / pk:settled). Sent to
@@ -320,6 +328,18 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   async isUserInRoom(userId: string, room: string): Promise<boolean> {
     const sockets = await this.server.in(room).fetchSockets();
     return sockets.some((s) => (s.data as { userId?: string } | undefined)?.userId === userId);
+  }
+
+  // Every user with at least one socket inside `room`, in one fetch. Used by
+  // the room reaper to free seats held by guests whose app has gone away.
+  async userIdsInRoom(room: string): Promise<Set<string>> {
+    const sockets = await this.server.in(room).fetchSockets();
+    const ids = new Set<string>();
+    for (const s of sockets) {
+      const id = (s.data as { userId?: string } | undefined)?.userId;
+      if (id) ids.add(id);
+    }
+    return ids;
   }
 
   // The actual point of the personal-room change above — emits directly

@@ -23,8 +23,13 @@ describe('cleanRoomInput — starting a party', () => {
     expect(() => cleanRoomInput({ privacy: 'everyone' })).toThrow(/PUBLIC, PRIVATE, FOLLOWERS_ONLY, INVITE_ONLY/);
   });
 
-  it('seat count: text numbers work, out-of-range is clamped to 4-12, non-numbers are refused', () => {
+  it('seat count: text numbers work, values snap to a real layout, non-numbers are refused', () => {
     expect(cleanRoomInput({ seatCount: '6' }).seatCount).toBe(6);
+    expect(cleanRoomInput({ seatCount: 8 }).seatCount).toBe(8);
+    expect(cleanRoomInput({ seatCount: 5 }).seatCount).toBe(6);
+    expect(cleanRoomInput({ seatCount: 7 }).seatCount).toBe(8);
+    expect(cleanRoomInput({ seatCount: 10 }).seatCount).toBe(9);
+    expect(cleanRoomInput({ seatCount: 11 }).seatCount).toBe(12);
     expect(cleanRoomInput({ seatCount: 2 }).seatCount).toBe(4);
     expect(cleanRoomInput({ seatCount: 99 }).seatCount).toBe(12);
     expect(() => cleanRoomInput({ seatCount: 'many' })).toThrow(/whole number/);

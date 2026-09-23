@@ -2,7 +2,8 @@ import { BadRequestException, ForbiddenException, Inject, Injectable, NotFoundEx
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { ModerationService } from '../moderation/moderation.service';
-import { RoomPrivacy } from '@prisma/client';
+import { ModerationActionType, RoomPrivacy } from '@prisma/client';
+import { ROOM_SEAT_COUNTS, snapSeatCount } from './room-input';
 import { RTC_PROVIDER } from '../live/live.service';
 import type { RtcProvider } from '../live/providers/rtc-provider.interface';
 import { fetchChatHistory } from '../common/chat-history';
@@ -32,7 +33,7 @@ export class RoomsService {
         hostId,
         title,
         privacy,
-        seatCount: Math.min(Math.max(seatCount, 4), 12),
+        seatCount: snapSeatCount(seatCount),
         countryCode,
         providerChannel: channelName,
         category,
@@ -94,14 +95,16 @@ export class RoomsService {
       .filter((row): row is NonNullable<typeof row> => row !== null);
   }
 
-  async getRoomDetails(roomId: string) {
+  // viewerId is the authenticated caller: profileGiftCoins is THEIR lifetime
+  // gift total, so the header can show it without a second request.
+  async getRoomDetails(roomId: string, viewerId: string) {
     const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
     if (!room) throw new NotFoundException('Room not found');
 
     const seats = await this.prisma.roomSeat.findMany({ where: { roomId }, orderBy: { seatNumber: 'asc' } });
     const users = await this.prisma.user.findMany({
       where: { id: { in: seats.map((s) => s.userId) } },
-      select: { id: true, displayName: true },
+      select: { id: true, displayName: true, avatarUrl: true },
     });
     const userById = new Map(users.map((u) => [u.id, u]));
 
@@ -117,6 +120,10 @@ export class RoomsService {
       this.prisma.giftTransaction.aggregate({ where: { context: 'ROOM', contextId: roomId }, _sum: { coinAmount: true } }),
       this.prisma.giftTransaction.groupBy({ by: ['recipientId'], where: { context: 'ROOM', contextId: roomId }, _sum: { coinAmount: true } }),
     ]);
+    const profileGiftAgg = await this.prisma.giftTransaction.aggregate({
+      where: { recipientId: viewerId },
+      _sum: { coinAmount: true },
+    });
     const seatGiftCoins = Object.fromEntries(giftByRecipient.map((row) => [row.recipientId, row._sum.coinAmount ?? 0]));
     const lockedNumbers = new Set(locks.map((l) => l.seatNumber));
 
@@ -127,10 +134,12 @@ export class RoomsService {
       lockedSeatNumbers: [...lockedNumbers],
       giftCoins: giftAgg._sum.coinAmount ?? 0,
       seatGiftCoins,
+      profileGiftCoins: profileGiftAgg._sum.coinAmount ?? 0,
       seats: seats.map((s) => ({
         seatNumber: s.seatNumber,
         userId: s.userId,
         displayName: userById.get(s.userId)?.displayName ?? null,
+        avatarUrl: userById.get(s.userId)?.avatarUrl ?? null,
         joinedAt: s.joinedAt,
         locked: lockedNumbers.has(s.seatNumber),
       })),
@@ -444,13 +453,14 @@ export class RoomsService {
 
       // An invitation gets immediate entry when a vacant UNLOCKED guest seat
       // exists. Otherwise it becomes a normal queue entry for the host.
+      const [occupiedRows, lockedRows] = await Promise.all([
+        tx.roomSeat.findMany({ where: { roomId }, select: { seatNumber: true } }),
+        tx.roomSeatLock.findMany({ where: { roomId }, select: { seatNumber: true } }),
+      ]);
+      const taken = new Set([...occupiedRows, ...lockedRows].map((r) => r.seatNumber));
       let seatNumber: number | null = null;
       for (let n = 1; n < room.seatCount; n++) {
-        const [occupied, locked] = await Promise.all([
-          tx.roomSeat.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber: n } } }),
-          tx.roomSeatLock.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber: n } } }),
-        ]);
-        if (!occupied && !locked) { seatNumber = n; break; }
+        if (!taken.has(n)) { seatNumber = n; break; }
       }
 
       if (seatNumber != null) {
@@ -557,13 +567,27 @@ export class RoomsService {
     if (!request || request.roomId !== roomId || !['PENDING', 'ACCEPTED'].includes(request.status)) {
       throw new NotFoundException('No such pending request');
     }
-    return this.prisma.seatRequest.update({
+    const updated = await this.prisma.seatRequest.update({
       where: { id: requestId },
       data: { status: 'REJECTED', decidedAt: new Date() },
     });
+    // The requester used to never find out; they sat waiting forever.
+    this.emitRoomState(roomId, 'SEAT_REJECTED', request.userId, { requestId });
+    return updated;
   }
 
   async leaveSeat(roomId: string, userId: string) {
+    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { hostId: true } });
+    if (!room) throw new NotFoundException('Room not found');
+    // The host's seat is the stage. Leaving it would leave a room with no host
+    // tile and no one able to take seat 1; the host ends the party with Close.
+    if (room.hostId === userId) throw new BadRequestException('The host stays on seat 1. Close the room to leave.');
+    return this.releaseSeat(roomId, userId);
+  }
+
+  // Frees a guest's seat and tells the room. Shared by leaveSeat and the
+  // reaper (a guest whose app died must not hold a seat forever).
+  async releaseSeat(roomId: string, userId: string) {
     const seat = await this.prisma.roomSeat.findUnique({ where: { roomId_userId: { roomId, userId } } });
     await this.prisma.roomSeat.deleteMany({ where: { roomId, userId } });
     if (seat) this.emitRoomState(roomId, 'SEAT_LEFT', userId, { seatNumber: seat.seatNumber });
@@ -651,7 +675,9 @@ export class RoomsService {
     const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
     if (!room) throw new NotFoundException('Room not found');
     if (room.hostId !== actorId) throw new ForbiddenException('Only the host can change seat count');
-    if (![4, 6, 9, 12].includes(seatCount)) throw new BadRequestException('seatCount must be 4, 6, 9, or 12');
+    if (!(ROOM_SEAT_COUNTS as readonly number[]).includes(seatCount)) {
+      throw new BadRequestException(`seatCount must be one of: ${ROOM_SEAT_COUNTS.join(', ')}`);
+    }
     if (seatCount < room.seatCount) {
       const occupied = await this.prisma.roomSeat.findFirst({ where: { roomId, seatNumber: { gte: seatCount } } });
       if (occupied) throw new BadRequestException('Remove guests from higher seats first');
@@ -689,10 +715,27 @@ export class RoomsService {
   private async finishClose(room: { id: string; providerChannel: string; status: string }) {
     if (room.status === 'CLOSED') return this.prisma.partyRoom.findUniqueOrThrow({ where: { id: room.id } });
     await this.rtc.destroyChannel(room.providerChannel);
-    return this.prisma.partyRoom.update({
+    const closed = await this.prisma.partyRoom.update({
       where: { id: room.id },
       data: { status: 'CLOSED', closedAt: new Date() },
     });
+    // Everyone still inside must be told. Before, guests sat in a dead,
+    // silent room until they left on their own.
+    try {
+      this.realtime.broadcastRoomClosed(room.id, { roomId: room.id });
+    } catch {
+      /* clients also see status CLOSED on their next room-details fetch */
+    }
+    // Open requests/invites for a closed room are meaningless now.
+    try {
+      await this.prisma.seatRequest.updateMany({
+        where: { roomId: room.id, status: { in: ['PENDING', 'ACCEPTED'] } },
+        data: { status: 'CANCELLED', decidedAt: new Date() },
+      });
+    } catch {
+      /* best effort — findMyInvites already hides closed rooms */
+    }
+    return closed;
   }
 
   async muteGuest(roomId: string, actorId: string, targetUserId: string) {
@@ -799,7 +842,7 @@ export class RoomsService {
 
   private async logModeration(
     actorId: string,
-    actionType: 'KICK' | 'ADD_MODERATOR' | 'REMOVE_MODERATOR' | 'LOCK_ROOM' | 'UNLOCK_ROOM' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
+    actionType: ModerationActionType,
     roomId: string,
     targetUserId?: string,
   ) {
