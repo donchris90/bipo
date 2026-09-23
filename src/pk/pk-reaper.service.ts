@@ -28,11 +28,26 @@ export class PkReaperService implements OnModuleInit, OnModuleDestroy {
     if (this.timer) clearInterval(this.timer);
   }
 
+  private ticks = 0;
+
   async sweep() {
     if (this.running) return;
     this.running = true;
     try {
       const now = new Date();
+      this.ticks++;
+
+      // Unanswered invitations lapse after CHALLENGE_TTL_MS.
+      try { await this.pk.expireStaleChallenges(now); }
+      catch (e: any) { this.logger.warn(`Could not expire PK invitations: ${e?.message ?? e}`); }
+
+      // Every 5s: a PK whose host is no longer live is ended (the host who
+      // left forfeits), instead of running on with one empty side.
+      if (this.ticks % 5 === 0) {
+        try { await this.pk.endBattlesWithoutHosts(); }
+        catch (e: any) { this.logger.warn(`Could not end orphaned PKs: ${e?.message ?? e}`); }
+      }
+
       const countdown = await this.prisma.pKBattle.findMany({
         where: { status: 'COUNTDOWN', startedAt: { lte: now } },
         select: { id: true },

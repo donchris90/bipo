@@ -6,6 +6,8 @@ import { decideAbandoned } from './live-reaper';
 
 const SWEEP_MS = 30_000;
 const GRACE_MS = 90_000;
+// A viewer row younger than this is never closed by the viewer sweep.
+const VIEWER_GRACE_MS = 60_000;
 
 // Ends broadcasts whose host has vanished. Without this, a host whose app is
 // killed (or whose phone dies) leaves a LIVE row behind: it shows on everyone's
@@ -32,12 +34,39 @@ export class LiveReaperService implements OnModuleInit, OnModuleDestroy {
 
   onModuleInit() {
     if (process.env.JEST_WORKER_ID) return; // no background timers under test
-    this.timer = setInterval(() => void this.sweep(), SWEEP_MS);
+    this.timer = setInterval(() => {
+      void this.sweep();
+      void this.sweepViewers();
+    }, SWEEP_MS);
     this.timer.unref?.();
   }
 
   onModuleDestroy() {
     if (this.timer) clearInterval(this.timer);
+  }
+
+  // Closes viewer rows of people who left without saying so (app killed,
+  // network gone), so the viewer count shown to everyone is real. A viewer
+  // gets VIEWER_GRACE_MS after joining before this can touch their row, so
+  // someone whose socket is still connecting is never counted out.
+  private sweepingViewers = false;
+  async sweepViewers(now = Date.now()): Promise<number> {
+    if (this.sweepingViewers) return 0;
+    this.sweepingViewers = true;
+    try {
+      const sessions = await this.prisma.liveSession.findMany({ where: { status: 'LIVE' }, select: { id: true }, take: 500 });
+      let closed = 0;
+      for (const s of sessions) {
+        const present = await this.realtime.userIdsInRoom(`LIVE:${s.id}`);
+        closed += await this.live.closeAbsentViewers(s.id, present, new Date(now - VIEWER_GRACE_MS));
+      }
+      return closed;
+    } catch (e: any) {
+      this.logger.warn(`Viewer sweep failed: ${e?.message ?? e}`);
+      return 0;
+    } finally {
+      this.sweepingViewers = false;
+    }
   }
 
   // Exposed for tests. Never throws: a failed sweep is retried on the next tick.

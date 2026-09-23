@@ -229,6 +229,13 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(`LIVE:${sessionId}`).emit('live:viewer_count', payload);
   }
 
+  // The host ended the live (or the reaper did). Viewers show the "live has
+  // ended" screen right away instead of staring at a frozen video.
+  broadcastLiveEnded(sessionId: string, payload: { sessionId: string; hostId: string }) {
+    this.server.to(`LIVE:${sessionId}`).emit('live:ended', payload);
+    this.server.in(`LIVE:${sessionId}`).socketsLeave(`LIVE:${sessionId}`);
+  }
+
   // Live moderation is broadcast to the current audience and directly to the target.
   // KICK/BAN also remove the target's sockets from the live channel immediately.
   broadcastLiveModeration(
@@ -297,8 +304,13 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(`ROOM:${roomId}`).emit('room:theme', payload);
   }
 
-  broadcastPkScore(pkBattleId: string, payload: unknown) {
-    this.server.to(`pk:${pkBattleId}`).emit('pk:score', payload);
+  // Score push after each counted gift. Goes to the battle channel and to
+  // both hosts' live rooms, so a viewer only needs to be in the live they
+  // are watching. Socket.IO delivers once per socket across these rooms.
+  broadcastPkScore(pkBattleId: string, payload: unknown, liveSessionIds: string[] = []) {
+    let op = this.server.to(`pk:${pkBattleId}`);
+    for (const sessionId of liveSessionIds) op = op.to(`LIVE:${sessionId}`);
+    op.emit('pk:score', payload);
   }
 
   // Whether the user has any live socket right now. Used to decide between

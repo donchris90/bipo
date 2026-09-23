@@ -30,9 +30,11 @@ export class LiveService {
     private readonly featureFlags: FeatureFlagsService,
     private readonly realtime: RealtimeGateway,
     private readonly moderation: ModerationService,
-    @Optional() private readonly media?: LiveMediaService,
     private readonly wallet: WalletService,
     private readonly revenueSplit: RevenueSplitService,
+    // Optional parameters must come last (TypeScript rejects a required one
+    // after it; SWC let it through, ts-jest did not).
+    @Optional() private readonly media?: LiveMediaService,
   ) {}
 
   // Per-user like throttle: recent (timestamp, count) entries within the
@@ -175,7 +177,28 @@ export class LiveService {
       await this.trackViewerJoin(sessionId, userId);
     }
 
-    return { session, token, private: session.privacy === 'PRIVATE' };
+    // Everything the viewer's header needs in the same round trip: who the
+    // host really is (the screen used to show the stream title and a letter
+    // as the "host"), whether I already follow them, and the live count.
+    const [host, follow, viewerCount] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: session.hostId }, select: { id: true, displayName: true, avatarUrl: true } }),
+      session.hostId === userId
+        ? Promise.resolve(null)
+        : this.prisma.follow.findUnique({
+            where: { followerId_followingId: { followerId: userId, followingId: session.hostId } },
+            select: { followerId: true },
+          }),
+      this.prisma.liveViewer.count({ where: { sessionId, leftAt: null } }),
+    ]);
+
+    return {
+      session,
+      token,
+      private: session.privacy === 'PRIVATE',
+      host: host ?? { id: session.hostId, displayName: null, avatarUrl: null },
+      isFollowing: !!follow,
+      viewerCount,
+    };
   }
 
 
@@ -427,6 +450,7 @@ export class LiveService {
   // time and duration.
   private async finish(session: {
     id: string;
+    hostId: string;
     providerChannel: string;
     status: string;
     startedAt: Date | null;
@@ -464,22 +488,57 @@ export class LiveService {
       ? Math.max(0, Math.round((endedAt.getTime() - session.startedAt.getTime()) / 1000))
       : 0;
 
-    return this.prisma.liveSession.update({
+    const ended = await this.prisma.liveSession.update({
       where: { id: session.id },
       data: { status: 'ENDED', endedAt, durationSeconds },
     });
+
+    // Viewers used to sit on a frozen picture: nothing told them it was over.
+    try {
+      this.realtime.broadcastLiveEnded(session.id, { sessionId: session.id, hostId: session.hostId });
+    } catch {
+      /* viewers also find out when their next join/refetch fails */
+    }
+    return ended;
   }
 
-  listLive() {
-    return this.prisma.liveSession.findMany({
+  // The public "who's live" list, hottest first (most people watching now),
+  // with what a list card needs: host name/photo, live viewer count, and
+  // whether the host is in a PK right now.
+  async listLive() {
+    const sessions = await this.prisma.liveSession.findMany({
       where: { status: 'LIVE', privacy: 'PUBLIC' },
       orderBy: { startedAt: 'desc' },
-      take: 50,
+      take: 100,
       select: {
         id: true, hostId: true, title: true, category: true, coverUrl: true,
         themeColor: true, status: true, startedAt: true, endedAt: true, durationSeconds: true,
       },
     });
+    if (sessions.length === 0) return [];
+    const ids = sessions.map((s) => s.id);
+    const hostIds = sessions.map((s) => s.hostId);
+    const [hosts, counts, battles] = await Promise.all([
+      this.prisma.user.findMany({ where: { id: { in: hostIds } }, select: { id: true, displayName: true, avatarUrl: true } }),
+      this.prisma.liveViewer.groupBy({ by: ['sessionId'], where: { sessionId: { in: ids }, leftAt: null }, _count: { _all: true } }),
+      this.prisma.pKBattle.findMany({
+        where: { status: { in: ['COUNTDOWN', 'ACTIVE'] }, OR: [{ challengerId: { in: hostIds } }, { opponentId: { in: hostIds } }] },
+        select: { challengerId: true, opponentId: true },
+      }),
+    ]);
+    const hostById = new Map(hosts.map((h) => [h.id, h]));
+    const countBySession = new Map(counts.map((c) => [c.sessionId, c._count._all]));
+    const inPk = new Set(battles.flatMap((b) => [b.challengerId, b.opponentId]));
+    return sessions
+      .map((s) => ({
+        ...s,
+        hostDisplayName: hostById.get(s.hostId)?.displayName ?? null,
+        hostAvatarUrl: hostById.get(s.hostId)?.avatarUrl ?? null,
+        viewerCount: countBySession.get(s.id) ?? 0,
+        inPk: inPk.has(s.hostId),
+      }))
+      .sort((a, b) => b.viewerCount - a.viewerCount || (b.startedAt?.getTime() ?? 0) - (a.startedAt?.getTime() ?? 0))
+      .slice(0, 50);
   }
 
   // Real watch history — built from LiveViewer rows that trackViewerJoin
@@ -576,6 +635,22 @@ export class LiveService {
     });
     await this.publishViewerCount(sessionId);
     return updated;
+  }
+
+  // Reaper: viewers whose app died never call /leave, so their row stayed
+  // open and the viewer count only ever went up. Closes the rows of anyone
+  // who has no socket in the live's room any more, then republishes the
+  // count. `present` is the set of user ids with a socket in LIVE:<id>.
+  async closeAbsentViewers(sessionId: string, present: Set<string>, openSince: Date) {
+    const open = await this.prisma.liveViewer.findMany({
+      where: { sessionId, leftAt: null, joinedAt: { lte: openSince } },
+      select: { id: true, userId: true },
+    });
+    const gone = open.filter((v) => !present.has(v.userId)).map((v) => v.id);
+    if (gone.length === 0) return 0;
+    await this.prisma.liveViewer.updateMany({ where: { id: { in: gone }, leftAt: null }, data: { leftAt: new Date() } });
+    await this.publishViewerCount(sessionId);
+    return gone.length;
   }
 
   // Recounts open viewer rows, ratchets peakViewerCount up if this is a new

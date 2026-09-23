@@ -6,6 +6,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { RevenueSplitService, ResolvedSplit } from './revenue-split.service';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { WalletType, LedgerEntryType, ChatContext } from '@prisma/client';
+import { pkPointsForCoins, pkSideForRecipient } from './pk-score';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -50,7 +51,10 @@ export interface SendGiftParams {
   giftId: string;
   context?: ChatContext;
   contextId?: string;
-  pkBattleId?: string; // if the gift is sent during an active PK battle
+    // Ignored as a source of truth: the server works out whether the
+  // recipient is in an ACTIVE PK itself (see resolvePkBattleId). Kept so
+  // older app versions that still send it keep working.
+  pkBattleId?: string;
   idempotencyKey: string;
 }
 
@@ -164,6 +168,10 @@ export class GiftService {
     const split = await this.revenueSplit.resolve(sender.countryCode);
     const coinAmount = gift.coinPrice;
 
+    // Which PK (if any) this gift counts towards, decided here from the
+    // recipient — never trusted from the client.
+    const pkBattleId = await this.resolvePkBattleId(params);
+
     // Agency commission lookup kept inline here (Prisma query, not an
     // AgenciesService import) for the same reason as the PK-score hook
     // below — avoids a circular dependency between Economy and Agencies.
@@ -251,7 +259,7 @@ export class GiftService {
           coinAmount,
           context: params.context,
           contextId: params.contextId,
-          pkBattleId: params.pkBattleId,
+          pkBattleId,
           creatorShareCoins: creatorShare,
           platformShareCoins: platformShare,
           agencyShareCoins: agencyShare,
@@ -271,8 +279,12 @@ export class GiftService {
     // roll back a gift that has already legitimately happened. Kept inline
     // here (rather than a PKService import) to avoid a circular dependency
     // between Economy and PK — PK depends on gift data, not the reverse.
-    if (params.pkBattleId) {
-      await this.applyPkScore(params.pkBattleId, params.senderId, coinAmount);
+    if (pkBattleId) {
+      try {
+        await this.applyPkScore(pkBattleId, params.recipientId, coinAmount);
+      } catch {
+        /* score is game state, never a reason to fail a paid gift */
+      }
     }
 
     // Deliberately NO notification here. A busy stream can receive hundreds of
@@ -288,31 +300,36 @@ export class GiftService {
     return transaction;
   }
 
-  private async applyPkScore(pkBattleId: string, senderId: string, coinAmount: number) {
+  // A gift sent in a live counts for a PK when its recipient is one of the
+  // two hosts of an ACTIVE battle. Gifts outside a live (rooms, video tips)
+  // never count.
+  private async resolvePkBattleId(params: SendGiftParams): Promise<string | null> {
+    if (params.context && params.context !== 'LIVE') return null;
+    const battle = await this.prisma.pKBattle.findFirst({
+      where: { status: 'ACTIVE', OR: [{ challengerId: params.recipientId }, { opponentId: params.recipientId }] },
+      select: { id: true },
+      orderBy: { startedAt: 'desc' },
+    });
+    return battle?.id ?? null;
+  }
+
+  private async applyPkScore(pkBattleId: string, recipientId: string, coinAmount: number) {
     const battle = await this.prisma.pKBattle.findUnique({ where: { id: pkBattleId } });
     if (!battle || battle.status !== 'ACTIVE') return; // gift still counts financially even if PK isn't live
+    if (battle.endsAt && battle.endsAt.getTime() <= Date.now()) return; // buzzer has sounded
 
-    const scoreConfig =
-      (await this.prisma.pKScoreConfig.findFirst({ where: { active: true }, orderBy: { id: 'desc' } })) ??
-      null;
-    const coinsPerPoint = scoreConfig?.coinsPerPoint ?? 1;
-    const points = BigInt(Math.floor(coinAmount / coinsPerPoint));
+    const side = pkSideForRecipient(battle, recipientId);
+    if (!side) return;
+
+    const scoreConfig = await this.prisma.pKScoreConfig.findFirst({ where: { active: true }, orderBy: { id: 'desc' } });
+    const points = pkPointsForCoins(coinAmount, scoreConfig?.coinsPerPoint ?? 1);
     if (points <= 0n) return;
 
-    if (senderId === battle.challengerId) {
-      await this.prisma.pKBattle.update({
-        where: { id: battle.id },
-        data: { scoreChallenger: { increment: points } },
-      });
-    } else if (senderId === battle.opponentId) {
-      await this.prisma.pKBattle.update({
-        where: { id: battle.id },
-        data: { scoreOpponent: { increment: points } },
-      });
-    }
-    // A gift from a third party (not a participant) during a PK does not
-    // move either score — only participants' own audiences count per spec's
-    // "users send gifts" framing of §16.
+    // Guarded on ACTIVE so a gift racing the settle can't change a final score.
+    await this.prisma.pKBattle.updateMany({
+      where: { id: battle.id, status: 'ACTIVE' },
+      data: side === 'CHALLENGER' ? { scoreChallenger: { increment: points } } : { scoreOpponent: { increment: points } },
+    });
   }
 
   // The "Honor" leaderboard (reference app's top-recipients ranking) —

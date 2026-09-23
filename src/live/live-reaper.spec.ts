@@ -43,7 +43,7 @@ describe('LiveReaperService.sweep', () => {
   const build = (present: string[]) => {
     const prisma: any = { liveSession: { findMany: jest.fn().mockResolvedValue([{ id: 's1', hostId: 'h1' }, { id: 's2', hostId: 'h2' }]) } };
     const realtime: any = { isUserInRoom: jest.fn(async (_u: string, room: string) => present.includes(room)) };
-    const live: any = { endAbandoned: jest.fn().mockResolvedValue({}) };
+    const live: any = { endAbandoned: jest.fn().mockResolvedValue({}), sweepPrivateSessions: jest.fn().mockResolvedValue([]) };
     return { svc: new LiveReaperService(prisma, realtime, live as LiveService), live, realtime };
   };
 
@@ -92,5 +92,20 @@ describe('LiveService cover + end', () => {
     await svc.end('s', 'h');
     expect(prisma.liveSession.update).not.toHaveBeenCalled();
     expect(rtc.destroyChannel).not.toHaveBeenCalled();
+  });
+});
+
+describe('LiveReaperService.sweepViewers', () => {
+  it('closes viewer rows only for people with no socket in the live room', async () => {
+    const prisma: any = { liveSession: { findMany: jest.fn().mockResolvedValue([{ id: 's1' }]) } };
+    const realtime: any = { userIdsInRoom: jest.fn(async () => new Set(['still-here'])) };
+    const live: any = { closeAbsentViewers: jest.fn().mockResolvedValue(2) };
+    const svc = new LiveReaperService(prisma, realtime, live as LiveService);
+    expect(await svc.sweepViewers(1_000_000)).toBe(2);
+    expect(realtime.userIdsInRoom).toHaveBeenCalledWith('LIVE:s1');
+    const [sessionId, present, openSince] = live.closeAbsentViewers.mock.calls[0];
+    expect(sessionId).toBe('s1');
+    expect(present.has('still-here')).toBe(true);
+    expect(openSince.getTime()).toBe(1_000_000 - 60_000);
   });
 });

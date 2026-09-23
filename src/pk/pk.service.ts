@@ -5,9 +5,21 @@ import { PK_QUEUE } from '../queue/queue.module';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { NotificationsService } from '../notifications/notifications.service';
 import { assertNotBlocked } from '../common/blocks';
+import { loadPkSupporters } from '../economy/pk-score';
 
 const COUNTDOWN_MS = 10_000;
 const DEFAULT_BATTLE_DURATION_MS = 3 * 60_000;
+// An unanswered PK invitation lapses after this long (BIGO/Poppo style), so
+// a challenger is never stuck waiting and old invites don't pile up.
+export const CHALLENGE_TTL_MS = 30_000;
+// After the buzzer both hosts stay side by side with the WIN/LOSE result
+// (the "punishment" window) before going back to solo.
+export const RESULT_MS = 30_000;
+
+export type PkPhase = 'COUNTDOWN' | 'ACTIVE' | 'RESULT';
+export type PkCloseReason = 'DECLINED' | 'CANCELLED' | 'EXPIRED' | 'SUPERSEDED';
+
+const isExpired = (createdAt: Date, now = Date.now()) => now - createdAt.getTime() >= CHALLENGE_TTL_MS;
 
 function shuffle<T>(items: T[]): T[] {
   const a = [...items];
@@ -48,9 +60,17 @@ export class PkService {
       select: { id: true },
     });
     if (busy) throw new BadRequestException('They are in a PK battle right now');
+    const selfBusy = await this.prisma.pKBattle.findFirst({
+      where: { status: { in: ['ACCEPTED', 'COUNTDOWN', 'ACTIVE'] }, OR: [{ challengerId }, { opponentId: challengerId }] },
+      select: { id: true },
+    });
+    if (selfBusy) throw new BadRequestException('Finish your current PK first');
     // Tapping Challenge twice must not send two challenges.
     const pending = await this.prisma.pKBattle.findFirst({ where: { challengerId, opponentId, status: 'CHALLENGED' } });
-    if (pending) return pending;
+    if (pending && !isExpired(pending.createdAt)) return pending;
+    // One invitation at a time: a new challenge replaces any other one this
+    // host still has waiting (including an expired one to the same person).
+    await this.closeChallenges({ challengerId, status: 'CHALLENGED' }, 'SUPERSEDED');
 
     const battle = await this.prisma.pKBattle.create({
       data: { challengerId, opponentId, status: 'CHALLENGED' },
@@ -176,7 +196,39 @@ export class PkService {
     if (!battle) throw new NotFoundException('Battle not found');
     if (battle.opponentId !== userId) throw new ForbiddenException('Only the challenged creator can decline');
     if (battle.status !== 'CHALLENGED') throw new BadRequestException('Battle is not awaiting a reply');
-    return this.prisma.pKBattle.update({ where: { id: battleId }, data: { status: 'CANCELLED' } });
+    const updated = await this.prisma.pKBattle.update({ where: { id: battleId }, data: { status: 'CANCELLED' } });
+    // The challenger used to keep waiting with no idea they'd been turned down.
+    this.emitChallengeClosed(battle, 'DECLINED');
+    return updated;
+  }
+
+  // The challenger withdraws an invitation that hasn't been answered yet.
+  async cancel(battleId: string, userId: string) {
+    const battle = await this.prisma.pKBattle.findUnique({ where: { id: battleId } });
+    if (!battle) throw new NotFoundException('Battle not found');
+    if (battle.challengerId !== userId) throw new ForbiddenException('Only the challenger can cancel');
+    if (battle.status !== 'CHALLENGED') throw new BadRequestException('This invitation is no longer waiting');
+    const flipped = await this.prisma.pKBattle.updateMany({ where: { id: battleId, status: 'CHALLENGED' }, data: { status: 'CANCELLED' } });
+    if (flipped.count === 1) this.emitChallengeClosed(battle, 'CANCELLED');
+    return this.prisma.pKBattle.findUniqueOrThrow({ where: { id: battleId } });
+  }
+
+  // The invitation this host sent that is still waiting, if any — so the
+  // host screen can show "Waiting for X… Cancel" with a countdown.
+  async outgoing(userId: string) {
+    const battle = await this.prisma.pKBattle.findFirst({
+      where: { challengerId: userId, status: 'CHALLENGED', createdAt: { gt: new Date(Date.now() - CHALLENGE_TTL_MS) } },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!battle) return null;
+    const opponent = await this.prisma.user.findUnique({ where: { id: battle.opponentId }, select: { displayName: true, avatarUrl: true } });
+    return {
+      battle,
+      opponentDisplayName: opponent?.displayName ?? null,
+      opponentAvatarUrl: opponent?.avatarUrl ?? null,
+      expiresAt: new Date(battle.createdAt.getTime() + CHALLENGE_TTL_MS),
+      serverTime: new Date(),
+    };
   }
 
   // Without this, a challenged user has no way to ever discover the
@@ -185,11 +237,23 @@ export class PkService {
   // the battle id, which nothing gave the opponent. Ordered most-recent
   // first since a user is very unlikely to have more than a handful of
   // pending challenges at once.
-  incomingChallenges(userId: string) {
-    return this.prisma.pKBattle.findMany({
-      where: { opponentId: userId, status: 'CHALLENGED' },
+  async incomingChallenges(userId: string) {
+    const battles = await this.prisma.pKBattle.findMany({
+      where: { opponentId: userId, status: 'CHALLENGED', createdAt: { gt: new Date(Date.now() - CHALLENGE_TTL_MS) } },
       orderBy: { createdAt: 'desc' },
     });
+    if (battles.length === 0) return [];
+    const users = await this.prisma.user.findMany({
+      where: { id: { in: battles.map((b) => b.challengerId) } },
+      select: { id: true, displayName: true, avatarUrl: true },
+    });
+    const byId = new Map(users.map((u) => [u.id, u]));
+    return battles.map((b) => ({
+      ...b,
+      challengerDisplayName: byId.get(b.challengerId)?.displayName ?? null,
+      challengerAvatarUrl: byId.get(b.challengerId)?.avatarUrl ?? null,
+      expiresAt: new Date(b.createdAt.getTime() + CHALLENGE_TTL_MS),
+    }));
   }
 
   // The missing link this whole feature needed — PKBattle only ever
@@ -202,35 +266,51 @@ export class PkService {
   // opponent's current session is whatever LiveSession row currently has
   // status LIVE for their id — both already real, both already correct
   // the instant either changes, with nothing here to keep in sync by hand.
-  async findActiveForHost(hostId: string) {
+  //
+  // It now also covers the 10-second COUNTDOWN (both videos already side by
+  // side, "PK starts in 3…") and the RESULT window after the buzzer (WIN /
+  // LOSE stamps for RESULT_MS), each told apart by `phase`.
+  async findActiveForHost(hostId: string, now = new Date()) {
     const battle = await this.prisma.pKBattle.findFirst({
       where: {
-        status: 'ACTIVE',
-        OR: [{ challengerId: hostId }, { opponentId: hostId }],
+        OR: [
+          { status: { in: ['COUNTDOWN', 'ACTIVE'] } },
+          { status: 'SETTLED', settledAt: { gte: new Date(now.getTime() - RESULT_MS) } },
+        ],
+        AND: [{ OR: [{ challengerId: hostId }, { opponentId: hostId }] }],
       },
-      orderBy: { startedAt: 'desc' },
+      orderBy: { createdAt: 'desc' },
     });
     if (!battle) return null;
 
+    const phase: PkPhase = battle.status === 'COUNTDOWN' ? 'COUNTDOWN' : battle.status === 'ACTIVE' ? 'ACTIVE' : 'RESULT';
     const opponentId = battle.challengerId === hostId ? battle.opponentId : battle.challengerId;
-    const [opponentSession, opponent] = await Promise.all([
+    const [opponentSession, people, supporters] = await Promise.all([
       this.prisma.liveSession.findFirst({
         where: { hostId: opponentId, status: 'LIVE' },
         select: { id: true, providerChannel: true, title: true },
       }),
-      this.prisma.user.findUnique({ where: { id: opponentId }, select: { displayName: true } }),
+      this.prisma.user.findMany({ where: { id: { in: [hostId, opponentId] } }, select: { id: true, displayName: true, avatarUrl: true } }),
+      loadPkSupporters(this.prisma, battle),
     ]);
+    const host = people.find((p) => p.id === hostId);
+    const opponent = people.find((p) => p.id === opponentId);
 
     return {
       battle,
+      phase,
       opponentId,
       opponentDisplayName: opponent?.displayName ?? null,
-      // null here is a real, meaningful state — the battle is active but
-      // the opponent isn't currently broadcasting (they may have
-      // disconnected, or the accept happened before either went live).
-      // The mobile client should show the clash bar with only the local
-      // host's video in that case, not fail outright.
+      opponentAvatarUrl: opponent?.avatarUrl ?? null,
+      hostDisplayName: host?.displayName ?? null,
+      hostAvatarUrl: host?.avatarUrl ?? null,
+      // null here is a real, meaningful state — the battle is on but the
+      // opponent isn't currently broadcasting. The client shows only the
+      // local host's video in that case, not an error.
       opponentSession,
+      supporters,
+      resultEndsAt: phase === 'RESULT' && battle.settledAt ? new Date(battle.settledAt.getTime() + RESULT_MS) : null,
+      serverTime: new Date(),
     };
   }
 
@@ -239,6 +319,22 @@ export class PkService {
     if (!battle) throw new NotFoundException('Battle not found');
     if (battle.opponentId !== opponentId) throw new ForbiddenException('Only the challenged creator can accept');
     if (battle.status !== 'CHALLENGED') throw new BadRequestException('Battle is not awaiting acceptance');
+    if (isExpired(battle.createdAt)) {
+      const flipped = await this.prisma.pKBattle.updateMany({ where: { id: battleId, status: 'CHALLENGED' }, data: { status: 'CANCELLED' } });
+      if (flipped.count === 1) this.emitChallengeClosed(battle, 'EXPIRED');
+      throw new BadRequestException('This PK invitation has expired');
+    }
+    const eitherBusy = await this.prisma.pKBattle.findFirst({
+      where: {
+        status: { in: ['ACCEPTED', 'COUNTDOWN', 'ACTIVE'] },
+        OR: [
+          { challengerId: { in: [battle.challengerId, battle.opponentId] } },
+          { opponentId: { in: [battle.challengerId, battle.opponentId] } },
+        ],
+      },
+      select: { id: true },
+    });
+    if (eitherBusy) throw new BadRequestException('One of you is already in a PK');
 
     // Both creators must still be broadcasting when the invitation is accepted.
     // This prevents an accepted PK from entering COUNTDOWN with no second channel.
@@ -254,10 +350,19 @@ export class PkService {
     const startedAt = new Date(now.getTime() + COUNTDOWN_MS);
     const endsAt = new Date(now.getTime() + COUNTDOWN_MS + DEFAULT_BATTLE_DURATION_MS);
 
-    const updated = await this.prisma.pKBattle.update({
-      where: { id: battleId },
+    const flipped = await this.prisma.pKBattle.updateMany({
+      where: { id: battleId, status: 'CHALLENGED' },
       data: { status: 'COUNTDOWN', startedAt, endsAt },
     });
+    if (flipped.count !== 1) throw new BadRequestException('Battle is not awaiting acceptance');
+    const updated = await this.prisma.pKBattle.findUniqueOrThrow({ where: { id: battleId } });
+
+    // Every other invitation to or from either host is now moot.
+    const both = [battle.challengerId, battle.opponentId];
+    await this.closeChallenges(
+      { status: 'CHALLENGED', id: { not: battleId }, OR: [{ challengerId: { in: both } }, { opponentId: { in: both } }] },
+      'SUPERSEDED',
+    );
 
     // Redis/BullMQ is a timing fast-path only. Redis can reject writes when
     // its maxmemory limit is reached, so a queue failure must never turn a
@@ -383,6 +488,110 @@ export class PkService {
       forSide(battle.challengerId, battle.opponentId, battle.scoreChallenger, battle.scoreOpponent),
       forSide(battle.opponentId, battle.challengerId, battle.scoreOpponent, battle.scoreChallenger),
     ]);
+  }
+
+  // ── Ending early ────────────────────────────────────────────────
+
+  // A host leaves the PK before the buzzer (the "End PK" button, or their
+  // live ended). During the countdown nothing has happened yet, so the
+  // battle is simply called off. Once it is ACTIVE, the other host wins.
+  async forfeit(battleId: string, userId: string) {
+    const battle = await this.prisma.pKBattle.findUnique({ where: { id: battleId } });
+    if (!battle) throw new NotFoundException('Battle not found');
+    if (battle.challengerId !== userId && battle.opponentId !== userId) {
+      throw new ForbiddenException('Only a host in this PK can end it');
+    }
+    return this.forfeitBy(battle, userId);
+  }
+
+  private async forfeitBy(
+    battle: { id: string; challengerId: string; opponentId: string; status: string },
+    quitterId: string | null,
+  ) {
+    const now = new Date();
+    if (battle.status === 'COUNTDOWN' || battle.status === 'ACCEPTED') {
+      const flipped = await this.prisma.pKBattle.updateMany({
+        where: { id: battle.id, status: battle.status as any },
+        data: { status: 'CANCELLED', settledAt: now },
+      });
+      const current = await this.prisma.pKBattle.findUniqueOrThrow({ where: { id: battle.id } });
+      if (flipped.count === 1) await this.emitLifecycle('pk:settled', current);
+      return current;
+    }
+    if (battle.status === 'ACTIVE') {
+      const winnerId = quitterId == null ? null : quitterId === battle.challengerId ? battle.opponentId : battle.challengerId;
+      const flipped = await this.prisma.pKBattle.updateMany({
+        where: { id: battle.id, status: 'ACTIVE' },
+        data: { status: 'SETTLED', settledAt: now, endsAt: now, winnerId },
+      });
+      const current = await this.prisma.pKBattle.findUniqueOrThrow({ where: { id: battle.id } });
+      if (flipped.count === 1) {
+        await this.emitLifecycle('pk:settled', current);
+        await this.notifyResult(current);
+      }
+      return current;
+    }
+    return this.prisma.pKBattle.findUniqueOrThrow({ where: { id: battle.id } });
+  }
+
+  // Reaper: invitations nobody answered in time.
+  async expireStaleChallenges(now = new Date()) {
+    return this.closeChallenges({ status: 'CHALLENGED', createdAt: { lte: new Date(now.getTime() - CHALLENGE_TTL_MS) } }, 'EXPIRED');
+  }
+
+  // Reaper: a PK whose host stopped broadcasting (ended the live, app died)
+  // can't go on. The host who left forfeits; if both left it's called off.
+  async endBattlesWithoutHosts() {
+    const running = await this.prisma.pKBattle.findMany({
+      where: { status: { in: ['COUNTDOWN', 'ACTIVE'] } },
+      select: { id: true, challengerId: true, opponentId: true, status: true },
+      take: 200,
+    });
+    if (running.length === 0) return [];
+    const hostIds = [...new Set(running.flatMap((b) => [b.challengerId, b.opponentId]))];
+    const live = await this.prisma.liveSession.findMany({
+      where: { hostId: { in: hostIds }, status: 'LIVE' },
+      select: { hostId: true },
+    });
+    const liveHosts = new Set(live.map((l) => l.hostId));
+    const ended: string[] = [];
+    for (const b of running) {
+      const challengerLive = liveHosts.has(b.challengerId);
+      const opponentLive = liveHosts.has(b.opponentId);
+      if (challengerLive && opponentLive) continue;
+      const quitter = !challengerLive && !opponentLive ? null : !challengerLive ? b.challengerId : b.opponentId;
+      await this.forfeitBy(b, quitter);
+      ended.push(b.id);
+    }
+    return ended;
+  }
+
+  // Closes matching CHALLENGED invitations and tells both people involved.
+  private async closeChallenges(where: Record<string, unknown>, reason: PkCloseReason) {
+    const open = await this.prisma.pKBattle.findMany({
+      where: where as any,
+      select: { id: true, challengerId: true, opponentId: true },
+      take: 200,
+    });
+    const closed: string[] = [];
+    for (const b of open) {
+      const flipped = await this.prisma.pKBattle.updateMany({ where: { id: b.id, status: 'CHALLENGED' }, data: { status: 'CANCELLED' } });
+      if (flipped.count === 1) {
+        this.emitChallengeClosed(b, reason);
+        closed.push(b.id);
+      }
+    }
+    return closed;
+  }
+
+  private emitChallengeClosed(battle: { id: string; challengerId: string; opponentId: string }, reason: PkCloseReason) {
+    const payload = { battleId: battle.id, challengerId: battle.challengerId, opponentId: battle.opponentId, reason };
+    try {
+      this.realtime.emitToUser(battle.challengerId, 'pk:challenge_closed', payload);
+      this.realtime.emitToUser(battle.opponentId, 'pk:challenge_closed', payload);
+    } catch {
+      /* both screens also poll */
+    }
   }
 
   // ── History ─────────────────────────────────────────────────────
