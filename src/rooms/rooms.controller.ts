@@ -107,9 +107,9 @@ export class RoomsController {
     return this.rooms.inviteToSeat(id, req.user.userId, userId);
   }
 
-  @Post(':id/invite/accept/:seatNumber')
-  acceptInvite(@Param('id') id: string, @Param('seatNumber') seatNumber: string, @Req() req: AuthedRequest) {
-    return this.rooms.acceptInvite(id, req.user.userId, Number(seatNumber));
+  @Post(':id/invite/accept')
+  acceptInvite(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.rooms.acceptInvite(id, req.user.userId);
   }
 
   @Post(':id/remove/:userId')

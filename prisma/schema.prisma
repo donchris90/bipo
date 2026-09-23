@@ -781,6 +781,7 @@ enum RoomStatus {
 
 enum SeatRequestStatus {
   PENDING
+  ACCEPTED
   APPROVED
   REJECTED
   CANCELLED

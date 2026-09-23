@@ -185,8 +185,16 @@ export class RoomsService {
       if (!follows) throw new ForbiddenException('Only followers of the host can request a seat in this room');
     }
 
-    // INVITE_ONLY still requires a host invitation to enter the queue. The
-    // invitation remains separate and can also be accepted from Party.
+    // INVITE_ONLY requires a host invitation before the user may enter the
+    // queue. A user who already accepted a host invitation is represented by
+    // an ACCEPTED request and is already in the queue.
+    const acceptedInvite = await this.prisma.seatRequest.findFirst({
+      where: { roomId, userId, status: 'ACCEPTED', invitedByHost: true },
+    });
+    if (acceptedInvite) {
+      return { requested: true, requestId: acceptedInvite.id, waitingForSeat: true, invited: true };
+    }
+
     if (room.privacy === 'INVITE_ONLY') {
       const invite = await this.prisma.seatRequest.findFirst({
         where: { roomId, userId, status: 'PENDING', invitedByHost: true },
@@ -223,7 +231,8 @@ export class RoomsService {
     // Unseated guests do not bypass the host queue by tapping a seat.
     // Queueing is allowed regardless of whether that seat is occupied, locked,
     // or currently empty. The host decides the actual seat when approving.
-    if (!Number.isInteger(seatNumber) || seatNumber < 0) {
+    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { seatCount: true } });
+    if (!room || !Number.isInteger(seatNumber) || seatNumber < 0 || seatNumber >= room.seatCount) {
       throw new BadRequestException('Invalid seat number');
     }
     return this.joinRequest(roomId, userId);
@@ -332,21 +341,24 @@ export class RoomsService {
     // Either direction: a host can't pull in someone they've blocked, and
     // can't invite someone who blocked them.
     await assertNotBlocked(this.prisma, actorId, targetUserId, "You can't invite this user");
-    const existingPending = await this.prisma.seatRequest.findFirst({
-      where: { roomId, userId: targetUserId, status: 'PENDING' },
+    const existingInvite = await this.prisma.seatRequest.findFirst({
+      where: { roomId, userId: targetUserId, status: 'PENDING', invitedByHost: true },
     });
-    if (existingPending) return existingPending;
-    return this.prisma.seatRequest.create({ data: { roomId, userId: targetUserId, invitedByHost: true } });
+    if (existingInvite) return existingInvite;
+
+    // An ordinary queue request and a host invitation are intentionally
+    // separate. The host may invite someone who is already waiting; the
+    // invitation can then be accepted from Party without taking a seat.
+    return this.prisma.seatRequest.create({
+      data: { roomId, userId: targetUserId, invitedByHost: true },
+    });
   }
 
-  async acceptInvite(roomId: string, userId: string, seatNumber: number) {
-    return this.prisma.$transaction(async (tx) => {
+  async acceptInvite(roomId: string, userId: string) {
+    const result = await this.prisma.$transaction(async (tx) => {
       const room = await tx.partyRoom.findUnique({ where: { id: roomId } });
       if (!room || room.status !== 'OPEN') throw new NotFoundException('Room not open');
       if (room.locked) throw new BadRequestException('Room is locked');
-      if (!Number.isInteger(seatNumber) || seatNumber < 0 || seatNumber >= room.seatCount) {
-        throw new BadRequestException('Invalid seat number');
-      }
       if (await this.moderation.isBanned('ROOM', roomId, userId)) {
         throw new ForbiddenException('You are banned from this room');
       }
@@ -356,33 +368,55 @@ export class RoomsService {
       });
       if (!invite) throw new NotFoundException('No pending invite for you in this room');
 
-      const lockedSeat = await tx.roomSeatLock.findUnique({
-        where: { roomId_seatNumber: { roomId, seatNumber } },
+      // If the person was already waiting in the normal queue, the invitation
+      // should not create a duplicate queue row. The accepted host invitation
+      // becomes the single request the host will approve.
+      await tx.seatRequest.updateMany({
+        where: {
+          roomId,
+          userId,
+          status: 'PENDING',
+          invitedByHost: false,
+        },
+        data: { status: 'CANCELLED', decidedAt: new Date() },
       });
-      if (lockedSeat) throw new ForbiddenException('This seat is locked by the host');
 
-      let seat;
-      try {
-        seat = await tx.roomSeat.create({ data: { roomId, userId, seatNumber } });
-      } catch {
-        throw new BadRequestException('Seat already taken or you already hold a seat in this room');
+      const existingSeat = await tx.roomSeat.findFirst({ where: { roomId, userId } });
+      if (existingSeat) {
+        await tx.seatRequest.update({
+          where: { id: invite.id },
+          data: { status: 'APPROVED', decidedAt: new Date() },
+        });
+        return { roomId, userId, requestId: invite.id, seated: true, seatNumber: existingSeat.seatNumber };
       }
 
+      // Accepting an invitation does NOT bypass the host-controlled seat
+      // queue. This is important because guest seats start locked and may all
+      // be occupied. The invite is converted into an accepted queue request;
+      // the host still chooses the exact seat later.
       await tx.seatRequest.update({
         where: { id: invite.id },
-        data: { status: 'APPROVED', decidedAt: new Date() },
+        data: { status: 'ACCEPTED' },
       });
-      return seat;
-    }).then((seat) => {
-      this.emitRoomState(roomId, 'SEAT_APPROVED', seat.userId, { seatNumber: seat.seatNumber });
-      return seat;
+
+      return { roomId, userId, requestId: invite.id, seated: false, waitingForSeat: true };
     });
+
+    if (!result.seated) {
+      this.emitRoomState(roomId, 'SEAT_REQUESTED', userId, { requestId: result.requestId, invited: true });
+    } else {
+      this.emitRoomState(roomId, 'SEAT_APPROVED', userId, { seatNumber: result.seatNumber });
+    }
+    return result;
   }
 
   async listSeatRequests(roomId: string, actorId: string) {
     await this.assertHostOrModerator(roomId, actorId);
     const requests = await this.prisma.seatRequest.findMany({
-      where: { roomId, status: 'PENDING', invitedByHost: false },
+      where: {
+        roomId,
+        status: { in: ['PENDING', 'ACCEPTED'] },
+      },
       orderBy: { createdAt: 'asc' },
     });
     if (requests.length === 0) return [];
@@ -403,6 +437,8 @@ export class RoomsService {
       userId: r.userId,
       displayName: userById.get(r.userId)?.displayName ?? null,
       createdAt: r.createdAt,
+      invited: r.invitedByHost,
+      acceptedInvite: r.status === 'ACCEPTED',
     }));
   }
 
@@ -415,7 +451,7 @@ export class RoomsService {
         throw new BadRequestException('Invalid seat number');
       }
       const request = await tx.seatRequest.findUnique({ where: { id: requestId } });
-      if (!request || request.roomId !== roomId || request.status !== 'PENDING' || request.invitedByHost) {
+      if (!request || request.roomId !== roomId || !['PENDING', 'ACCEPTED'].includes(request.status)) {
         throw new NotFoundException('No such pending request');
       }
       if (await this.moderation.isBanned('ROOM', roomId, request.userId)) {
@@ -457,7 +493,7 @@ export class RoomsService {
   async rejectSeatRequest(roomId: string, actorId: string, requestId: string) {
     await this.assertHostOrModerator(roomId, actorId);
     const request = await this.prisma.seatRequest.findUnique({ where: { id: requestId } });
-    if (!request || request.roomId !== roomId || request.status !== 'PENDING') {
+    if (!request || request.roomId !== roomId || !['PENDING', 'ACCEPTED'].includes(request.status)) {
       throw new NotFoundException('No such pending request');
     }
     return this.prisma.seatRequest.update({
