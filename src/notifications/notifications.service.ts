@@ -54,7 +54,7 @@ export class NotificationsService {
     const notification = await this.prisma.notification.create({
       data: { userId, type, payload: payload as any },
     });
-    this.nudge(userId, notification.id, type, notification.createdAt);
+    this.nudge(userId, notification.id, type, notification.createdAt, payload);
     void this.pushToPhone(userId, type, payload); // fire-and-forget; never rejects
     return notification;
   }
@@ -168,9 +168,9 @@ export class NotificationsService {
     return { notifications, messages, total: notifications + messages };
   }
 
-  private nudge(userId: string, id: string, type: NotificationType, createdAt: Date) {
+  private nudge(userId: string, id: string, type: NotificationType, createdAt: Date, payload?: Record<string, unknown>) {
     try {
-      this.realtime.emitToUser(userId, 'notification:new', { id, type, createdAt });
+      this.realtime.emitToUser(userId, 'notification:new', { id, type, createdAt, payload });
     } catch {
       /* the inbox poll picks it up */
     }

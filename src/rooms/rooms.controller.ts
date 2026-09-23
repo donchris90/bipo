@@ -102,6 +102,17 @@ export class RoomsController {
     return this.rooms.rejectSeatRequest(id, req.user.userId, requestId);
   }
 
+  @Get(':id/invite-candidates')
+  inviteCandidates(
+    @Param('id') id: string,
+    @Query('category') category: string,
+    @Query('search') search: string | undefined,
+    @Req() req: AuthedRequest,
+  ) {
+    const value = category === 'fans' || category === 'agency' ? category : 'friends';
+    return this.rooms.inviteCandidates(id, req.user.userId, value as 'friends' | 'fans' | 'agency', search);
+  }
+
   @Post(':id/invite/:userId')
   inviteToSeat(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
     return this.rooms.inviteToSeat(id, req.user.userId, userId);

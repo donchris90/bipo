@@ -117,7 +117,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     // needs played back. Only LIVE/ROOM have an actual chat feed for this
     // to appear in — 'pk' and other free-form contexts reuse this handler
     // too but have nowhere to show it.
-    if ((data.context === 'ROOM' || data.context === 'LIVE') && this.shouldAnnounceJoin(userId, `${data.context}:${data.contextId}`)) {
+    if (data.context === 'LIVE' && this.shouldAnnounceJoin(userId, `${data.context}:${data.contextId}`)) {
       try {
         const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true } });
         client.to(`${data.context}:${data.contextId}`).emit('chat:message', {
