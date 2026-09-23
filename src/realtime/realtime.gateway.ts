@@ -253,7 +253,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     payload: { roomId: string; action: string; targetUserId: string; actorId: string },
   ) {
     this.server.to(`ROOM:${roomId}`).to(`user:${payload.targetUserId}`).emit('room:moderation', payload);
-    if (payload.action === 'BAN') {
+    if (payload.action === 'BAN' || payload.action === 'KICK') {
       this.server.in(`user:${payload.targetUserId}`).socketsLeave(`ROOM:${roomId}`);
     }
   }
@@ -277,6 +277,10 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     for (const userId of userIds) op = op.to(`user:${userId}`);
     for (const sessionId of liveSessionIds) op = op.to(`LIVE:${sessionId}`);
     op.emit(event, payload);
+  }
+
+  broadcastRoomState(roomId: string, payload: { roomId: string; action: string; targetUserId?: string; [key: string]: unknown }) {
+    this.server.to(`ROOM:${roomId}`).emit('room:state', payload);
   }
 
   // Host changed the room theme mid-session — everyone in the room re-skins

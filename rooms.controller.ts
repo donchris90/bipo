@@ -3,7 +3,7 @@ import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Req, UseGuard
 import { Request } from 'express';
 import { RoomsService } from './rooms.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { RoleName, RoomPrivacy } from '@prisma/client';
+import { RoleName, RoomMode, RoomPrivacy } from '@prisma/client';
 
 interface AuthedRequest extends Request {
   user: { userId: string; roles: RoleName[]; countryCode: string };
@@ -49,11 +49,6 @@ export class RoomsController {
     return this.rooms.joinToken(id, req.user.userId);
   }
 
-  @Post(':id/join-request')
-  joinRequest(@Param('id') id: string, @Req() req: AuthedRequest) {
-    return this.rooms.joinRequest(id, req.user.userId);
-  }
-
   @Post()
   create(@Body() body: Record<string, unknown>, @Req() req: AuthedRequest) {
     // Validated and defaulted first: a blank or odd value is fixed or answered with
@@ -62,24 +57,39 @@ export class RoomsController {
     return this.rooms.create(req.user.userId, input.title, input.privacy, input.seatCount, req.user.countryCode, input.category, input.themeColor, input.mode);
   }
 
+  @Post(':id/join-request')
+  requestToJoin(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.rooms.requestToJoinRoom(id, req.user.userId);
+  }
+
   @Post(':id/seats/:seatNumber')
   takeSeat(@Param('id') id: string, @Param('seatNumber') seatNumber: string, @Req() req: AuthedRequest) {
     return this.rooms.requestSeat(id, req.user.userId, Number(seatNumber));
   }
 
-  @Post(':id/seats/:seatNumber/move')
-  moveOwnSeat(@Param('id') id: string, @Param('seatNumber') seatNumber: string, @Req() req: AuthedRequest) {
-    return this.rooms.moveSeat(id, req.user.userId, req.user.userId, Number(seatNumber));
-  }
-
-  @Post(':id/seats/:seatNumber/move/:userId')
-  moveGuestSeat(@Param('id') id: string, @Param('seatNumber') seatNumber: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
-    return this.rooms.moveSeat(id, req.user.userId, userId, Number(seatNumber));
-  }
-
   @Delete(':id/seats/me')
   leaveSeat(@Param('id') id: string, @Req() req: AuthedRequest) {
     return this.rooms.leaveSeat(id, req.user.userId);
+  }
+
+  @Post(':id/seats/:seatNumber/move')
+  moveOwnSeat(@Param('id') id: string, @Param('seatNumber') seatNumber: string, @Req() req: AuthedRequest) {
+    return this.rooms.moveOwnSeat(id, req.user.userId, Number(seatNumber));
+  }
+
+  @Post(':id/seats/:seatNumber/move/:userId')
+  moveGuestToSeat(@Param('id') id: string, @Param('seatNumber') seatNumber: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
+    return this.rooms.moveGuestToSeat(id, req.user.userId, userId, Number(seatNumber));
+  }
+
+  @Patch(':id/mode')
+  updateMode(@Param('id') id: string, @Body('mode') mode: RoomMode, @Req() req: AuthedRequest) {
+    return this.rooms.updateMode(id, req.user.userId, mode);
+  }
+
+  @Patch(':id/seat-count')
+  updateSeatCount(@Param('id') id: string, @Body('seatCount') seatCount: number, @Req() req: AuthedRequest) {
+    return this.rooms.updateSeatCount(id, req.user.userId, Number(seatCount));
   }
 
   @Get(':id/seat-requests')
@@ -145,16 +155,6 @@ export class RoomsController {
   @Delete(':id/moderators/:userId')
   removeModerator(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
     return this.rooms.removeModerator(id, req.user.userId, userId);
-  }
-
-  @Patch(':id/mode')
-  setMode(@Param('id') id: string, @Body('mode') mode: string, @Req() req: AuthedRequest) {
-    return this.rooms.setMode(id, req.user.userId, mode);
-  }
-
-  @Patch(':id/seat-count')
-  setSeatCount(@Param('id') id: string, @Body('seatCount') seatCount: number, @Req() req: AuthedRequest) {
-    return this.rooms.setSeatCount(id, req.user.userId, Number(seatCount));
   }
 
   @Post(':id/lock')

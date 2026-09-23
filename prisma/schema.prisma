@@ -27,6 +27,7 @@ model User {
   bio           String?
   liveViews     LiveViewer[]
   privateLiveRequests PrivateLiveRequest[]
+  liveModerators LiveModerator[]
   refreshTokens RefreshToken[]
   referredBy    User?          @relation("Referrals", fields: [referredById], references: [id])
   referrals     User[]         @relation("Referrals")
@@ -177,9 +178,23 @@ model LiveSession {
   privateEndsAt          DateTime?
   privateRequests        PrivateLiveRequest[]
   viewers                LiveViewer[]
+  moderators             LiveModerator[]
 
   @@index([hostId])
   @@index([status])
+}
+
+model LiveModerator {
+  id        String      @id @default(uuid())
+  sessionId String
+  userId    String
+  createdAt DateTime    @default(now())
+  session   LiveSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, userId])
+  @@index([sessionId])
+  @@index([userId])
 }
 
 model LiveViewer {
@@ -787,6 +802,8 @@ enum ModerationActionType {
   REMOVE_MODERATOR
   LOCK_ROOM
   UNLOCK_ROOM
+  LOCK_SEAT
+  UNLOCK_SEAT
 }
 
 enum WalletType {

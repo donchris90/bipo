@@ -259,39 +259,35 @@ export class PkService {
       data: { status: 'COUNTDOWN', startedAt, endsAt },
     });
 
-    // If scheduling either job fails (Redis unavailable, this class of
-    // BullMQ validation error, etc.), roll the battle back to CHALLENGED
-    // rather than leaving it stranded in COUNTDOWN with nothing that will
-    // ever move it forward. The opponent can then just accept again. This
-    // replaces an earlier version of this comment that claimed the battle
-    // "fails loudly rather than silently leaving a battle stuck" — that
-    // was aspirational, not actually implemented, and a real bug (BullMQ
-    // job IDs can't contain `:`) proved it wrong the first time this ran
-    // against live infrastructure.
-    try {
-      await this.pkQueue.add(
-        'activate',
-        { battleId },
-        { delay: Math.max(startedAt.getTime() - now.getTime(), 0), jobId: `activate-${battleId}` },
-      );
-      await this.pkQueue.add(
-        'settle',
-        { battleId },
-        { delay: Math.max(endsAt.getTime() - now.getTime(), 0), jobId: `settle-${battleId}` },
-      );
-    } catch (e) {
-      await this.prisma.pKBattle.update({
-        where: { id: battleId },
-        data: { status: 'CHALLENGED', startedAt: null, endsAt: null },
-      });
-      throw e;
-    }
+    // Redis/BullMQ is a timing fast-path only. Redis can reject writes when
+    // its maxmemory limit is reached, so a queue failure must never turn a
+    // valid Accept into HTTP 500 or roll the battle back. PkReaperService
+    // makes startedAt/endsAt authoritative and recovers the transitions
+    // from PostgreSQL when Redis is unavailable.
+    void this.scheduleTransitionsBestEffort(battleId, startedAt, endsAt);
 
-    // Only announced once both jobs are safely scheduled — the rollback
-    // above means a failed accept never tells anyone a countdown started.
     await this.emitLifecycle('pk:countdown_start', updated);
 
     return updated;
+  }
+
+  private async scheduleTransitionsBestEffort(battleId: string, startedAt: Date, endsAt: Date) {
+    try {
+      await Promise.all([
+        this.pkQueue.add(
+          'activate',
+          { battleId },
+          { delay: Math.max(startedAt.getTime() - Date.now(), 0), jobId: `activate-${battleId}` },
+        ),
+        this.pkQueue.add(
+          'settle',
+          { battleId },
+          { delay: Math.max(endsAt.getTime() - Date.now(), 0), jobId: `settle-${battleId}` },
+        ),
+      ]);
+    } catch (e: any) {
+      console.warn(`[PK] transition queue unavailable for ${battleId}: ${e?.message ?? e}`);
+    }
   }
 
   // Transitions COUNTDOWN -> ACTIVE once startedAt has passed. In production

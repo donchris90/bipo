@@ -2,7 +2,7 @@ import { BadRequestException, ForbiddenException, Inject, Injectable, NotFoundEx
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { ModerationService } from '../moderation/moderation.service';
-import { RoomPrivacy } from '@prisma/client';
+import { RoomPrivacy, RoomMode } from '@prisma/client';
 import { RTC_PROVIDER } from '../live/live.service';
 import type { RtcProvider } from '../live/providers/rtc-provider.interface';
 import { fetchChatHistory } from '../common/chat-history';
@@ -152,44 +152,6 @@ export class RoomsService {
     return { room, token, role, muted };
   }
 
-  async joinRequest(roomId: string, userId: string) {
-    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
-    if (!room || room.status !== 'OPEN') throw new NotFoundException('Room not open');
-    if (room.locked) throw new BadRequestException('Room is locked');
-    if (await this.moderation.isBanned('ROOM', roomId, userId)) {
-      throw new ForbiddenException('You are banned from this room');
-    }
-    const existingSeat = await this.prisma.roomSeat.findFirst({ where: { roomId, userId } });
-    if (existingSeat) return { joined: true, seatNumber: existingSeat.seatNumber };
-
-    const seats = await this.prisma.roomSeat.findMany({ where: { roomId }, select: { seatNumber: true } });
-    const occupied = new Set(seats.map((s) => s.seatNumber));
-    let firstAvailable: number | null = null;
-    for (let i = 0; i < room.seatCount; i++) {
-      if (!occupied.has(i)) {
-        const locked = await this.prisma.roomSeatLock.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber: i } } });
-        if (!locked) { firstAvailable = i; break; }
-      }
-    }
-
-    if (room.privacy === 'INVITE_ONLY') {
-      throw new ForbiddenException('This room is invite-only');
-    }
-    if (room.privacy === 'FOLLOWERS_ONLY') {
-      const follows = await this.prisma.follow.findUnique({ where: { followerId_followingId: { followerId: userId, followingId: room.hostId } } });
-      if (!follows) throw new ForbiddenException('Only followers of the host can join this room');
-    }
-    if (room.privacy === 'PRIVATE') {
-      const existingPending = await this.prisma.seatRequest.findFirst({ where: { roomId, userId, status: 'PENDING', invitedByHost: false } });
-      if (existingPending) return { requested: true, requestId: existingPending.id };
-      const request = await this.prisma.seatRequest.create({ data: { roomId, userId, invitedByHost: false } });
-      return { requested: true, requestId: request.id };
-    }
-    if (firstAvailable === null) throw new BadRequestException('No available seat');
-    const seat = await this.assignSeat(roomId, userId, firstAvailable);
-    return { joined: true, seatNumber: seat.seatNumber };
-  }
-
   private async assertHostOrModerator(roomId: string, userId: string) {
     const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
     if (!room) throw new NotFoundException('Room not found');
@@ -199,6 +161,51 @@ export class RoomsService {
     });
     if (!isMod) throw new ForbiddenException('Requires host or moderator');
     return room;
+  }
+
+  /** Bottom-bar Join flow. Public/follower rooms join immediately; private rooms create a host request. */
+  async requestToJoinRoom(roomId: string, userId: string) {
+    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
+    if (!room || room.status !== 'OPEN') throw new NotFoundException('Room not open');
+    if (room.locked) throw new BadRequestException('Room is locked');
+    if (room.privacy === 'INVITE_ONLY') throw new ForbiddenException('This room is invite-only');
+    if (await this.moderation.isBanned('ROOM', roomId, userId)) {
+      throw new ForbiddenException('You are banned from this room');
+    }
+    if (await this.prisma.roomSeat.findFirst({ where: { roomId, userId } })) {
+      return { joined: true, alreadyJoined: true };
+    }
+
+    if (room.privacy === 'FOLLOWERS_ONLY') {
+      const follows = await this.prisma.follow.findUnique({
+        where: { followerId_followingId: { followerId: userId, followingId: room.hostId } },
+      });
+      if (!follows) throw new ForbiddenException('Only followers of the host can join this room');
+    }
+
+    if (room.privacy === 'PRIVATE') {
+      const existingPending = await this.prisma.seatRequest.findFirst({
+        where: { roomId, userId, status: 'PENDING', invitedByHost: false },
+      });
+      const request = existingPending ?? await this.prisma.seatRequest.create({
+        data: { roomId, userId, invitedByHost: false },
+      });
+      return { requested: true, requestId: request.id };
+    }
+
+    // PUBLIC/FOLLOWERS_ONLY: Join means actually taking the first available seat.
+    for (let seatNumber = 0; seatNumber < room.seatCount; seatNumber++) {
+      const locked = await this.prisma.roomSeatLock.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber } } });
+      if (locked) continue;
+      try {
+        const seat = await this.prisma.roomSeat.create({ data: { roomId, userId, seatNumber } });
+        this.emitRoomState(roomId, 'SEAT_JOINED', userId);
+        return { joined: true, seatNumber: seat.seatNumber };
+      } catch {
+        // Another guest won this seat between the availability check and create. Try the next one.
+      }
+    }
+    throw new BadRequestException('All seats are currently occupied');
   }
 
   async requestSeat(roomId: string, userId: string, seatNumber: number) {
@@ -244,39 +251,68 @@ export class RoomsService {
     const lockedSeat = await this.prisma.roomSeatLock.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber } } });
     if (lockedSeat) throw new ForbiddenException('This seat is locked by the host');
     try {
-      const seat = await this.prisma.roomSeat.create({ data: { roomId, userId, seatNumber } });
-      this.emitRoomState(roomId, 'SEAT_JOINED', userId, { seatNumber });
-      return seat;
+      return await this.prisma.roomSeat.create({ data: { roomId, userId, seatNumber } });
     } catch {
       throw new BadRequestException('Seat already taken or you already hold a seat in this room');
     }
   }
 
-  async moveSeat(roomId: string, actorId: string, targetUserId: string, seatNumber: number) {
+  async moveOwnSeat(roomId: string, userId: string, destinationSeat: number) {
+    return this.moveSeat(roomId, userId, userId, destinationSeat, false);
+  }
+
+  async moveGuestToSeat(roomId: string, actorId: string, targetUserId: string, destinationSeat: number) {
+    const room = await this.assertHostOrModerator(roomId, actorId);
+    if (targetUserId === room.hostId) throw new BadRequestException('Cannot move the host');
+    return this.moveSeat(roomId, actorId, targetUserId, destinationSeat, true);
+  }
+
+  private async moveSeat(roomId: string, actorId: string, targetUserId: string, destinationSeat: number, actorCanMoveOthers: boolean) {
     const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
     if (!room || room.status !== 'OPEN') throw new NotFoundException('Room not open');
-    if (!Number.isInteger(seatNumber) || seatNumber < 0 || seatNumber >= room.seatCount) throw new BadRequestException('Invalid seat number');
-    if (room.hostId === targetUserId && seatNumber !== 0) throw new BadRequestException('The host must remain in seat 1');
-    if (seatNumber === 0 && targetUserId !== room.hostId) throw new BadRequestException('Seat 1 belongs to the host');
-    if (targetUserId !== actorId) await this.assertHostOrModerator(roomId, actorId);
-    const locked = await this.prisma.roomSeatLock.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber } } });
-    if (locked) throw new ForbiddenException('This seat is locked by the host');
+    if (actorCanMoveOthers) await this.assertHostOrModerator(roomId, actorId);
+    else if (actorId !== targetUserId) throw new ForbiddenException('You can only move your own seat');
+    if (!Number.isInteger(destinationSeat) || destinationSeat < 0 || destinationSeat >= room.seatCount) {
+      throw new BadRequestException('Invalid destination seat');
+    }
 
-    return this.prisma.$transaction(async (tx) => {
-      const current = await tx.roomSeat.findUnique({ where: { roomId_userId: { roomId, userId: targetUserId } } });
-      if (!current) throw new BadRequestException('User is not seated in this room');
-      if (current.seatNumber === seatNumber) return current;
-      const destination = await tx.roomSeat.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber } } });
-      if (destination) throw new BadRequestException('That seat is already occupied');
-      const updated = await tx.roomSeat.update({ where: { id: current.id }, data: { seatNumber } });
-      return { updated, fromSeat: current.seatNumber };
-    }).then((result) => {
-      this.emitRoomState(roomId, 'SEAT_MOVED', targetUserId, {
-        fromSeat: result.fromSeat,
-        seatNumber: result.updated.seatNumber,
-      });
-      return result.updated;
+    const result = await this.prisma.$transaction(async (tx) => {
+      const source = await tx.roomSeat.findUnique({ where: { roomId_userId: { roomId, userId: targetUserId } } });
+      if (!source) throw new BadRequestException('Guest is not seated');
+      if (source.seatNumber === destinationSeat) return source;
+      const fromSeat = source.seatNumber;
+      const locked = await tx.roomSeatLock.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber: destinationSeat } } });
+      if (locked) throw new ForbiddenException('This seat is locked by the host');
+      const occupant = await tx.roomSeat.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber: destinationSeat } } });
+      if (occupant) throw new BadRequestException('That seat is already occupied');
+      return tx.roomSeat.update({ where: { id: source.id }, data: { seatNumber: destinationSeat } });
     });
+    this.emitRoomState(roomId, 'SEAT_MOVED', targetUserId, { toSeat: result.seatNumber });
+    return result;
+  }
+
+  async updateMode(roomId: string, actorId: string, mode: RoomMode) {
+    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
+    if (!room) throw new NotFoundException('Room not found');
+    if (room.hostId !== actorId) throw new ForbiddenException('Only the host can change room mode');
+    if (room.status !== 'OPEN') throw new BadRequestException('Room is closed');
+    const updated = await this.prisma.partyRoom.update({ where: { id: roomId }, data: { mode } });
+    this.emitRoomState(roomId, 'MODE_CHANGED', actorId, { mode });
+    return { mode: updated.mode };
+  }
+
+  async updateSeatCount(roomId: string, actorId: string, seatCount: number) {
+    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
+    if (!room) throw new NotFoundException('Room not found');
+    if (room.hostId !== actorId) throw new ForbiddenException('Only the host can change seat count');
+    if (room.status !== 'OPEN') throw new BadRequestException('Room is closed');
+    if (![4, 6, 9, 12].includes(seatCount)) throw new BadRequestException('Seat count must be 4, 6, 9, or 12');
+    const occupied = await this.prisma.roomSeat.findMany({ where: { roomId, seatNumber: { gte: seatCount } }, select: { seatNumber: true, userId: true } });
+    if (occupied.length) throw new BadRequestException('Move or remove guests from the seats being removed first');
+    const updated = await this.prisma.partyRoom.update({ where: { id: roomId }, data: { seatCount } });
+    await this.prisma.roomSeatLock.deleteMany({ where: { roomId, seatNumber: { gte: seatCount } } });
+    this.emitRoomState(roomId, 'SEAT_COUNT_CHANGED', actorId, { seatCount });
+    return { seatCount: updated.seatCount };
   }
 
   async setSeatLocked(roomId: string, actorId: string, seatNumber: number, locked: boolean) {
@@ -295,6 +331,7 @@ export class RoomsService {
       await this.prisma.roomSeatLock.deleteMany({ where: { roomId, seatNumber } });
     }
     await this.logModeration(actorId, locked ? 'LOCK_SEAT' : 'UNLOCK_SEAT', roomId);
+    this.emitRoomState(roomId, locked ? 'SEAT_LOCKED' : 'SEAT_UNLOCKED', actorId, { seatNumber, locked });
     return { seatNumber, locked };
   }
 
@@ -351,9 +388,6 @@ export class RoomsService {
         where: { id: invite.id },
         data: { status: 'APPROVED', decidedAt: new Date() },
       });
-      return seat;
-    }).then((seat) => {
-      this.emitRoomState(roomId, 'SEAT_APPROVED', seat.userId, { seatNumber: seat.seatNumber });
       return seat;
     });
   }
@@ -422,7 +456,7 @@ export class RoomsService {
       roomTitle: result.roomTitle,
       seatNumber,
     });
-    this.emitRoomState(roomId, 'SEAT_APPROVED', result.userId, { seatNumber });
+    this.emitRoomState(roomId, 'SEAT_JOINED', result.userId, { seatNumber });
     return result.seat;
   }
 
@@ -432,16 +466,17 @@ export class RoomsService {
     if (!request || request.roomId !== roomId || request.status !== 'PENDING') {
       throw new NotFoundException('No such pending request');
     }
-    return this.prisma.seatRequest.update({
+    const rejected = await this.prisma.seatRequest.update({
       where: { id: requestId },
       data: { status: 'REJECTED', decidedAt: new Date() },
     });
+    this.emitRoomState(roomId, 'SEAT_REQUEST_REJECTED', rejected.userId);
+    return rejected;
   }
 
   async leaveSeat(roomId: string, userId: string) {
-    const seat = await this.prisma.roomSeat.findUnique({ where: { roomId_userId: { roomId, userId } } });
     await this.prisma.roomSeat.deleteMany({ where: { roomId, userId } });
-    if (seat) this.emitRoomState(roomId, 'SEAT_LEFT', userId, { seatNumber: seat.seatNumber });
+    this.emitRoomState(roomId, 'SEAT_LEFT', userId);
     return { left: true };
   }
 
@@ -490,32 +525,6 @@ export class RoomsService {
     await this.prisma.roomModerator.deleteMany({ where: { roomId, userId: targetUserId } });
     await this.logModeration(actorId, 'REMOVE_MODERATOR', roomId, targetUserId);
     return { removed: true };
-  }
-
-  async setMode(roomId: string, actorId: string, mode: string) {
-    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
-    if (!room) throw new NotFoundException('Room not found');
-    if (room.hostId !== actorId) throw new ForbiddenException('Only the host can change room mode');
-    if (room.status !== 'OPEN') throw new BadRequestException('Room is closed');
-    if (mode !== 'VIDEO' && mode !== 'AUDIO') throw new BadRequestException('mode must be VIDEO or AUDIO');
-    const updated = await this.prisma.partyRoom.update({ where: { id: roomId }, data: { mode: mode as any } });
-    this.emitRoomState(roomId, 'MODE_CHANGED', undefined, { mode: updated.mode });
-    return { mode: updated.mode };
-  }
-
-  async setSeatCount(roomId: string, actorId: string, seatCount: number) {
-    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
-    if (!room) throw new NotFoundException('Room not found');
-    if (room.hostId !== actorId) throw new ForbiddenException('Only the host can change seat count');
-    if (![4, 6, 9, 12].includes(seatCount)) throw new BadRequestException('seatCount must be 4, 6, 9, or 12');
-    if (seatCount < room.seatCount) {
-      const occupied = await this.prisma.roomSeat.findFirst({ where: { roomId, seatNumber: { gte: seatCount } } });
-      if (occupied) throw new BadRequestException('Remove guests from higher seats first');
-    }
-    await this.prisma.roomSeatLock.deleteMany({ where: { roomId, seatNumber: { gte: seatCount } } });
-    const updated = await this.prisma.partyRoom.update({ where: { id: roomId }, data: { seatCount } });
-    this.emitRoomState(roomId, 'SEAT_COUNT_CHANGED', undefined, { seatCount: updated.seatCount });
-    return { seatCount: updated.seatCount };
   }
 
   async lock(roomId: string, actorId: string, locked: boolean) {
@@ -621,21 +630,16 @@ export class RoomsService {
     });
   }
 
-  // The audit row is the source of truth; the push is best-effort and must
-  // never fail the moderation action itself.
-  private emitRoomState(
-    roomId: string,
-    action: string,
-    targetUserId?: string,
-    extra: Record<string, unknown> = {},
-  ) {
+  private emitRoomState(roomId: string, action: string, targetUserId?: string, extra: Record<string, unknown> = {}) {
     try {
       this.realtime.broadcastRoomState(roomId, { roomId, action, targetUserId, ...extra });
     } catch {
-      /* REST polling remains the recovery path if realtime is unavailable. */
+      /* REST remains the source of truth if realtime is unavailable. */
     }
   }
 
+  // The audit row is the source of truth; the push is best-effort and must
+  // never fail the moderation action itself.
   private emitModeration(
     roomId: string,
     action: 'KICK' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
@@ -651,7 +655,7 @@ export class RoomsService {
 
   private async logModeration(
     actorId: string,
-    actionType: 'KICK' | 'ADD_MODERATOR' | 'LOCK_ROOM' | 'UNLOCK_ROOM' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
+    actionType: 'KICK' | 'ADD_MODERATOR' | 'LOCK_ROOM' | 'UNLOCK_ROOM' | 'LOCK_SEAT' | 'UNLOCK_SEAT' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
     roomId: string,
     targetUserId?: string,
   ) {
