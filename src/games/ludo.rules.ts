@@ -15,6 +15,17 @@ export interface LudoPlayerState {
   consecutiveSixes: number;
   finishedAt?: string;
 }
+/** The most recent dice roll. Unlike `lastRoll` it survives the turn passing, so every client can show what was rolled. */
+export interface LudoLastDice {
+  seat: number;
+  value: number;
+  /** Increments on every roll so clients can tell two identical rolls apart. */
+  seq: number;
+  /** True when the roll could not be played (no legal token, or a cancelled third six). */
+  noMove: boolean;
+  /** True when this roll was the cancelled third consecutive six. */
+  penalty: boolean;
+}
 export interface LudoState {
   matchId: string;
   roomCode: string;
@@ -29,6 +40,7 @@ export interface LudoState {
   turnExpiresAt: string;
   turnSeconds: number;
   lastRoll: number | null;
+  lastDice?: LudoLastDice | null;
   lastMove: { userId: string; tokenIndex: number; from: number; to: number; capturedUserId?: string } | null;
   players: LudoPlayerState[];
   winnerUserId?: string;
@@ -38,6 +50,19 @@ export interface LudoState {
 export const COLORS: LudoPlayerColor[] = ['RED', 'GREEN', 'YELLOW', 'BLUE'];
 export const TURN_MS = 20_000;
 export const RECONNECT_GRACE_MS = 120_000;
+
+/**
+ * Token path (matches the physical board):
+ *   -1        in the base (yard)
+ *   0 … 50    on the shared 52-square ring, starting on the player's own start square.
+ *             A token walks 51 ring squares and then turns into its home lane
+ *             (it never steps on the square directly behind its own start square).
+ *   51 … 55   the five coloured home-lane squares
+ *   56        home (finished)
+ */
+export const TRACK_LAST = 50;
+export const LANE_START = 51;
+export const HOME_PROGRESS = 56;
 
 // Eight classic-style safe squares. Start squares are safe too.
 const SAFE_TRACK = new Set([0, 8, 13, 21, 26, 34, 39, 47]);
@@ -51,8 +76,10 @@ export function createLudoState(params: {
   players: Array<{ userId: string; displayName: string }>;
   prizeFirst: number;
   prizeSecond: number;
+  turnSeconds?: number;
 }): LudoState {
   const now = Date.now();
+  const turnSeconds = params.turnSeconds ?? TURN_MS / 1000;
   return {
     matchId: params.matchId,
     roomCode: params.roomCode,
@@ -64,9 +91,10 @@ export function createLudoState(params: {
     currentSeat: 0,
     turnNumber: 1,
     turnStartedAt: new Date(now).toISOString(),
-    turnExpiresAt: new Date(now + (params.turnSeconds ?? TURN_MS / 1000) * 1000).toISOString(),
-    turnSeconds: params.turnSeconds ?? TURN_MS / 1000,
+    turnExpiresAt: new Date(now + turnSeconds * 1000).toISOString(),
+    turnSeconds,
     lastRoll: null,
+    lastDice: null,
     lastMove: null,
     players: params.players.map((p, seat) => ({
       userId: p.userId,
@@ -82,7 +110,7 @@ export function createLudoState(params: {
 }
 
 export function globalTrackIndex(seat: number, progress: number): number | null {
-  if (progress < 0 || progress > 51) return null;
+  if (progress < 0 || progress > TRACK_LAST) return null;
   return (START_OFFSETS[seat] + progress) % 52;
 }
 
@@ -92,9 +120,9 @@ export function legalMoves(state: LudoState, seat: number, dice: number): number
   const player = state.players[seat];
   if (!player) return [];
   return player.tokens.flatMap((token, i) => {
-    if (token.progress === 57) return [];
+    if (token.progress === HOME_PROGRESS) return [];
     if (token.progress === -1) return dice === 6 ? [i] : [];
-    return token.progress + dice <= 57 ? [i] : [];
+    return token.progress + dice <= HOME_PROGRESS ? [i] : [];
   });
 }
 
@@ -127,7 +155,7 @@ export function applyMove(state: LudoState, seat: number, tokenIndex: number, di
 }
 
 export function playerFinished(player: LudoPlayerState): boolean {
-  return player.tokens.every(t => t.progress === 57);
+  return player.tokens.every(t => t.progress === HOME_PROGRESS);
 }
 
 export function nextActiveSeat(state: LudoState, fromSeat: number): number {
@@ -159,5 +187,7 @@ export function rollForTurn(state: LudoState, seat: number, rng?: number): { dic
   if (dice === 6) player.consecutiveSixes += 1; else player.consecutiveSixes = 0;
   const threeSixPenalty = player.consecutiveSixes >= 3;
   state.lastRoll = dice;
-  return { dice, threeSixPenalty, legalMoves: threeSixPenalty ? [] : legalMoves(state, seat, dice) };
+  const moves = threeSixPenalty ? [] : legalMoves(state, seat, dice);
+  state.lastDice = { seat, value: dice, seq: (state.lastDice?.seq ?? 0) + 1, noMove: moves.length === 0, penalty: threeSixPenalty };
+  return { dice, threeSixPenalty, legalMoves: moves };
 }

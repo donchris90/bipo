@@ -1,4 +1,4 @@
-import { advanceTurn, applyMove, createLudoState, rollForTurn } from './ludo.rules';
+import { advanceTurn, applyMove, createLudoState, globalTrackIndex, HOME_PROGRESS, legalMoves, playerFinished, rollForTurn } from './ludo.rules';
 
 describe('Ludo rules', () => {
   const state = () => createLudoState({
@@ -24,6 +24,7 @@ describe('Ludo rules', () => {
     const third = rollForTurn(s, 0, 6);
     expect(third.threeSixPenalty).toBe(true);
     expect(third.legalMoves).toEqual([]);
+    expect(s.lastDice?.penalty).toBe(true);
     advanceTurn(s, 0, false);
     expect(s.currentSeat).toBe(1);
   });
@@ -37,12 +38,53 @@ describe('Ludo rules', () => {
 
   it('captures an opponent on a non-safe square', () => {
     const s = state();
-    // Put player 1 token at global track 1 (progress 1 from seat 0),
-    // player 2 reaches the same global track with progress 40 (start 13 + 40 = 1).
+    // Seat 0 token on global square 1; seat 1 token (start 13) reaches it at progress 40.
     s.players[0].tokens[0].progress = 1;
     s.players[1].tokens[0].progress = 39;
+    s.currentSeat = 1;
     rollForTurn(s, 1, 1);
     applyMove(s, 1, 0, 1);
     expect(s.players[0].tokens[0].progress).toBe(-1);
+  });
+
+  it('does not capture on a safe square', () => {
+    const s = state();
+    // Global square 8 is a star square. Seat 0 progress 8 -> square 8.
+    s.players[1].tokens[0].progress = 8;
+    s.players[0].tokens[0].progress = 4;
+    rollForTurn(s, 0, 4);
+    applyMove(s, 0, 0, 4);
+    expect(s.players[1].tokens[0].progress).toBe(8);
+  });
+
+  it('leaves the shared ring after 51 squares and enters the home lane', () => {
+    expect(globalTrackIndex(0, 50)).toBe(50);
+    expect(globalTrackIndex(0, 51)).toBeNull();
+    expect(globalTrackIndex(2, 50)).toBe((26 + 50) % 52);
+  });
+
+  it('needs an exact roll to reach home', () => {
+    const s = state();
+    s.players[0].tokens[0].progress = HOME_PROGRESS - 3;
+    expect(legalMoves(s, 0, 4)).not.toContain(0);
+    expect(legalMoves(s, 0, 3)).toContain(0);
+    s.players[0].tokens[1].progress = HOME_PROGRESS;
+    expect(legalMoves(s, 0, 1)).not.toContain(1);
+  });
+
+  it('finishes a player when all four tokens are home', () => {
+    const s = state();
+    s.players[0].tokens.forEach(t => { t.progress = HOME_PROGRESS; });
+    expect(playerFinished(s.players[0])).toBe(true);
+  });
+
+  it('records the roll even when the turn passes with no legal move', () => {
+    const s = state();
+    const r = rollForTurn(s, 0, 3); // all tokens in base, not a six
+    expect(r.legalMoves).toEqual([]);
+    expect(s.lastDice).toMatchObject({ seat: 0, value: 3, noMove: true, penalty: false });
+    advanceTurn(s, 0, false);
+    expect(s.lastRoll).toBeNull();
+    expect(s.lastDice?.value).toBe(3);
   });
 });

@@ -57,7 +57,12 @@ export class LudoService implements OnModuleDestroy {
     await this.requireBalance(userId, entryFee);
 
     const existingTicket = await this.getUserQuickTicket(userId);
-    if (existingTicket && existingTicket.status !== 'CANCELLED') return this.ticketResponse(existingTicket);
+    if (existingTicket?.status === 'WAITING') return this.ticketResponse(existingTicket);
+    if (existingTicket?.status === 'STARTED' && existingTicket.matchId) {
+      // Resume only a match that is still being played; a finished match must not block a new Quick Match.
+      const live = await this.getState(existingTicket.matchId).catch(() => null) as LudoState | null;
+      if (live?.status === 'ACTIVE') return this.ticketResponse({ ...existingTicket, state: live });
+    }
 
     const lockKey = `ludo:quick-lock:${this.queueKey(entryFee, playerCount)}`;
     const lockToken = uuid();
@@ -185,6 +190,8 @@ export class LudoService implements OnModuleDestroy {
     if (room.players.length >= room.playerCount) throw new BadRequestException('Room is full');
     await this.requireBalance(userId, room.entryFee);
     room.players.push({ userId, displayName, entryFee: room.entryFee, playerCount: room.playerCount });
+    this.rooms.set(room.roomCode, room);
+    await this.writeRoom(room);
     return this.startIfReady(room);
   }
 
@@ -240,6 +247,7 @@ export class LudoService implements OnModuleDestroy {
     const state = await this.requireState(matchId);
     const player = this.playerFor(state, userId);
     if (state.currentSeat !== player.seat) throw new BadRequestException('Not your turn');
+    if (state.lastRoll != null) throw new BadRequestException('You already rolled. Move a token.');
     const result = rollForTurn(state, player.seat);
     if (result.threeSixPenalty) {
       player.consecutiveSixes = 0;
@@ -314,21 +322,31 @@ export class LudoService implements OnModuleDestroy {
     if (state.status !== 'ACTIVE' || Date.now() < Date.parse(state.turnExpiresAt)) return this.publicState(state);
     const player = state.players[state.currentSeat];
     if (!player) return this.publicState(state);
-    // A timed-out turn is always resolved by the same server-side bot rules.
-    const result = rollForTurn(state, player.seat);
-    if (result.threeSixPenalty || result.legalMoves.length === 0) {
+    // A timed-out turn is always resolved by the same server-side bot rules. If the player had already rolled
+    // but did not pick a token, the bot plays that roll instead of rolling again.
+    let dice: number;
+    let moves: number[];
+    let penalty = false;
+    if (state.lastRoll != null) {
+      dice = state.lastRoll;
+      moves = legalMoves(state, player.seat, dice);
+    } else {
+      const result = rollForTurn(state, player.seat);
+      dice = result.dice; moves = result.legalMoves; penalty = result.threeSixPenalty;
+    }
+    if (penalty || moves.length === 0) {
       player.consecutiveSixes = 0;
       advanceTurn(state, player.seat, false);
     } else {
-      const tokenIndex = result.legalMoves[0];
-      applyMove(state, player.seat, tokenIndex, result.dice);
+      const tokenIndex = moves[0];
+      applyMove(state, player.seat, tokenIndex, dice);
       if (playerFinished(player)) {
         player.finishedAt = new Date().toISOString();
         if (!state.winnerUserId) state.winnerUserId = player.userId;
         else if (!state.secondPlaceUserId) state.secondPlaceUserId = player.userId;
       }
       if (state.winnerUserId && state.secondPlaceUserId) await this.finishMatch(state);
-      else advanceTurn(state, player.seat, result.dice === 6);
+      else advanceTurn(state, player.seat, dice === 6);
     }
     await this.persistState(state);
     return this.publicState(state);
