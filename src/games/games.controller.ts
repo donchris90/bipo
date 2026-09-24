@@ -83,28 +83,14 @@ export class GamesController {
 
     return Promise.all(
       rounds.map(async (round) => {
-        const [wonAgg, totalAgg] = await Promise.all([
-          this.prisma.gameEntry.aggregate({
-            where: { roundId: round.id, status: 'WON' },
-            _count: { _all: true },
-            _sum: { rewardAmount: true },
-          }),
-          this.prisma.gameEntry.aggregate({
-            where: { roundId: round.id },
-            _count: { _all: true },
-            _sum: { coinAmount: true },
-          }),
+        const [wonAgg, totalAgg, winnerUsers, playerUsers] = await Promise.all([
+          this.prisma.gameEntry.aggregate({ where: { roundId: round.id, status: 'WON' }, _sum: { rewardAmount: true } }),
+          this.prisma.gameEntry.aggregate({ where: { roundId: round.id }, _sum: { coinAmount: true } }),
+          this.prisma.gameEntry.findMany({ where: { roundId: round.id, status: 'WON' }, select: { userId: true }, distinct: ['userId'] }),
+          this.prisma.gameEntry.findMany({ where: { roundId: round.id }, select: { userId: true }, distinct: ['userId'] }),
         ]);
 
-        return {
-          roundId: round.id,
-          settledAt: round.settledAt,
-          result: round.result,
-          winners: wonAgg._count._all, // counts winning entries, not distinct users — a player who places 2 winning entries counts as 2 here
-          prize: wonAgg._sum.rewardAmount ?? 0,
-          players: totalAgg._count._all, // same caveat — entry count, not distinct-user count
-          totalWagered: totalAgg._sum.coinAmount ?? 0,
-        };
+        return { roundId: round.id, settledAt: round.settledAt, result: round.result, winners: winnerUsers.length, prize: wonAgg._sum.rewardAmount ?? 0, players: playerUsers.length, totalWagered: totalAgg._sum.coinAmount ?? 0 };
       }),
     );
   }
@@ -134,6 +120,18 @@ export class GamesController {
   // condition is a full-set match, not "is my number among several I
   // picked," so attributing its stake per-number the same way would be
   // actively misleading, not just unavailable.
+  @Get('rounds/:roundId/live-stats')
+  async liveStats(@Param('roundId') roundId: string) {
+    const round = await this.prisma.gameRound.findUniqueOrThrow({ where: { id: roundId }, select: ROUND_SELECT });
+    const [users, totalAgg] = await Promise.all([
+      this.prisma.gameEntry.findMany({ where: { roundId }, select: { userId: true }, distinct: ['userId'] }),
+      this.prisma.gameEntry.aggregate({ where: { roundId }, _sum: { coinAmount: true } }),
+    ]);
+    const openMs = new Date(round.openAt).getTime();
+    const lockMs = new Date(round.lockAt).getTime();
+    return { players: users.length, totalWagered: totalAgg._sum.coinAmount ?? 0, timeLimitSeconds: Math.max(0, Math.round((lockMs - openMs) / 1000)), openAt: round.openAt, lockAt: round.lockAt, status: round.status };
+  }
+
   @Get('rounds/:roundId/pool')
   async pool(@Param('roundId') roundId: string) {
     const round = await this.prisma.gameRound.findUniqueOrThrow({ where: { id: roundId }, select: ROUND_SELECT });
