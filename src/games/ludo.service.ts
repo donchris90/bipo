@@ -20,6 +20,12 @@ export class LudoService implements OnModuleDestroy {
   private readonly rooms = new Map<string, Room>();
   private readonly states = new Map<string, LudoState>();
   private readonly disconnectTimers = new Map<string, NodeJS.Timeout>();
+  // Redis is preferred for multi-instance coordination, but Ludo must remain usable if Redis is temporarily full/unavailable.
+  // These maps are a bounded fallback for the active API instance; durable match state remains in Postgres.
+  private readonly localTickets = new Map<string, QuickTicket>();
+  private readonly localInvites = new Map<string, LudoInvite>();
+  private readonly localInviteIds = new Map<string, Set<string>>();
+  private readonly localQuickLocks = new Set<string>();
   private readonly redis: IORedis;
 
   constructor(private readonly prisma: PrismaService, private readonly wallet: WalletService, private readonly rounds: RoundService, private readonly config: ConfigService) {
@@ -55,8 +61,18 @@ export class LudoService implements OnModuleDestroy {
 
     const lockKey = `ludo:quick-lock:${this.queueKey(entryFee, playerCount)}`;
     const lockToken = uuid();
-    const locked = await this.redis.set(lockKey, lockToken, 'PX', 4000, 'NX').catch(() => null);
-    if (!locked) throw new BadRequestException('Quick Match is busy. Please try again.');
+    let redisLock = false;
+    let localLock = false;
+    try {
+      const locked = await this.redis.set(lockKey, lockToken, 'PX', 4000, 'NX');
+      if (!locked) throw new BadRequestException('Quick Match is busy. Please try again.');
+      redisLock = true;
+    } catch (error) {
+      // Do not turn Redis OOM/unavailable into a misleading "busy" error.
+      if (this.localQuickLocks.has(lockKey)) throw new BadRequestException('Quick Match is busy. Please try again.');
+      this.localQuickLocks.add(lockKey);
+      localLock = true;
+    }
     try {
       const ticket = uuid();
       const item: QueueItem = { userId, displayName, entryFee, playerCount, ticket };
@@ -83,23 +99,26 @@ export class LudoService implements OnModuleDestroy {
       }
       return result;
     } finally {
-      const current = await this.redis.get(lockKey).catch(() => null);
-      if (current === lockToken) await this.redis.del(lockKey).catch(() => undefined);
+      if (redisLock) {
+        const current = await this.redis.get(lockKey).catch(() => null);
+        if (current === lockToken) await this.redis.del(lockKey).catch(() => undefined);
+      }
+      if (localLock) this.localQuickLocks.delete(lockKey);
     }
   }
 
   async quickMatchStatus(userId: string, ticket: string) {
-    const raw = await this.redis.get(`ludo:quick-ticket:${ticket}`);
-    if (!raw) throw new NotFoundException('Quick Match ticket expired');
-    const data = JSON.parse(raw) as QuickTicket;
+    const raw = await this.redis.get(`ludo:quick-ticket:${ticket}`).catch(() => null);
+    const data = raw ? JSON.parse(raw) as QuickTicket : this.localTickets.get(ticket);
+    if (!data) throw new NotFoundException('Quick Match ticket expired');
     if (data.userId !== userId) throw new BadRequestException('Invalid Quick Match ticket');
     return this.ticketResponse(data);
   }
 
   async cancelQuickMatch(userId: string, ticket: string) {
-    const raw = await this.redis.get(`ludo:quick-ticket:${ticket}`);
-    if (!raw) return { status: 'CANCELLED', ticket };
-    const data = JSON.parse(raw) as QuickTicket;
+    const raw = await this.redis.get(`ludo:quick-ticket:${ticket}`).catch(() => null);
+    const data = raw ? JSON.parse(raw) as QuickTicket : this.localTickets.get(ticket);
+    if (!data) return { status: 'CANCELLED', ticket };
     if (data.userId !== userId) throw new BadRequestException('Invalid Quick Match ticket');
     if (data.status !== 'WAITING') return this.ticketResponse(data);
     const key = this.queueKey(data.entryFee, data.playerCount);
@@ -107,21 +126,24 @@ export class LudoService implements OnModuleDestroy {
     await this.writeQueue(key, queue.filter(item => item.ticket !== ticket && item.userId !== userId));
     data.status = 'CANCELLED'; data.players = 0;
     await this.writeTicket(data);
-    await this.redis.del(`ludo:quick-user:${userId}`);
+    await this.redis.del(`ludo:quick-user:${userId}`).catch(() => undefined);
     return this.ticketResponse(data);
   }
 
   private async getUserQuickTicket(userId: string): Promise<QuickTicket | null> {
     const ticket = await this.redis.get(`ludo:quick-user:${userId}`).catch(() => null);
-    if (!ticket) return null;
-    const raw = await this.redis.get(`ludo:quick-ticket:${ticket}`).catch(() => null);
-    if (!raw) { await this.redis.del(`ludo:quick-user:${userId}`).catch(() => undefined); return null; }
-    return JSON.parse(raw) as QuickTicket;
+    if (ticket) {
+      const raw = await this.redis.get(`ludo:quick-ticket:${ticket}`).catch(() => null);
+      if (raw) return JSON.parse(raw) as QuickTicket;
+    }
+    for (const data of this.localTickets.values()) if (data.userId === userId && data.status !== 'CANCELLED') return data;
+    return null;
   }
 
   private async writeTicket(ticket: QuickTicket) {
     const ttl = ticket.status === 'WAITING' ? 900 : 3600;
-    await this.redis.set(`ludo:quick-ticket:${ticket.ticket}`, JSON.stringify(ticket), 'EX', ttl);
+    this.localTickets.set(ticket.ticket, ticket);
+    try { await this.redis.set(`ludo:quick-ticket:${ticket.ticket}`, JSON.stringify(ticket), 'EX', ttl); } catch {}
   }
 
   private ticketResponse(ticket: QuickTicket) {
@@ -393,37 +415,48 @@ export class LudoService implements OnModuleDestroy {
     if (room.players.some(p => p.userId === toUserId)) throw new BadRequestException('Player is already in the room');
     if (room.players.length >= room.playerCount) throw new BadRequestException('Room is full');
     const invite: LudoInvite = { id: uuid(), matchId, roomCode: room.roomCode, fromUserId, toUserId, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() };
-    await this.redis.set(`ludo:invite:${invite.id}`, JSON.stringify(invite), 'EX', 600);
-    await this.redis.sadd(`ludo:invites:${toUserId}`, invite.id);
-    await this.redis.expire(`ludo:invites:${toUserId}`, 600);
+    this.localInvites.set(invite.id, invite);
+    const ids = this.localInviteIds.get(toUserId) ?? new Set<string>(); ids.add(invite.id); this.localInviteIds.set(toUserId, ids);
+    try {
+      await this.redis.set(`ludo:invite:${invite.id}`, JSON.stringify(invite), 'EX', 600);
+      await this.redis.sadd(`ludo:invites:${toUserId}`, invite.id);
+      await this.redis.expire(`ludo:invites:${toUserId}`, 600);
+    } catch {}
     return invite;
   }
 
   async acceptInvite(userId: string, inviteId: string, displayName: string, countryCode = 'NG') {
-    const raw = await this.redis.get(`ludo:invite:${inviteId}`);
-    if (!raw) throw new NotFoundException('Ludo invitation expired');
-    const invite = JSON.parse(raw) as LudoInvite;
+    const raw = await this.redis.get(`ludo:invite:${inviteId}`).catch(() => null);
+    const invite = raw ? JSON.parse(raw) as LudoInvite : this.localInvites.get(inviteId);
+    if (!invite) throw new NotFoundException('Ludo invitation expired');
     if (invite.toUserId !== userId) throw new BadRequestException('Invitation does not belong to you');
     const result = await this.joinRoom(userId, displayName, invite.roomCode, countryCode);
-    await this.redis.del(`ludo:invite:${inviteId}`);
-    await this.redis.srem(`ludo:invites:${userId}`, inviteId);
+    this.localInvites.delete(inviteId); this.localInviteIds.get(userId)?.delete(inviteId);
+    await this.redis.del(`ludo:invite:${inviteId}`).catch(() => undefined);
+    await this.redis.srem(`ludo:invites:${userId}`, inviteId).catch(() => undefined);
     return { ...result, inviteId };
   }
 
   async declineInvite(userId: string, inviteId: string) {
-    const raw = await this.redis.get(`ludo:invite:${inviteId}`);
-    if (!raw) return { ok: true };
-    const invite = JSON.parse(raw) as LudoInvite;
+    const raw = await this.redis.get(`ludo:invite:${inviteId}`).catch(() => null);
+    const invite = raw ? JSON.parse(raw) as LudoInvite : this.localInvites.get(inviteId);
+    if (!invite) return { ok: true };
     if (invite.toUserId !== userId) throw new BadRequestException('Invitation does not belong to you');
-    await this.redis.del(`ludo:invite:${inviteId}`);
-    await this.redis.srem(`ludo:invites:${userId}`, inviteId);
+    this.localInvites.delete(inviteId); this.localInviteIds.get(userId)?.delete(inviteId);
+    await this.redis.del(`ludo:invite:${inviteId}`).catch(() => undefined);
+    await this.redis.srem(`ludo:invites:${userId}`, inviteId).catch(() => undefined);
     return { ok: true };
   }
 
   async listInvites(userId: string) {
-    const ids = await this.redis.smembers(`ludo:invites:${userId}`).catch(() => [] as string[]);
+    const ids = new Set(await this.redis.smembers(`ludo:invites:${userId}`).catch(() => [] as string[]));
+    for (const id of (this.localInviteIds.get(userId) ?? new Set<string>())) ids.add(id);
     const invites: LudoInvite[] = [];
-    for (const id of ids) { const raw = await this.redis.get(`ludo:invite:${id}`).catch(() => null); if (raw) invites.push(JSON.parse(raw)); else await this.redis.srem(`ludo:invites:${userId}`, id).catch(() => undefined); }
+    for (const id of ids) {
+      const raw = await this.redis.get(`ludo:invite:${id}`).catch(() => null);
+      const invite = raw ? JSON.parse(raw) as LudoInvite : this.localInvites.get(id);
+      if (invite) invites.push(invite);
+    }
     return invites;
   }
 
