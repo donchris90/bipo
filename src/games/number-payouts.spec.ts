@@ -72,3 +72,55 @@ describe('SettlementService — per-number payouts', () => {
     expect(wallet.credit).toHaveBeenCalledTimes(1); // only the winner
   });
 });
+
+describe('SettlementService — Lucky Number formula payouts', () => {
+  function luckyBuild(resultSum: number) {
+    const round = { id: 'r1', gameCode: 'SUM_DICE', status: 'LOCKED', selectionCount: null };
+    const selection = { numbers: [resultSum], stakes: { [String(resultSum)]: 2 } };
+    const entries = [{ id: 'e1', userId: 'u1', coinAmount: 2, selection, bonusAmount: 0, autoCashoutMultiplier: null }];
+    const prisma: any = {
+      gameRound: {
+        findUnique: jest.fn().mockResolvedValue(round),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUniqueOrThrow: jest.fn(),
+        update: jest.fn(async ({ data }: any) => ({ ...round, ...data })),
+      },
+      gameDefinition: { findUnique: jest.fn().mockResolvedValue({ code: 'SUM_DICE', rulesJson: { rtp: 0.95, basePrize: 1000, diceCount: 3, diceSides: 10 } }) },
+      gameEntry: {
+        findMany: jest.fn().mockResolvedValue(entries),
+        update: jest.fn(async ({ data }: any) => data),
+      },
+      $transaction: jest.fn((cb: any) => cb(prisma)),
+    };
+    // Equal die values make the sum deterministic for the values used below.
+    const perDie = resultSum / 3;
+    const rng: any = { randomInRange: jest.fn(() => perDie) };
+    const wallet: any = { credit: jest.fn().mockResolvedValue(undefined) };
+    return { svc: new SettlementService(prisma, wallet, rng), prisma, wallet };
+  }
+
+  it('uses the configured per-number stake and computed multiplier, not a flat multiplier', async () => {
+    const { svc, prisma } = luckyBuild(0);
+    await svc.settle('r1');
+    const update = prisma.gameEntry.update.mock.calls.find((c: any) => c[0].where.id === 'e1')[0].data;
+    expect(update).toMatchObject({ status: 'WON', rewardAmount: 1900, netAmount: 1898 });
+  });
+
+  it('a losing Lucky Number bet pays zero and stores the negative net', async () => {
+    const { svc, prisma } = luckyBuild(0);
+    const entry = { id: 'e1', userId: 'u1', coinAmount: 10, selection: { numbers: [27], stakes: { '27': 10 } }, bonusAmount: 0, autoCashoutMultiplier: null };
+    prisma.gameEntry.findMany.mockResolvedValue([entry]);
+    await svc.settle('r1');
+    const update = prisma.gameEntry.update.mock.calls.find((c: any) => c[0].where.id === 'e1')[0].data;
+    expect(update).toMatchObject({ status: 'LOST', rewardAmount: 0, netAmount: -10 });
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('settlement is idempotent after the round is already SETTLED', async () => {
+    const { svc, prisma, wallet } = luckyBuild(0);
+    prisma.gameRound.findUnique.mockResolvedValue({ id: 'r1', status: 'SETTLED' });
+    await svc.settle('r1');
+    expect(wallet.credit).not.toHaveBeenCalled();
+    expect(prisma.gameEntry.findMany).not.toHaveBeenCalled();
+  });
+});

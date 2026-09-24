@@ -9,7 +9,7 @@ export type GameRules = Record<string, number | null>;
 
 const SHARED = ['openSeconds', 'minStake', 'maxStake'] as const;
 const SHAPES = {
-  dice: ['payoutMultiplier', 'diceCount', 'diceSides', 'numberPayouts', ...SHARED],
+  dice: ['payoutMultiplier', 'rtp', 'basePrize', 'stakeWeightExponent', 'diceCount', 'diceSides', 'numberPayouts', ...SHARED],
   crash: ['houseEdge', 'growthRate', ...SHARED],
   lucky: ['payoutMultiplier', ...SHARED],
   ludo: ['minEntry', 'maxEntry', 'turnSeconds', 'reconnectSeconds', 'prizeFirstPercent', 'prizeSecondPercent'],
@@ -64,42 +64,48 @@ export function validateGameRules(existing: any, incoming: any): GameRules {
     // dice themselves can't be changed from here — only how the game pays.
     if (existing?.diceCount && incoming.diceCount !== existing.diceCount) errors.push('diceCount cannot be changed');
     if (existing?.diceSides && incoming.diceSides !== existing.diceSides) errors.push('diceSides cannot be changed');
-    if (!isNum(incoming.payoutMultiplier) || incoming.payoutMultiplier < 1.01 || incoming.payoutMultiplier > 1000) {
-      errors.push('payoutMultiplier must be a number from 1.01 to 1000');
-    } else if (!errors.length) {
-      // Guard rail: backing the single likeliest number must not have a
-      // positive expected return, or players beat the house on average.
-      const best = maxSumProbability(incoming.diceCount, incoming.diceSides);
-      if (incoming.payoutMultiplier * best >= 1) {
-        const limit = Math.floor((1 / best) * 100) / 100;
-        errors.push(`payoutMultiplier is too high: at ${incoming.payoutMultiplier}x players would win money on average. It must be below ${limit}x`);
+    const isLuckyNumber = incoming.rtp !== undefined || incoming.basePrize !== undefined || (existing?.rtp !== undefined) || (existing?.basePrize !== undefined);
+    if (isLuckyNumber) {
+      if (!isNum(incoming.rtp) || incoming.rtp <= 0 || incoming.rtp > 1) errors.push('rtp must be greater than 0 and at most 1');
+      if (!isInt(incoming.basePrize, 1, 1_000_000_000)) errors.push('basePrize must be a whole number from 1 to 1000000000');
+      if (!isNum(incoming.stakeWeightExponent) || incoming.stakeWeightExponent < 1 || incoming.stakeWeightExponent > 3) errors.push('stakeWeightExponent must be from 1 to 3');
+      if (incoming.diceCount !== 3 || incoming.diceSides !== 10) errors.push('Lucky Number requires exactly 3 dice with 10 sides (0-9)');
+      out.rtp = incoming.rtp;
+      out.basePrize = incoming.basePrize;
+      out.stakeWeightExponent = incoming.stakeWeightExponent;
+    } else {
+      if (!isNum(incoming.payoutMultiplier) || incoming.payoutMultiplier < 1.01 || incoming.payoutMultiplier > 1000) {
+        errors.push('payoutMultiplier must be a number from 1.01 to 1000');
+      } else if (!errors.length) {
+        const best = maxSumProbability(incoming.diceCount, incoming.diceSides);
+        if (incoming.payoutMultiplier * best >= 1) {
+          const limit = Math.floor((1 / best) * 100) / 100;
+          errors.push(`payoutMultiplier is too high: at ${incoming.payoutMultiplier}x players would win money on average. It must be below ${limit}x`);
+        }
       }
+      out.payoutMultiplier = incoming.payoutMultiplier;
     }
-    out.payoutMultiplier = incoming.payoutMultiplier;
     out.diceCount = incoming.diceCount;
     out.diceSides = incoming.diceSides;
     if (incoming.numberPayouts !== undefined) {
       if (!incoming.numberPayouts || typeof incoming.numberPayouts !== 'object' || Array.isArray(incoming.numberPayouts)) {
-        errors.push('numberPayouts must be an object mapping each winning number to its payout value');
+        errors.push('numberPayouts must be an object mapping each winning number to a coin payout');
       } else if (!errors.length) {
         const max = incoming.diceCount * (incoming.diceSides - 1);
         const clean: Record<string, number> = {};
-        // Per-number payout values are operator-defined and independent of
-        // the mathematical probability of the number. Partial overrides are
-        // valid; an unset number keeps the shared payoutMultiplier.
-        for (const [key, raw] of Object.entries(incoming.numberPayouts)) {
-          const n = Number(key);
-          if (!/^\d+$/.test(key) || !Number.isInteger(n) || n < 0 || n > max) {
+        for (const [key, value] of Object.entries(incoming.numberPayouts as Record<string, unknown>)) {
+          if (!/^\d+$/.test(key) || Number(key) < 0 || Number(key) > max) {
             errors.push(`numberPayouts may only contain numbers 0-${max}`);
             continue;
           }
+          const raw = value;
           if (!isNum(raw) || raw < 0 || raw > 1000) {
-            errors.push(`numberPayouts[${n}] must be a number from 0 to 1000`);
+            errors.push(`numberPayouts[${key}] must be a number from 0 to 1000`);
             continue;
           }
           clean[key] = raw;
         }
-        if (!errors.length && Object.keys(clean).length) out.numberPayouts = clean as any;
+        if (!errors.length) out.numberPayouts = clean as any;
       }
     }
   } else if (shape === 'crash') {

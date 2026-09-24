@@ -741,6 +741,7 @@ model GameEntry {
   // spendable or withdrawable coins by being played.
   bonusAmount           Int             @default(0)
   rewardAmount          Int             @default(0)
+  netAmount             Int             @default(0)
   status                GameEntryStatus @default(PLACED)
   autoCashoutMultiplier Float?
   cashedOutMultiplier   Float?

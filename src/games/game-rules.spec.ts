@@ -70,3 +70,20 @@ describe('validateGameRules — shared limits and safety', () => {
     expect(sameRules({ a: 1 }, { a: 2 })).toBe(false);
   });
 });
+
+describe('validateGameRules — Lucky Number 3-digit formula mode', () => {
+  const lucky = { rtp: 0.95, basePrize: 1000, diceCount: 3, diceSides: 10 };
+
+  it('accepts RTP/base-prize config without a payout multiplier', () => {
+    expect(validateGameRules(lucky, { ...lucky, openSeconds: 30, minStake: 1, maxStake: 1000000 })).toMatchObject({ rtp: 0.95, basePrize: 1000, diceCount: 3, diceSides: 10 });
+  });
+
+  it('does not apply the old probability-vs-payout validation to Lucky Number', () => {
+    expect(() => validateGameRules(lucky, { ...lucky, rtp: 0.95, basePrize: 1000 })).not.toThrow();
+  });
+
+  it('rejects RTP outside 0..1 and non-whole base prizes', () => {
+    expect(() => validateGameRules(lucky, { ...lucky, rtp: 1.01 })).toThrow(/rtp/);
+    expect(() => validateGameRules(lucky, { ...lucky, basePrize: 100.5 })).toThrow(/basePrize/);
+  });
+});

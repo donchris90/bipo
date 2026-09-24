@@ -248,7 +248,7 @@ export class RoundSchedulerService implements OnModuleInit, OnModuleDestroy {
         }
         return;
       }
-      const openSeconds = gameCode === 'SUM_DICE' ? 30 : (rules.openSeconds ?? RoundSchedulerService.DEFAULT_OPEN_SECONDS[gameCode] ?? 15);
+      const openSeconds = rules.openSeconds ?? RoundSchedulerService.DEFAULT_OPEN_SECONDS[gameCode] ?? 15;
       const entryPrice = rules.minStake ?? RoundSchedulerService.DEFAULT_ENTRY_PRICE[gameCode] ?? 10;
       const openAt = new Date();
       const lockAt = new Date(openAt.getTime() + openSeconds * 1000);
