@@ -10,6 +10,7 @@ import { fetchChatHistory } from '../common/chat-history';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { NotificationsService } from '../notifications/notifications.service';
 import { assertNotBlocked } from '../common/blocks';
+import { publicName } from '../common/public-name';
 
 @Injectable()
 export class RoomsService {
@@ -138,7 +139,7 @@ export class RoomsService {
       seats: seats.map((s) => ({
         seatNumber: s.seatNumber,
         userId: s.userId,
-        displayName: userById.get(s.userId)?.displayName ?? null,
+        displayName: publicName(userById.get(s.userId)?.displayName, s.userId),
         avatarUrl: userById.get(s.userId)?.avatarUrl ?? null,
         joinedAt: s.joinedAt,
         locked: lockedNumbers.has(s.seatNumber),
@@ -408,7 +409,21 @@ export class RoomsService {
     const existingInvite = await this.prisma.seatRequest.findFirst({
       where: { roomId, userId: targetUserId, status: 'PENDING', invitedByHost: true },
     });
-    if (existingInvite) return existingInvite;
+    if (existingInvite) {
+      // The host tapped Invite again: the first notification may have been missed
+      // (app in the background, socket down), so send it again, at most every 15 s.
+      if (Date.now() - new Date(existingInvite.createdAt).getTime() > 15_000) {
+        const host = await this.prisma.user.findUnique({ where: { id: actorId }, select: { displayName: true } });
+        await this.notifications.notify(targetUserId, 'SYSTEM', {
+          event: 'PARTY_INVITE',
+          roomId,
+          roomTitle: room.title,
+          hostDisplayName: publicName(host?.displayName, actorId),
+          requestId: existingInvite.id,
+        });
+      }
+      return existingInvite;
+    }
 
     // An ordinary queue request and a host invitation are intentionally
     // separate. The host may invite someone who is already waiting; the
@@ -421,7 +436,7 @@ export class RoomsService {
       event: 'PARTY_INVITE',
       roomId,
       roomTitle: room.title,
-      hostDisplayName: host?.displayName ?? 'Host',
+      hostDisplayName: publicName(host?.displayName, actorId),
       requestId: invite.id,
     });
     return invite;
@@ -506,7 +521,7 @@ export class RoomsService {
     return requests.map((r) => ({
       id: r.id,
       userId: r.userId,
-      displayName: userById.get(r.userId)?.displayName ?? null,
+      displayName: publicName(userById.get(r.userId)?.displayName, r.userId),
       createdAt: r.createdAt,
       invited: r.invitedByHost,
       acceptedInvite: r.status === 'ACCEPTED',
@@ -820,8 +835,23 @@ export class RoomsService {
     targetUserId?: string,
     extra: Record<string, unknown> = {},
   ) {
+    void this.broadcastRoomState(roomId, action, targetUserId, extra);
+  }
+
+  // Seat events carry the person's name so every client can write "Ada took a seat"
+  // straight away. Clients used to look the joiner up in the seat list from before the
+  // event, where they are not yet listed, and printed "Guest".
+  private static readonly NAMED_ACTIONS = new Set(['SEAT_JOINED', 'SEAT_APPROVED', 'SEAT_REQUESTED', 'SEAT_LEFT']);
+  private async broadcastRoomState(roomId: string, action: string, targetUserId: string | undefined, extra: Record<string, unknown>) {
     try {
-      this.realtime.broadcastRoomState(roomId, { roomId, action, targetUserId, ...extra });
+      let payload: Record<string, unknown> = { ...extra };
+      if (targetUserId && payload.displayName === undefined && RoomsService.NAMED_ACTIONS.has(action)) {
+        try {
+          const user = await this.prisma.user.findUnique({ where: { id: targetUserId }, select: { displayName: true } });
+          payload = { ...payload, displayName: publicName(user?.displayName, targetUserId) };
+        } catch { /* the event still goes out; the app falls back to a profile lookup */ }
+      }
+      this.realtime.broadcastRoomState(roomId, { roomId, action, targetUserId, ...payload });
     } catch {
       /* REST polling remains the recovery path if realtime is unavailable. */
     }
