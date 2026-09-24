@@ -131,6 +131,19 @@ async function main() {
     },
   });
 
+  // Ludo is a persistent real-time paid match. It is disabled by default
+  // until the operator enables the game and its country region.
+  await prisma.gameDefinition.upsert({
+    where: { code: 'LUDO' },
+    update: {},
+    create: {
+      code: 'LUDO',
+      name: 'Ludo',
+      status: 'DISABLED',
+      rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 20, reconnectSeconds: 120, prizeFirstPercent: 70, prizeSecondPercent: 30 },
+    },
+  });
+
   // Crash (spec §44-46). growthRate is tuned so the multiplier reaches
   // 2.00x at ~5 seconds into the live phase — see games/crash-rules.ts.
   // houseEdge of 3% matches the (1-houseEdge)/(1-r) formula's defining

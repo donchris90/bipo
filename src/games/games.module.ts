@@ -11,11 +11,16 @@ import { GamesController, GameOperatorController } from './games.controller';
 import { EconomyModule } from '../economy/economy.module';
 import { RegionalConfigModule } from '../config/regional-config.module';
 import { FeatureFlagsModule } from '../feature-flags/feature-flags.module';
+import { JwtModule } from '@nestjs/jwt';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { LudoService } from './ludo.service';
+import { LudoController } from './ludo.controller';
+import { LudoGateway } from './ludo.gateway';
 
 @Module({
-  imports: [EconomyModule, RegionalConfigModule, FeatureFlagsModule],
-  providers: [RngService, RoundService, EntryService, SettlementService, CrashService, GameAdminService, RoundSchedulerService, GamesReadinessService],
-  controllers: [GamesController, GameOperatorController],
-  exports: [RoundService, SettlementService, CrashService],
+  imports: [EconomyModule, RegionalConfigModule, FeatureFlagsModule, ConfigModule, JwtModule.registerAsync({ imports: [ConfigModule], inject: [ConfigService], useFactory: (config: ConfigService) => ({ secret: config.get<string>('JWT_ACCESS_SECRET') }) })],
+  providers: [RngService, RoundService, EntryService, SettlementService, CrashService, GameAdminService, RoundSchedulerService, GamesReadinessService, LudoService, LudoGateway],
+  controllers: [GamesController, GameOperatorController, LudoController],
+  exports: [RoundService, SettlementService, CrashService, LudoService],
 })
 export class GamesModule {}

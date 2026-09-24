@@ -110,7 +110,7 @@ export class RoundSchedulerService implements OnModuleInit, OnModuleDestroy {
       this.lastNoActiveWarn = Date.now();
       this.logger.warn('No game is ACTIVE, so no rounds are being created. Set a game to Active in the admin panel.');
     }
-    await Promise.all(games.map((game) => this.ensureRound(game.code, game.version)));
+    await Promise.all(games.filter((game) => game.code !== 'LUDO').map((game) => this.ensureRound(game.code, game.version)));
   }
 
   // Every game we know about, with just what recovery needs. Cached briefly:
@@ -121,6 +121,7 @@ export class RoundSchedulerService implements OnModuleInit, OnModuleDestroy {
     const defs = await this.prisma.gameDefinition.findMany({ select: { code: true, rulesJson: true } });
     const games = new Map<string, { isCrash: boolean; growthRate: number }>();
     for (const d of defs) {
+      if (d.code === 'LUDO') continue;
       const rules = (d.rulesJson ?? {}) as { houseEdge?: unknown; growthRate?: unknown };
       const isCrash = typeof rules.houseEdge === 'number' && typeof rules.growthRate === 'number';
       games.set(d.code, { isCrash, growthRate: isCrash ? (rules.growthRate as number) : 0 });

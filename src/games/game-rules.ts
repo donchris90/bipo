@@ -12,6 +12,7 @@ const SHAPES = {
   dice: ['payoutMultiplier', 'diceCount', 'diceSides', 'numberPayouts', ...SHARED],
   crash: ['houseEdge', 'growthRate', ...SHARED],
   lucky: ['payoutMultiplier', ...SHARED],
+  ludo: ['minEntry', 'maxEntry', 'turnSeconds', 'reconnectSeconds', 'prizeFirstPercent', 'prizeSecondPercent'],
 } as const;
 
 type Shape = keyof typeof SHAPES;
@@ -21,6 +22,7 @@ export function shapeOf(rules: any): Shape | null {
   if (typeof rules.houseEdge === 'number' && typeof rules.growthRate === 'number') return 'crash';
   if (rules.diceCount && rules.diceSides) return 'dice';
   if (typeof rules.payoutMultiplier === 'number') return 'lucky';
+  if (typeof rules.turnSeconds === 'number' && typeof rules.prizeFirstPercent === 'number') return 'ludo';
   return null;
 }
 
@@ -110,6 +112,14 @@ export function validateGameRules(existing: any, incoming: any): GameRules {
     if (!isNum(incoming.growthRate) || incoming.growthRate < 0.01 || incoming.growthRate > 1) errors.push('growthRate must be a number from 0.01 to 1');
     out.houseEdge = incoming.houseEdge;
     out.growthRate = incoming.growthRate;
+  } else if (shape === 'ludo') {
+    const ints: Array<[string, number, number]> = [['minEntry', 1, 1_000_000_000], ['maxEntry', 1, 1_000_000_000], ['turnSeconds', 5, 120], ['reconnectSeconds', 10, 900]];
+    for (const [key, min, max] of ints) if (!isInt(incoming[key], min, max)) errors.push(`${key} must be a whole number from ${min} to ${max}`);
+    if (isInt(incoming.minEntry, 1, 1_000_000_000) && isInt(incoming.maxEntry, 1, 1_000_000_000) && incoming.maxEntry < incoming.minEntry) errors.push('maxEntry cannot be below minEntry');
+    if (!isNum(incoming.prizeFirstPercent) || incoming.prizeFirstPercent < 0 || incoming.prizeFirstPercent > 100) errors.push('prizeFirstPercent must be from 0 to 100');
+    if (!isNum(incoming.prizeSecondPercent) || incoming.prizeSecondPercent < 0 || incoming.prizeSecondPercent > 100) errors.push('prizeSecondPercent must be from 0 to 100');
+    if (isNum(incoming.prizeFirstPercent) && isNum(incoming.prizeSecondPercent) && Math.abs((incoming.prizeFirstPercent + incoming.prizeSecondPercent) - 100) > 0.001) errors.push('Ludo prize percentages must add up to 100');
+    if (!errors.length) { out.minEntry = incoming.minEntry; out.maxEntry = incoming.maxEntry; out.turnSeconds = incoming.turnSeconds; out.reconnectSeconds = incoming.reconnectSeconds; out.prizeFirstPercent = incoming.prizeFirstPercent; out.prizeSecondPercent = incoming.prizeSecondPercent; }
   } else {
     if (!isNum(incoming.payoutMultiplier) || incoming.payoutMultiplier < 1.01 || incoming.payoutMultiplier > 1000) errors.push('payoutMultiplier must be a number from 1.01 to 1000');
     out.payoutMultiplier = incoming.payoutMultiplier;
