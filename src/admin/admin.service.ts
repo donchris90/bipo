@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { namesMatch } from '../kyc/kyc-rules';
 import { Injectable } from '@nestjs/common';
 import {
@@ -8,8 +9,11 @@ import {
   RoleName,
   UserStatus,
   WithdrawalStatus,
+  WalletType,
+  LedgerEntryType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { WalletService } from '../economy/wallet.service';
 import { clampLimit, parseBefore, parseEnumFilter, userSearchWhere } from './admin-query';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -27,7 +31,7 @@ interface Page {
 // *show*: the lists and counts that had no endpoint. Nothing here mutates.
 @Injectable()
 export class AdminService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(private readonly prisma: PrismaService, private readonly wallets: WalletService) {}
 
   // display names for a set of user ids, in one query
   private async namesFor(ids: (string | null | undefined)[]) {
@@ -123,7 +127,36 @@ export class AdminService {
         roles: { select: { role: true } },
       },
     });
-    return rows.map((u) => ({ ...u, roles: u.roles.map((r) => r.role) }));
+    const coinWallets = rows.length
+      ? await this.prisma.wallet.findMany({ where: { userId: { in: rows.map((u) => u.id) }, type: WalletType.COIN }, select: { userId: true, balance: true } })
+      : [];
+    const balances = new Map(coinWallets.map((w) => [w.userId, w.balance]));
+    return rows.map((u) => ({ ...u, coinBalance: (balances.get(u.id) ?? 0n).toString(), roles: u.roles.map((r) => r.role) }));
+  }
+
+  async grantCoins(userId: string, input: { amount?: unknown; wallet?: unknown; note?: unknown }) {
+    const amount = Number(input.amount);
+    if (!Number.isSafeInteger(amount) || amount < 1 || amount > 10_000_000) {
+      throw new Error('The amount must be a whole number from 1 to 10,000,000');
+    }
+    const walletType = input.wallet === 'BONUS' ? WalletType.BONUS : WalletType.COIN;
+    const note = String(input.note ?? '').trim().slice(0, 200);
+    const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, displayName: true } });
+    if (!user) throw new Error('User not found');
+    const before = await this.wallets.getBalance(user.id, walletType);
+    const entry = await this.wallets.credit({
+      userId: user.id,
+      walletType,
+      amount: BigInt(amount),
+      ledgerType: walletType === WalletType.BONUS ? LedgerEntryType.BONUS : LedgerEntryType.ADJUSTMENT,
+      reference: `admin grant${note ? `: ${note}` : ''}`,
+      idempotencyKey: `admin-grant:${randomUUID()}`,
+    });
+    await this.prisma.auditLog.create({
+      data: { action: 'wallet.admin_grant', targetType: 'user', targetId: user.id, metadata: { amount, wallet: walletType, note: note || null, ledgerEntryId: entry.id, via: 'admin-dashboard' } },
+    });
+    const after = await this.wallets.getBalance(user.id, walletType);
+    return { ok: true, user, walletType, before: before.toString(), after: after.toString(), amount };
   }
 
   async creatorApplications(q: Page & { status?: unknown }) {

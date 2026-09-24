@@ -35,6 +35,12 @@ export class AdminController {
     return this.admin.overview(req.user.roles);
   }
 
+  @Put('users/:id/coins')
+  @Roles(...FINANCE)
+  grantCoins(@Param('id') id: string, @Body() body: Record<string, unknown>) {
+    return this.admin.grantCoins(id, body);
+  }
+
   @Get('users')
   @Roles(...TRUST_SAFETY, RoleName.FINANCE_ADMIN)
   users(@Query() q: Record<string, unknown>) {
