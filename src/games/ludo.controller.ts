@@ -17,6 +17,8 @@ export class LudoController {
   }
   @Post('quick-match') quick(@Req() req: AuthedRequest, @Body() body: { entryFee: number; playerCount?: 2 | 4; displayName?: string }) { return this.ludo.quickMatch(req.user.userId, body.displayName?.trim() || 'Player', body.entryFee, body.playerCount ?? 4, req.user.countryCode || 'NG'); }
   @Get('quick-match/:ticket') quickStatus(@Req() req: AuthedRequest, @Param('ticket') ticket: string) { return this.ludo.quickMatchStatus(req.user.userId, ticket); }
+  @Get('quick-lobby') quickLobby() { return this.ludo.quickMatchLobby(); }
+  @Post('quick-match/:ticket/bots') quickBots(@Req() req: AuthedRequest, @Param('ticket') ticket: string) { return this.ludo.startBotMatch(req.user.userId, ticket, true); }
   @Post('quick-match/:ticket/cancel') quickCancel(@Req() req: AuthedRequest, @Param('ticket') ticket: string) { return this.ludo.cancelQuickMatch(req.user.userId, ticket); }
   @Post('rooms') create(@Req() req: AuthedRequest, @Body() body: { entryFee: number; playerCount?: 2 | 4; displayName?: string }) { return this.ludo.createRoom(req.user.userId, body.displayName?.trim() || 'Player', body.entryFee, body.playerCount ?? 4, req.user.countryCode || 'NG'); }
   @Get('rooms/:roomCode/status') roomStatus(@Req() req: AuthedRequest, @Param('roomCode') roomCode: string) { return this.ludo.roomStatus(req.user.userId, roomCode); }

@@ -7,10 +7,17 @@ import { v4 as uuid } from 'uuid';
 import { ConfigService } from '@nestjs/config';
 import IORedis from 'ioredis';
 import { randomInt } from 'node:crypto';
-import { createLudoState, LudoState, RECONNECT_GRACE_MS, TURN_MS, advanceTurn, applyMove, legalMoves, playerFinished, rollForTurn } from './ludo.rules';
+import { BOT_THINK_MS, createLudoState, LudoState, RECONNECT_GRACE_MS, TURN_MS, advanceTurn, applyMove, legalMoves, pickBotMove, playerFinished, rollForTurn } from './ludo.rules';
 
-interface QueueItem { userId: string; displayName: string; entryFee: number; playerCount: 2 | 4; ticket?: string; }
-interface QuickTicket { ticket: string; userId: string; entryFee: number; playerCount: 2 | 4; status: 'WAITING' | 'STARTED' | 'CANCELLED'; matchId?: string; roomCode?: string; players?: number; state?: LudoState; createdAt: string; }
+// A search whose app has not checked in for this long is treated as abandoned (the app polls every 2 s).
+const STALE_TICKET_MS = 20_000;
+// How long Quick Match looks for other people before filling the seats with bots, unless the
+// game's rulesJson.botFillSeconds says otherwise (0 switches bot matches off).
+const DEFAULT_BOT_FILL_SECONDS = 20;
+const BOT_NAMES = ['Ava', 'Max', 'Zara', 'Leo', 'Nia', 'Kai'];
+
+interface QueueItem { userId: string; displayName: string; entryFee: number; playerCount: 2 | 4; ticket?: string; synthetic?: boolean; }
+interface QuickTicket { ticket: string; userId: string; entryFee: number; playerCount: 2 | 4; status: 'WAITING' | 'STARTED' | 'CANCELLED'; matchId?: string; roomCode?: string; players?: number; state?: LudoState; createdAt: string; lastSeenAt?: number; }
 interface Room { matchId: string; roomCode: string; entryFee: number; playerCount: 2 | 4; players: QueueItem[]; creatorId: string; started: boolean; }
 interface LudoInvite { id: string; matchId: string; roomCode: string; fromUserId: string; toUserId: string; createdAt: string; expiresAt: string; }
 
@@ -43,7 +50,7 @@ export class LudoService implements OnModuleDestroy {
       update: {},
       create: {
         code: 'LUDO', name: 'Ludo', status: 'DISABLED', version: 1,
-        rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 20, reconnectSeconds: 120, prizeFirstPercent: 70, prizeSecondPercent: 30 },
+        rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 20, reconnectSeconds: 120, prizeFirstPercent: 70, prizeSecondPercent: 30, botFillSeconds: DEFAULT_BOT_FILL_SECONDS },
       },
     });
   }
@@ -82,12 +89,13 @@ export class LudoService implements OnModuleDestroy {
       const ticket = uuid();
       const item: QueueItem = { userId, displayName, entryFee, playerCount, ticket };
       const key = this.queueKey(entryFee, playerCount);
-      const queue = await this.readQueue(key);
+      // Searches whose app went away (killed, no signal) must not count as players or fill a room.
+      const queue = await this.pruneStale(await this.readQueue(key));
       const filtered = queue.filter(x => x.userId !== userId);
       filtered.push(item);
-      const waiting: QuickTicket = { ticket, userId, entryFee, playerCount, status: 'WAITING', players: Math.min(filtered.length, playerCount), createdAt: new Date().toISOString() };
+      const waiting: QuickTicket = { ticket, userId, entryFee, playerCount, status: 'WAITING', players: Math.min(filtered.length, playerCount), createdAt: new Date().toISOString(), lastSeenAt: Date.now() };
       await this.writeTicket(waiting);
-      await this.redis.set(`ludo:quick-user:${userId}`, ticket, 'EX', 900);
+      await this.redis.set(`ludo:quick-user:${userId}`, ticket, 'EX', 900).catch(() => undefined); // Redis being down must not stop Quick Match
       if (filtered.length < playerCount) {
         await this.writeQueue(key, filtered);
         return this.ticketResponse(waiting);
@@ -100,7 +108,7 @@ export class LudoService implements OnModuleDestroy {
         if (!player.ticket) continue;
         const t: QuickTicket = { ticket: player.ticket, userId: player.userId, entryFee, playerCount, status: 'STARTED', matchId: started.matchId, roomCode: started.roomCode, players: playerCount, state: started.state, createdAt: waiting.createdAt };
         await this.writeTicket(t);
-        await this.redis.set(`ludo:quick-user:${player.userId}`, player.ticket, 'EX', 3600);
+        await this.redis.set(`ludo:quick-user:${player.userId}`, player.ticket, 'EX', 3600).catch(() => undefined);
       }
       return result;
     } finally {
@@ -117,7 +125,125 @@ export class LudoService implements OnModuleDestroy {
     const data = raw ? JSON.parse(raw) as QuickTicket : this.localTickets.get(ticket);
     if (!data) throw new NotFoundException('Quick Match ticket expired');
     if (data.userId !== userId) throw new BadRequestException('Invalid Quick Match ticket');
+    if (data.status === 'WAITING') {
+      // Polling doubles as "I am still here". Nobody found after the wait? Fill the seats with bots.
+      data.lastSeenAt = Date.now();
+      // "2/4 players found" reflects the people searching right now, not the count at the time this search began.
+      const searching = (await this.readQueue(this.queueKey(data.entryFee, data.playerCount))).length;
+      data.players = Math.max(1, Math.min(searching, data.playerCount));
+      await this.writeTicket(data);
+      return this.startBotMatch(userId, ticket, false);
+    }
     return this.ticketResponse(data);
+  }
+
+  private async readTicket(ticket: string): Promise<QuickTicket | undefined> {
+    const raw = await this.redis.get(`ludo:quick-ticket:${ticket}`).catch(() => null);
+    return raw ? JSON.parse(raw) as QuickTicket : this.localTickets.get(ticket);
+  }
+
+  private async botFillSeconds(): Promise<number> {
+    const game = await this.prisma.gameDefinition.findUnique({ where: { code: 'LUDO' }, select: { rulesJson: true } });
+    const value = Number(((game?.rulesJson ?? {}) as any).botFillSeconds ?? DEFAULT_BOT_FILL_SECONDS);
+    return Number.isFinite(value) && value >= 0 ? value : DEFAULT_BOT_FILL_SECONDS;
+  }
+
+  // Drops searches that are gone, cancelled, already started or abandoned.
+  private async pruneStale(queue: QueueItem[]): Promise<QueueItem[]> {
+    const now = Date.now();
+    const keep: QueueItem[] = [];
+    for (const item of queue) {
+      if (!item.ticket) { keep.push(item); continue; }
+      const t = await this.readTicket(item.ticket);
+      if (!t || t.status !== 'WAITING') continue;
+      if (now - (t.lastSeenAt ?? Date.parse(t.createdAt)) > STALE_TICKET_MS) {
+        t.status = 'CANCELLED';
+        await this.writeTicket(t);
+        continue;
+      }
+      keep.push(item);
+    }
+    return keep;
+  }
+
+  private async withQuickLock<T>(key: string, fn: () => Promise<T>): Promise<T | null> {
+    const lockKey = `ludo:quick-lock:${key}`;
+    const token = uuid();
+    let redisLock = false;
+    let localLock = false;
+    try {
+      const locked = await this.redis.set(lockKey, token, 'PX', 4000, 'NX');
+      if (!locked) return null;
+      redisLock = true;
+    } catch {
+      if (this.localQuickLocks.has(lockKey)) return null;
+      this.localQuickLocks.add(lockKey);
+      localLock = true;
+    }
+    try {
+      return await fn();
+    } finally {
+      if (redisLock && (await this.redis.get(lockKey).catch(() => null)) === token) await this.redis.del(lockKey).catch(() => undefined);
+      if (localLock) this.localQuickLocks.delete(lockKey);
+    }
+  }
+
+  /**
+   * Starts a PRACTICE match: the people currently searching at these settings plus bots for the
+   * empty seats. No coins are taken and no prize is paid (bots have no wallet, and a bot that
+   * plays a fixed rule set must never be a source of coins). `force` is the "play with bots now"
+   * button; otherwise it only happens once the wait is over.
+   */
+  async startBotMatch(userId: string, ticketId: string, force = false) {
+    const data = await this.readTicket(ticketId);
+    if (!data) throw new NotFoundException('Quick Match ticket expired');
+    if (data.userId !== userId) throw new BadRequestException('Invalid Quick Match ticket');
+    if (data.status !== 'WAITING') return this.ticketResponse(data);
+    const waitSeconds = await this.botFillSeconds();
+    if (waitSeconds <= 0) {
+      if (force) throw new BadRequestException('Bot matches are switched off');
+      return this.ticketResponse(data);
+    }
+    if (!force && Date.now() - Date.parse(data.createdAt) < waitSeconds * 1000) return this.ticketResponse(data);
+
+    const key = this.queueKey(data.entryFee, data.playerCount);
+    const result = await this.withQuickLock(key, async () => {
+      const current = await this.readTicket(ticketId);
+      if (!current || current.status !== 'WAITING') return current ? this.ticketResponse(current) : null;
+      const queue = await this.pruneStale(await this.readQueue(key));
+      const humans = queue.filter(x => x.ticket).slice(0, data.playerCount);
+      if (!humans.some(h => h.userId === userId)) return this.ticketResponse(current); // matched or removed in the meantime
+      await this.writeQueue(key, queue.filter(x => !humans.includes(x)));
+      const bots: QueueItem[] = Array.from({ length: data.playerCount - humans.length }, (_, i) => ({
+        userId: `bot:${uuid()}`, displayName: `${BOT_NAMES[(i + Math.floor(Math.random() * BOT_NAMES.length)) % BOT_NAMES.length]} (bot)`,
+        entryFee: 0, playerCount: data.playerCount, synthetic: true,
+      }));
+      const started = await this.startMatch([...humans, ...bots], undefined, { practice: true });
+      let mine: QuickTicket = current;
+      for (const human of humans) {
+        const t = (human.userId === userId ? current : await this.readTicket(human.ticket!)) ?? current;
+        const done: QuickTicket = { ...t, status: 'STARTED', matchId: started.matchId, roomCode: started.roomCode, players: data.playerCount, state: started.state };
+        await this.writeTicket(done);
+        if (human.userId === userId) mine = done;
+      }
+      return this.ticketResponse(mine);
+    });
+    return result ?? this.ticketResponse(data); // lock busy: still waiting, the next check retries
+  }
+
+  // How many people are searching right now, per entry amount and size. Lets the lobby show
+  // where a match will start immediately.
+  async quickMatchLobby() {
+    const keys = new Set<string>(this.queues.keys());
+    try { for (const k of await this.redis.keys('ludo:queue:*')) keys.add(k.replace('ludo:queue:', '')); } catch { /* local queues only */ }
+    const rows: Array<{ entryFee: number; playerCount: number; waiting: number }> = [];
+    for (const key of keys) {
+      const [fee, count] = key.split(':').map(Number);
+      if (!Number.isFinite(fee) || !Number.isFinite(count)) continue;
+      const waiting = (await this.pruneStale(await this.readQueue(key))).length;
+      if (waiting > 0) rows.push({ entryFee: fee, playerCount: count, waiting });
+    }
+    return rows;
   }
 
   async cancelQuickMatch(userId: string, ticket: string) {
@@ -203,12 +329,13 @@ export class LudoService implements OnModuleDestroy {
     return this.startMatch(room.players, room);
   }
 
-  private async startMatch(players: QueueItem[], room?: Room) {
+  private async startMatch(players: QueueItem[], room?: Room, opts: { practice?: boolean } = {}) {
+    const practice = opts.practice === true;
     const matchId = room?.matchId ?? uuid();
     const roomCode = room?.roomCode ?? this.makeRoomCode();
-    const entryFee = players[0].entryFee;
+    const entryFee = practice ? 0 : players[0].entryFee;
     const playerCount = players.length as 2 | 4;
-    const totalPool = entryFee * playerCount;
+    const totalPool = entryFee * playerCount; // practice: 0
     const game = await this.prisma.gameDefinition.findUnique({ where: { code: 'LUDO' }, select: { rulesJson: true } });
     const rules = (game?.rulesJson ?? {}) as any;
     const firstPct = Number(rules.prizeFirstPercent ?? 70);
@@ -219,7 +346,7 @@ export class LudoService implements OnModuleDestroy {
     // Debit all entries atomically with their durable GameEntry records.
     const round = await this.prisma.$transaction(async tx => {
       const created = await tx.gameRound.create({ data: { id: matchId, gameCode: 'LUDO', rulesVersion: 1, entryPrice: entryFee, openAt: now, lockAt: new Date(now.getTime() + 10_000), status: 'OPEN', hiddenState: {} as any } });
-      for (const p of players) {
+      for (const p of practice ? [] : players) {
         await this.wallet.debit({ userId: p.userId, walletType: WalletType.COIN, amount: BigInt(entryFee), ledgerType: LedgerEntryType.GAME_ENTRY, reference: created.id, idempotencyKey: `ludo_entry:${created.id}:${p.userId}` }, tx);
         await tx.gameEntry.create({ data: { roundId: created.id, userId: p.userId, selection: { roomCode }, coinAmount: entryFee, idempotencyKey: `ludo_entry_record:${created.id}:${p.userId}` } });
       }
@@ -227,7 +354,7 @@ export class LudoService implements OnModuleDestroy {
     });
 
     const turnSeconds = Math.max(5, Number(rules.turnSeconds ?? TURN_MS / 1000));
-    const state = createLudoState({ matchId, roomCode, entryFee, playerCount, players, prizeFirst, prizeSecond, turnSeconds });
+    const state = createLudoState({ matchId, roomCode, entryFee, playerCount, players, prizeFirst, prizeSecond, turnSeconds, practice });
     this.states.set(matchId, state);
     await this.persistState(state);
     await this.redis.del(this.roomKey(roomCode)).catch(() => undefined);
@@ -319,9 +446,14 @@ export class LudoService implements OnModuleDestroy {
 
   async tick(matchId: string) {
     const state = await this.requireState(matchId);
-    if (state.status !== 'ACTIVE' || Date.now() < Date.parse(state.turnExpiresAt)) return this.publicState(state);
+    if (state.status !== 'ACTIVE') return this.publicState(state);
     const player = state.players[state.currentSeat];
     if (!player) return this.publicState(state);
+    // A bot seat plays after a short think; anyone else only once their turn timer has run out.
+    const due = player.synthetic
+      ? Date.now() >= Date.parse(state.turnStartedAt) + BOT_THINK_MS
+      : Date.now() >= Date.parse(state.turnExpiresAt);
+    if (!due) return this.publicState(state);
     // A timed-out turn is always resolved by the same server-side bot rules. If the player had already rolled
     // but did not pick a token, the bot plays that roll instead of rolling again.
     let dice: number;
@@ -338,7 +470,7 @@ export class LudoService implements OnModuleDestroy {
       player.consecutiveSixes = 0;
       advanceTurn(state, player.seat, false);
     } else {
-      const tokenIndex = moves[0];
+      const tokenIndex = pickBotMove(state, player.seat, dice, moves);
       applyMove(state, player.seat, tokenIndex, dice);
       if (playerFinished(player)) {
         player.finishedAt = new Date().toISOString();
@@ -357,6 +489,11 @@ export class LudoService implements OnModuleDestroy {
     state.status = 'FINISHED';
     const round = await this.prisma.gameRound.findUnique({ where: { id: state.matchId } });
     if (!round || round.status === 'SETTLED') return;
+    if (state.practice) {
+      // Nothing was staked, so there is nothing to pay. Just close the match.
+      await this.prisma.gameRound.update({ where: { id: state.matchId }, data: { status: 'SETTLED', result: { winnerUserId: state.winnerUserId, practice: true } as any, settledAt: new Date(), hiddenState: state as any } });
+      return;
+    }
     const payouts = new Map<string, number>();
     if (state.winnerUserId) payouts.set(state.winnerUserId, state.prizeFirst);
     if (state.secondPlaceUserId) payouts.set(state.secondPlaceUserId, state.prizeSecond);

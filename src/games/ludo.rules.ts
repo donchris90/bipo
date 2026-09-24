@@ -14,6 +14,8 @@ export interface LudoPlayerState {
   tokens: LudoToken[];
   consecutiveSixes: number;
   finishedAt?: string;
+  /** A server-controlled bot seat (filled in by Quick Match when nobody else is found). */
+  synthetic?: boolean;
 }
 /** The most recent dice roll. Unlike `lastRoll` it survives the turn passing, so every client can show what was rolled. */
 export interface LudoLastDice {
@@ -34,6 +36,8 @@ export interface LudoState {
   prizeFirst: number;
   prizeSecond: number;
   status: LudoStatus;
+  /** Practice match against bots: no entry fee, no prize. */
+  practice?: boolean;
   currentSeat: number;
   turnNumber: number;
   turnStartedAt: string;
@@ -48,6 +52,9 @@ export interface LudoState {
 }
 
 export const COLORS: LudoPlayerColor[] = ['RED', 'GREEN', 'YELLOW', 'BLUE'];
+// Two players sit in OPPOSITE corners (RED and YELLOW), not side by side.
+export const COLORS_2P: LudoPlayerColor[] = ['RED', 'YELLOW'];
+export const BOT_THINK_MS = 1100;
 export const TURN_MS = 20_000;
 export const RECONNECT_GRACE_MS = 120_000;
 
@@ -73,10 +80,11 @@ export function createLudoState(params: {
   roomCode: string;
   entryFee: number;
   playerCount: 2 | 4;
-  players: Array<{ userId: string; displayName: string }>;
+  players: Array<{ userId: string; displayName: string; synthetic?: boolean }>;
   prizeFirst: number;
   prizeSecond: number;
   turnSeconds?: number;
+  practice?: boolean;
 }): LudoState {
   const now = Date.now();
   const turnSeconds = params.turnSeconds ?? TURN_MS / 1000;
@@ -88,6 +96,7 @@ export function createLudoState(params: {
     prizeFirst: params.prizeFirst,
     prizeSecond: params.prizeSecond,
     status: 'ACTIVE',
+    practice: params.practice === true,
     currentSeat: 0,
     turnNumber: 1,
     turnStartedAt: new Date(now).toISOString(),
@@ -99,10 +108,11 @@ export function createLudoState(params: {
     players: params.players.map((p, seat) => ({
       userId: p.userId,
       displayName: p.displayName,
-      color: COLORS[seat],
+      color: (params.playerCount === 2 ? COLORS_2P : COLORS)[seat],
       seat,
       connected: true,
       bot: false,
+      ...(p.synthetic ? { synthetic: true } : {}),
       tokens: [{ progress: -1 }, { progress: -1 }, { progress: -1 }, { progress: -1 }],
       consecutiveSixes: 0,
     })),
@@ -112,6 +122,11 @@ export function createLudoState(params: {
 export function globalTrackIndex(seat: number, progress: number): number | null {
   if (progress < 0 || progress > TRACK_LAST) return null;
   return (START_OFFSETS[seat] + progress) % 52;
+}
+
+/** Ring square of a token, from the player's COLOUR (where its start square is), or null off the ring. */
+export function trackIndexFor(player: Pick<LudoPlayerState, 'color'>, progress: number): number | null {
+  return globalTrackIndex(COLORS.indexOf(player.color), progress);
 }
 
 export function isSafeTrack(index: number): boolean { return SAFE_TRACK.has(index); }
@@ -137,12 +152,12 @@ export function applyMove(state: LudoState, seat: number, tokenIndex: number, di
   token.progress = to;
 
   let capturedUserId: string | undefined;
-  const landing = globalTrackIndex(seat, to);
+  const landing = trackIndexFor(player, to);
   if (landing !== null && !isSafeTrack(landing)) {
     for (const opponent of state.players) {
       if (opponent.seat === seat) continue;
       for (const other of opponent.tokens) {
-        if (globalTrackIndex(opponent.seat, other.progress) === landing) {
+        if (trackIndexFor(opponent, other.progress) === landing) {
           other.progress = -1;
           capturedUserId = opponent.userId;
         }
@@ -190,4 +205,32 @@ export function rollForTurn(state: LudoState, seat: number, rng?: number): { dic
   const moves = threeSixPenalty ? [] : legalMoves(state, seat, dice);
   state.lastDice = { seat, value: dice, seq: (state.lastDice?.seq ?? 0) + 1, noMove: moves.length === 0, penalty: threeSixPenalty };
   return { dice, threeSixPenalty, legalMoves: moves };
+}
+
+/** Would moving this token capture an opponent? */
+function capturesOpponent(state: LudoState, seat: number, to: number): boolean {
+  const player = state.players[seat];
+  const landing = trackIndexFor(player, to);
+  if (landing === null || isSafeTrack(landing)) return false;
+  return state.players.some(o => o.seat !== seat && o.tokens.some(t => trackIndexFor(o, t.progress) === landing));
+}
+
+/**
+ * The move a bot (a server bot seat, or a player whose turn timed out) makes:
+ * finish a token > capture > leave the yard > advance the furthest token.
+ */
+export function pickBotMove(state: LudoState, seat: number, dice: number, legal: number[]): number {
+  const player = state.players[seat];
+  let best = legal[0];
+  let bestScore = -Infinity;
+  for (const i of legal) {
+    const from = player.tokens[i].progress;
+    const to = from === -1 ? 0 : from + dice;
+    let score = to;
+    if (to === HOME_PROGRESS) score += 1000;
+    if (capturesOpponent(state, seat, to)) score += 500;
+    if (from === -1) score += 300;
+    if (score > bestScore) { bestScore = score; best = i; }
+  }
+  return best;
 }

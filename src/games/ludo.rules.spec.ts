@@ -1,4 +1,4 @@
-import { advanceTurn, applyMove, createLudoState, globalTrackIndex, HOME_PROGRESS, legalMoves, playerFinished, rollForTurn } from './ludo.rules';
+import { advanceTurn, applyMove, createLudoState, globalTrackIndex, HOME_PROGRESS, legalMoves, pickBotMove, playerFinished, rollForTurn, trackIndexFor } from './ludo.rules';
 
 describe('Ludo rules', () => {
   const state = () => createLudoState({
@@ -86,5 +86,56 @@ describe('Ludo rules', () => {
     advanceTurn(s, 0, false);
     expect(s.lastRoll).toBeNull();
     expect(s.lastDice?.value).toBe(3);
+  });
+
+  describe('two players', () => {
+    const two = () => createLudoState({
+      matchId: 'm', roomCode: 'ABC123', entryFee: 1000, playerCount: 2,
+      players: [{ userId: 'a', displayName: 'A' }, { userId: 'b', displayName: 'B', synthetic: true }],
+      prizeFirst: 1400, prizeSecond: 600,
+    });
+
+    it('seats them in opposite corners (RED and YELLOW), not side by side', () => {
+      const s = two();
+      expect(s.players.map(p => p.color)).toEqual(['RED', 'YELLOW']);
+      expect(s.players[1].synthetic).toBe(true);
+      expect(s.players[0].synthetic).toBe(undefined);
+    });
+
+    it('starts each colour on its own start square', () => {
+      const s = two();
+      expect(trackIndexFor(s.players[0], 0)).toBe(0);
+      expect(trackIndexFor(s.players[1], 0)).toBe(26);
+    });
+
+    it('captures across the two colours', () => {
+      const s = two();
+      s.players[0].tokens[0].progress = 30; // RED on square 30
+      s.players[1].tokens[0].progress = 3;  // YELLOW on square 29
+      s.currentSeat = 1;
+      rollForTurn(s, 1, 1);
+      applyMove(s, 1, 0, 1);                // YELLOW to 30
+      expect(s.players[0].tokens[0].progress).toBe(-1);
+    });
+  });
+
+  describe('bot move choice', () => {
+    it('prefers finishing, then capturing, then leaving the yard, then the furthest token', () => {
+      const s = createLudoState({
+        matchId: 'm', roomCode: 'R', entryFee: 0, playerCount: 4,
+        players: [1, 2, 3, 4].map(i => ({ userId: `u${i}`, displayName: `P${i}` })), prizeFirst: 0, prizeSecond: 0,
+      });
+      const p = s.players[0];
+      p.tokens[0].progress = 54; p.tokens[1].progress = 10; p.tokens[2].progress = -1; p.tokens[3].progress = 20;
+      expect(pickBotMove(s, 0, 2, legalMoves(s, 0, 2))).toBe(0);        // 54 + 2 = home
+      p.tokens[0].progress = -1;
+      s.players[1].tokens[0].progress = 25;                              // GREEN on square 38
+      p.tokens[1].progress = 34;                                         // +4 lands on 38
+      expect(pickBotMove(s, 0, 4, legalMoves(s, 0, 4))).toBe(1);        // capture
+      s.players[1].tokens[0].progress = -1;
+      expect(pickBotMove(s, 0, 6, legalMoves(s, 0, 6))).toBe(0);        // leave the yard (token 0 is in the yard)
+      p.tokens[0].progress = 5; p.tokens[1].progress = 10; p.tokens[2].progress = 12;
+      expect(pickBotMove(s, 0, 3, legalMoves(s, 0, 3))).toBe(3);        // furthest token (20 + 3)
+    });
   });
 });
