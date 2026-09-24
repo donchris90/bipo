@@ -43,5 +43,6 @@ export class LudoController {
   @Post('matches/:matchId/roll') roll(@Req() req: AuthedRequest, @Param('matchId') matchId: string) { return this.ludo.roll(req.user.userId, matchId); }
   @Post('matches/:matchId/move') move(@Req() req: AuthedRequest, @Param('matchId') matchId: string, @Body() body: { tokenIndex: number }) { return this.ludo.move(req.user.userId, matchId, body.tokenIndex); }
   @Post('matches/:matchId/reconnect') reconnect(@Req() req: AuthedRequest, @Param('matchId') matchId: string) { return this.ludo.reconnect(req.user.userId, matchId); }
-  @Post('matches/:matchId/tick') tick(@Param('matchId') matchId: string) { return this.ludo.tick(matchId); }
+  @Post('matches/:matchId/resume') resume(@Req() req: AuthedRequest, @Param('matchId') matchId: string) { return this.ludo.resume(req.user.userId, matchId); }
+  @Post('matches/:matchId/tick') tick(@Req() req: AuthedRequest, @Param('matchId') matchId: string) { return this.ludo.tickAs(req.user.userId, matchId); }
 }

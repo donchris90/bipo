@@ -7,7 +7,7 @@ import { v4 as uuid } from 'uuid';
 import { ConfigService } from '@nestjs/config';
 import IORedis from 'ioredis';
 import { randomInt } from 'node:crypto';
-import { BOT_THINK_MS, createLudoState, LudoState, RECONNECT_GRACE_MS, TURN_MS, advanceTurn, applyMove, legalMoves, pickBotMove, playerFinished, rollForTurn } from './ludo.rules';
+import { AUTOPILOT_AFTER_MISSED_TURNS, createLudoState, LudoPlayerState, LudoState, TURN_MS, advanceTurn, applyMove, giveControlBack, handToAi, isAiControlled, legalMoves, pickBotMove, recordFinish, rollForTurn, serverActsAt } from './ludo.rules';
 
 // A search whose app has not checked in for this long is treated as abandoned (the app polls every 2 s).
 const STALE_TICKET_MS = 20_000;
@@ -26,7 +26,8 @@ export class LudoService implements OnModuleDestroy {
   private readonly queues = new Map<string, QueueItem[]>();
   private readonly rooms = new Map<string, Room>();
   private readonly states = new Map<string, LudoState>();
-  private readonly disconnectTimers = new Map<string, NodeJS.Timeout>();
+  // One action at a time per match: a player's tap, the AI's move and the tick loop must never interleave.
+  private readonly matchChains = new Map<string, Promise<unknown>>();
   // Redis is preferred for multi-instance coordination, but Ludo must remain usable if Redis is temporarily full/unavailable.
   // These maps are a bounded fallback for the active API instance; durable match state remains in Postgres.
   private readonly localTickets = new Map<string, QuickTicket>();
@@ -148,6 +149,12 @@ export class LudoService implements OnModuleDestroy {
     return Number.isFinite(value) && value >= 0 ? value : DEFAULT_BOT_FILL_SECONDS;
   }
 
+  private async botMatchesPaid(): Promise<boolean> {
+    const game = await this.prisma.gameDefinition.findUnique({ where: { code: 'LUDO' }, select: { rulesJson: true } });
+    const v = ((game?.rulesJson ?? {}) as any).botMatchPaid;
+    return !(v === 0 || v === false); // paid unless an admin switches it off
+  }
+
   // Drops searches that are gone, cancelled, already started or abandoned.
   private async pruneStale(queue: QueueItem[]): Promise<QueueItem[]> {
     const now = Date.now();
@@ -189,10 +196,11 @@ export class LudoService implements OnModuleDestroy {
   }
 
   /**
-   * Starts a PRACTICE match: the people currently searching at these settings plus bots for the
-   * empty seats. No coins are taken and no prize is paid (bots have no wallet, and a bot that
-   * plays a fixed rule set must never be a source of coins). `force` is the "play with bots now"
-   * button; otherwise it only happens once the wait is over.
+   * Starts a match against AI: the people currently searching at these settings plus AI players for the
+   * empty seats. By default it is NOT free: every human pays the entry fee exactly like a normal match and
+   * the prize pool is the normal one (the AI seats are funded by the house; `botPrizePercent` scales that pool
+   * down for a house edge). Setting rulesJson.botMatchPaid to 0 turns these into free practice matches.
+   * `force` is the "play with AI now" button; otherwise it only happens once the wait is over.
    */
   async startBotMatch(userId: string, ticketId: string, force = false) {
     const data = await this.readTicket(ticketId);
@@ -201,24 +209,42 @@ export class LudoService implements OnModuleDestroy {
     if (data.status !== 'WAITING') return this.ticketResponse(data);
     const waitSeconds = await this.botFillSeconds();
     if (waitSeconds <= 0) {
-      if (force) throw new BadRequestException('Bot matches are switched off');
+      if (force) throw new BadRequestException('AI matches are switched off');
       return this.ticketResponse(data);
     }
     if (!force && Date.now() - Date.parse(data.createdAt) < waitSeconds * 1000) return this.ticketResponse(data);
+    const paid = await this.botMatchesPaid();
 
     const key = this.queueKey(data.entryFee, data.playerCount);
     const result = await this.withQuickLock(key, async () => {
       const current = await this.readTicket(ticketId);
       if (!current || current.status !== 'WAITING') return current ? this.ticketResponse(current) : null;
       const queue = await this.pruneStale(await this.readQueue(key));
-      const humans = queue.filter(x => x.ticket).slice(0, data.playerCount);
+      let humans = queue.filter(x => x.ticket).slice(0, data.playerCount);
       if (!humans.some(h => h.userId === userId)) return this.ticketResponse(current); // matched or removed in the meantime
-      await this.writeQueue(key, queue.filter(x => !humans.includes(x)));
+
+      // A paid match only starts with people who can still afford it; the rest leave the search.
+      let broke: QueueItem[] = [];
+      if (paid) {
+        const funded: QueueItem[] = [];
+        for (const h of humans) {
+          const balance = await this.wallet.getBalance(h.userId, WalletType.COIN).catch(() => 0n);
+          if (balance >= BigInt(data.entryFee)) funded.push(h); else broke.push(h);
+        }
+        humans = funded;
+        for (const b of broke) {
+          const t = b.userId === userId ? current : await this.readTicket(b.ticket!);
+          if (t) { t.status = 'CANCELLED'; t.players = 0; await this.writeTicket(t); }
+        }
+      }
+      await this.writeQueue(key, queue.filter(x => !humans.includes(x) && !broke.includes(x)));
+      if (!humans.some(h => h.userId === userId)) throw new BadRequestException('Insufficient balance');
+
       const bots: QueueItem[] = Array.from({ length: data.playerCount - humans.length }, (_, i) => ({
-        userId: `bot:${uuid()}`, displayName: `${BOT_NAMES[(i + Math.floor(Math.random() * BOT_NAMES.length)) % BOT_NAMES.length]} (bot)`,
-        entryFee: 0, playerCount: data.playerCount, synthetic: true,
+        userId: `bot:${uuid()}`, displayName: `${BOT_NAMES[(i + Math.floor(Math.random() * BOT_NAMES.length)) % BOT_NAMES.length]} (AI)`,
+        entryFee: paid ? data.entryFee : 0, playerCount: data.playerCount, synthetic: true,
       }));
-      const started = await this.startMatch([...humans, ...bots], undefined, { practice: true });
+      const started = await this.startMatch([...humans, ...bots], undefined, { practice: !paid });
       let mine: QuickTicket = current;
       for (const human of humans) {
         const t = (human.userId === userId ? current : await this.readTicket(human.ticket!)) ?? current;
@@ -335,10 +361,14 @@ export class LudoService implements OnModuleDestroy {
     const roomCode = room?.roomCode ?? this.makeRoomCode();
     const entryFee = practice ? 0 : players[0].entryFee;
     const playerCount = players.length as 2 | 4;
-    const totalPool = entryFee * playerCount; // practice: 0
     const game = await this.prisma.gameDefinition.findUnique({ where: { code: 'LUDO' }, select: { rulesJson: true } });
     const rules = (game?.rulesJson ?? {}) as any;
-    const firstPct = Number(rules.prizeFirstPercent ?? 70);
+    // AI seats put nothing in; the house covers that share of the pool, scaled by botPrizePercent (default 100).
+    const hasAi = players.some(p => p.synthetic);
+    const aiScale = hasAi ? Math.min(100, Math.max(0, Number(rules.botPrizePercent ?? 100))) / 100 : 1;
+    const totalPool = Math.floor(entryFee * playerCount * aiScale); // practice: 0
+    // Two players: the winner takes the pool (there is no second place). Four players: 1st/2nd split.
+    const firstPct = playerCount === 2 ? Number(rules.prizeFirstPercent2p ?? 100) : Number(rules.prizeFirstPercent ?? 70);
     const prizeFirst = Math.floor(totalPool * (firstPct / 100));
     const prizeSecond = totalPool - prizeFirst;
     const now = new Date();
@@ -346,7 +376,7 @@ export class LudoService implements OnModuleDestroy {
     // Debit all entries atomically with their durable GameEntry records.
     const round = await this.prisma.$transaction(async tx => {
       const created = await tx.gameRound.create({ data: { id: matchId, gameCode: 'LUDO', rulesVersion: 1, entryPrice: entryFee, openAt: now, lockAt: new Date(now.getTime() + 10_000), status: 'OPEN', hiddenState: {} as any } });
-      for (const p of practice ? [] : players) {
+      for (const p of practice ? [] : players.filter(x => !x.synthetic)) {
         await this.wallet.debit({ userId: p.userId, walletType: WalletType.COIN, amount: BigInt(entryFee), ledgerType: LedgerEntryType.GAME_ENTRY, reference: created.id, idempotencyKey: `ludo_entry:${created.id}:${p.userId}` }, tx);
         await tx.gameEntry.create({ data: { roundId: created.id, userId: p.userId, selection: { roomCode }, coinAmount: entryFee, idempotencyKey: `ludo_entry_record:${created.id}:${p.userId}` } });
       }
@@ -370,64 +400,88 @@ export class LudoService implements OnModuleDestroy {
     throw new NotFoundException('Ludo state unavailable');
   }
 
-  async roll(userId: string, matchId: string) {
-    const state = await this.requireState(matchId);
-    const player = this.playerFor(state, userId);
-    if (state.currentSeat !== player.seat) throw new BadRequestException('Not your turn');
-    if (state.lastRoll != null) throw new BadRequestException('You already rolled. Move a token.');
-    const result = rollForTurn(state, player.seat);
+  private withMatch<T>(matchId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.matchChains.get(matchId) ?? Promise.resolve();
+    const run = prev.catch(() => undefined).then(fn);
+    const tail = run.catch(() => undefined);
+    this.matchChains.set(matchId, tail);
+    void tail.then(() => { if (this.matchChains.get(matchId) === tail) this.matchChains.delete(matchId); });
+    return run;
+  }
+
+  private assertActive(state: LudoState) { if (state.status !== 'ACTIVE') throw new BadRequestException('This match is over'); }
+
+  /** What happens right after a roll: a cancelled third six or an unplayable roll ends the turn. */
+  private afterRoll(state: LudoState, player: LudoPlayerState, result: { dice: number; threeSixPenalty: boolean; legalMoves: number[] }) {
     if (result.threeSixPenalty) {
       player.consecutiveSixes = 0;
       advanceTurn(state, player.seat, false);
     } else if (result.legalMoves.length === 0) {
       advanceTurn(state, player.seat, result.dice === 6);
     }
-    await this.persistState(state);
-    return this.publicState(state);
+  }
+
+  /** Plays one token for `player`, then either ends the match or passes the turn. Shared by people and the AI. */
+  private async playToken(state: LudoState, player: LudoPlayerState, tokenIndex: number, dice: number) {
+    applyMove(state, player.seat, tokenIndex, dice);
+    if (recordFinish(state, player)) { await this.finishMatch(state); return; }
+    advanceTurn(state, player.seat, dice === 6);
+  }
+
+  async roll(userId: string, matchId: string) {
+    return this.withMatch(matchId, async () => {
+      const state = await this.requireState(matchId);
+      this.assertActive(state);
+      const player = this.playerFor(state, userId);
+      if (state.currentSeat !== player.seat) throw new BadRequestException('Not your turn');
+      if (state.lastRoll != null) throw new BadRequestException('You already rolled. Move a token.');
+      giveControlBack(state, player); // rolling yourself means you are back
+      this.afterRoll(state, player, rollForTurn(state, player.seat));
+      await this.persistState(state);
+      return this.publicState(state);
+    });
   }
 
   async move(userId: string, matchId: string, tokenIndex: number) {
-    const state = await this.requireState(matchId);
-    const player = this.playerFor(state, userId);
-    if (state.currentSeat !== player.seat) throw new BadRequestException('Not your turn');
-    if (state.lastRoll == null) throw new BadRequestException('Roll the dice first');
-    const dice = state.lastRoll;
-    const legal = legalMoves(state, player.seat, dice);
-    if (!legal.includes(tokenIndex)) throw new BadRequestException('Illegal token');
-    applyMove(state, player.seat, tokenIndex, dice);
-    const finished = playerFinished(player);
-    if (finished && !player.finishedAt) player.finishedAt = new Date().toISOString();
-    const placementCount = state.players.filter(p => p.finishedAt).length;
-    if (placementCount === 1) state.winnerUserId = player.userId;
-    if (placementCount === 2 && !state.secondPlaceUserId) state.secondPlaceUserId = player.userId;
-    if (placementCount >= 2 || finished && state.players.filter(p => !p.finishedAt).length === 1) {
-      await this.finishMatch(state);
+    return this.withMatch(matchId, async () => {
+      const state = await this.requireState(matchId);
+      this.assertActive(state);
+      const player = this.playerFor(state, userId);
+      if (state.currentSeat !== player.seat) throw new BadRequestException('Not your turn');
+      if (state.lastRoll == null) throw new BadRequestException('Roll the dice first');
+      const dice = state.lastRoll;
+      if (!legalMoves(state, player.seat, dice).includes(tokenIndex)) throw new BadRequestException('Illegal token');
+      giveControlBack(state, player);
+      await this.playToken(state, player, tokenIndex, dice);
+      await this.persistState(state);
       return this.publicState(state);
-    }
-    const extraTurn = dice === 6;
-    advanceTurn(state, player.seat, extraTurn);
-    await this.persistState(state);
-    return this.publicState(state);
+    });
   }
 
+  /** The player is (back) in the match: the AI hands the seat back. Also used by the explicit "take back control" button. */
   async reconnect(userId: string, matchId: string) {
-    const state = await this.requireState(matchId);
-    const player = this.playerFor(state, userId);
-    player.connected = true; player.bot = false;
-    const timer = this.disconnectTimers.get(`${matchId}:${userId}`);
-    if (timer) { clearTimeout(timer); this.disconnectTimers.delete(`${matchId}:${userId}`); }
-    await this.persistState(state);
-    return this.publicState(state);
+    return this.withMatch(matchId, async () => {
+      const state = await this.requireState(matchId);
+      const player = this.playerFor(state, userId);
+      giveControlBack(state, player);
+      await this.persistState(state);
+      return this.publicState(state);
+    });
   }
 
+  async resume(userId: string, matchId: string) { return this.reconnect(userId, matchId); }
+
+  /** The player's connection dropped. The AI covers their turns (after a short grace) until they are back. */
   async disconnect(userId: string, matchId: string) {
-    const state = this.states.get(matchId); if (!state) return;
-    const player = state.players.find(p => p.userId === userId); if (!player) return;
-    player.connected = false; player.bot = true;
-    await this.persistState(state);
-    const key = `${matchId}:${userId}`;
-    const old = this.disconnectTimers.get(key); if (old) clearTimeout(old);
-    this.disconnectTimers.set(key, setTimeout(() => { this.disconnectTimers.delete(key); }, RECONNECT_GRACE_MS));
+    return this.withMatch(matchId, async () => {
+      const state = this.states.get(matchId);
+      if (!state || state.status !== 'ACTIVE') return undefined;
+      const player = state.players.find(p => p.userId === userId);
+      if (!player || player.synthetic) return undefined;
+      player.connected = false;
+      await this.persistState(state);
+      return this.publicState(state);
+    });
   }
 
   async tickActiveMatches() {
@@ -435,58 +489,66 @@ export class LudoService implements OnModuleDestroy {
     const states: LudoState[] = [];
     for (const row of rounds) {
       try {
-        const lockKey = `ludo:tick-lock:${row.id}`;
-        const acquired = await this.redis.set(lockKey, uuid(), 'PX', 2500, 'NX').catch(() => null);
+        // Redis only de-duplicates work between API instances. If it is down, the per-match lock still keeps this instance safe.
+        let acquired = true;
+        try { acquired = !!(await this.redis.set(`ludo:tick-lock:${row.id}`, uuid(), 'PX', 2500, 'NX')); } catch { acquired = true; }
         if (!acquired) continue;
-        try { states.push(await this.tick(row.id)); } finally { await this.redis.del(lockKey).catch(() => undefined); }
-      } catch { /* one match must never stop the bot loop for others */ }
+        const before = this.states.get(row.id);
+        const seenBefore = before ? `${before.actionAt}:${before.status}` : '';
+        const state = await this.tick(row.id);
+        const after = `${state.actionAt}:${state.status}`;
+        if (after !== seenBefore) states.push(state); // only broadcast when the AI actually did something
+      } catch { /* one match must never stop the loop for others */ }
     }
     return states;
   }
 
-  async tick(matchId: string) {
+  /** A player asking the server to check the clock (fallback for clients without a socket). */
+  async tickAs(userId: string, matchId: string) {
     const state = await this.requireState(matchId);
-    if (state.status !== 'ACTIVE') return this.publicState(state);
-    const player = state.players[state.currentSeat];
-    if (!player) return this.publicState(state);
-    // A bot seat plays after a short think; anyone else only once their turn timer has run out.
-    const due = player.synthetic
-      ? Date.now() >= Date.parse(state.turnStartedAt) + BOT_THINK_MS
-      : Date.now() >= Date.parse(state.turnExpiresAt);
-    if (!due) return this.publicState(state);
-    // A timed-out turn is always resolved by the same server-side bot rules. If the player had already rolled
-    // but did not pick a token, the bot plays that roll instead of rolling again.
-    let dice: number;
-    let moves: number[];
-    let penalty = false;
-    if (state.lastRoll != null) {
-      dice = state.lastRoll;
-      moves = legalMoves(state, player.seat, dice);
-    } else {
-      const result = rollForTurn(state, player.seat);
-      dice = result.dice; moves = result.legalMoves; penalty = result.threeSixPenalty;
-    }
-    if (penalty || moves.length === 0) {
-      player.consecutiveSixes = 0;
-      advanceTurn(state, player.seat, false);
-    } else {
-      const tokenIndex = pickBotMove(state, player.seat, dice, moves);
-      applyMove(state, player.seat, tokenIndex, dice);
-      if (playerFinished(player)) {
-        player.finishedAt = new Date().toISOString();
-        if (!state.winnerUserId) state.winnerUserId = player.userId;
-        else if (!state.secondPlaceUserId) state.secondPlaceUserId = player.userId;
+    this.playerFor(state, userId);
+    return this.tick(matchId);
+  }
+
+  /**
+   * The AI runs the seat of a bot, or of a human who ran out of time / lost their connection. It plays like a
+   * person: roll, a short pause, then move. Once it has taken over a human it keeps playing every one of that
+   * human's turns at bot speed, so an absent player never stalls the table, until the human comes back.
+   */
+  async tick(matchId: string) {
+    return this.withMatch(matchId, async () => {
+      const state = await this.requireState(matchId);
+      if (state.status !== 'ACTIVE') return this.publicState(state);
+      const player = state.players[state.currentSeat];
+      if (!player) return this.publicState(state);
+      if (Date.now() < serverActsAt(state, player)) return this.publicState(state);
+
+      if (!isAiControlled(player)) {
+        // A person's clock ran out (or they dropped): the AI takes the seat for them.
+        player.missedTurns = (player.missedTurns ?? 0) + 1;
+        if (!player.connected || player.missedTurns >= AUTOPILOT_AFTER_MISSED_TURNS) handToAi(player);
       }
-      if (state.winnerUserId && state.secondPlaceUserId) await this.finishMatch(state);
-      else advanceTurn(state, player.seat, dice === 6);
-    }
-    await this.persistState(state);
-    return this.publicState(state);
+
+      if (state.lastRoll == null) {
+        this.afterRoll(state, player, rollForTurn(state, player.seat));
+      } else {
+        // Already rolled (by the person or a moment ago by the AI): play that roll instead of rolling again.
+        const dice = state.lastRoll;
+        const moves = legalMoves(state, player.seat, dice);
+        if (moves.length === 0) advanceTurn(state, player.seat, false);
+        else await this.playToken(state, player, pickBotMove(state, player.seat, dice, moves), dice);
+      }
+      await this.persistState(state);
+      return this.publicState(state);
+    });
   }
 
   private async finishMatch(state: LudoState) {
     if (state.status === 'FINISHED') return;
     state.status = 'FINISHED';
+    // Keep the result around briefly for late polls, then free the memory.
+    const evict = setTimeout(() => this.states.delete(state.matchId), 10 * 60_000);
+    evict.unref?.();
     const round = await this.prisma.gameRound.findUnique({ where: { id: state.matchId } });
     if (!round || round.status === 'SETTLED') return;
     if (state.practice) {
@@ -619,7 +681,8 @@ export class LudoService implements OnModuleDestroy {
   private playerFor(state: LudoState, userId: string) { const p = state.players.find(p => p.userId === userId); if (!p) throw new BadRequestException('You are not a player in this match'); return p; }
   private async requireBalance(userId: string, amount: number) { const balance = await this.wallet.getBalance(userId, WalletType.COIN); if (balance < BigInt(amount)) throw new BadRequestException('Insufficient balance'); }
   private async persistState(state: LudoState) { await this.prisma.gameRound.update({ where: { id: state.matchId }, data: { hiddenState: state as any } }); }
-  private publicState(state: LudoState) { return state; }
+  // serverNow lets each phone correct for its own clock when drawing the turn countdown.
+  private publicState(state: LudoState): LudoState { return { ...state, serverNow: Date.now() }; }
   private makeRoomCode() {
     const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';

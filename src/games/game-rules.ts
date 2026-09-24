@@ -12,7 +12,7 @@ const SHAPES = {
   dice: ['payoutMultiplier', 'rtp', 'basePrize', 'stakeWeightExponent', 'diceCount', 'diceSides', 'numberPayouts', ...SHARED],
   crash: ['houseEdge', 'growthRate', ...SHARED],
   lucky: ['payoutMultiplier', ...SHARED],
-  ludo: ['minEntry', 'maxEntry', 'turnSeconds', 'reconnectSeconds', 'prizeFirstPercent', 'prizeSecondPercent'],
+  ludo: ['minEntry', 'maxEntry', 'turnSeconds', 'reconnectSeconds', 'prizeFirstPercent', 'prizeSecondPercent', 'prizeFirstPercent2p', 'botFillSeconds', 'botMatchPaid', 'botPrizePercent'],
 } as const;
 
 type Shape = keyof typeof SHAPES;
@@ -124,6 +124,13 @@ export function validateGameRules(existing: any, incoming: any): GameRules {
     if (!isNum(incoming.prizeSecondPercent) || incoming.prizeSecondPercent < 0 || incoming.prizeSecondPercent > 100) errors.push('prizeSecondPercent must be from 0 to 100');
     if (isNum(incoming.prizeFirstPercent) && isNum(incoming.prizeSecondPercent) && Math.abs((incoming.prizeFirstPercent + incoming.prizeSecondPercent) - 100) > 0.001) errors.push('Ludo prize percentages must add up to 100');
     if (!errors.length) { out.minEntry = incoming.minEntry; out.maxEntry = incoming.maxEntry; out.turnSeconds = incoming.turnSeconds; out.reconnectSeconds = incoming.reconnectSeconds; out.prizeFirstPercent = incoming.prizeFirstPercent; out.prizeSecondPercent = incoming.prizeSecondPercent; }
+    // Optional Ludo settings. Only kept when supplied, so saving the form never silently resets them.
+    const optional: Array<[string, number, number]> = [['prizeFirstPercent2p', 0, 100], ['botFillSeconds', 0, 300], ['botMatchPaid', 0, 1], ['botPrizePercent', 0, 100]];
+    for (const [key, min, max] of optional) {
+      if (incoming[key] === undefined) continue;
+      if (!isNum(incoming[key]) || incoming[key] < min || incoming[key] > max) errors.push(`${key} must be a number from ${min} to ${max}`);
+      else out[key] = incoming[key];
+    }
   } else {
     if (!isNum(incoming.payoutMultiplier) || incoming.payoutMultiplier < 1.01 || incoming.payoutMultiplier > 1000) errors.push('payoutMultiplier must be a number from 1.01 to 1000');
     out.payoutMultiplier = incoming.payoutMultiplier;
