@@ -35,6 +35,7 @@ describe('validateGameRules — dice', () => {
   });
 });
 
+
 describe('validateGameRules — crash', () => {
   it('bounds the house edge and growth rate', () => {
     expect(validateGameRules(crash, { ...crash, houseEdge: 0.05 }).houseEdge).toBe(0.05);
@@ -80,6 +81,15 @@ describe('validateGameRules — Lucky Number 3-digit formula mode', () => {
 
   it('does not apply the old probability-vs-payout validation to Lucky Number', () => {
     expect(() => validateGameRules(lucky, { ...lucky, rtp: 0.95, basePrize: 1000 })).not.toThrow();
+  });
+
+
+
+  it('ignores the legacy numberPayouts map in Lucky Number formula mode', () => {
+    const lucky = { diceCount: 3, diceSides: 10, rtp: 0.95, basePrize: 1000, stakeWeightExponent: 1.2798473 };
+    const saved = validateGameRules(lucky, { ...lucky, numberPayouts: { '7': 999, '12': 1 } });
+    expect(saved).toMatchObject({ rtp: 0.95, basePrize: 1000, stakeWeightExponent: 1.2798473, diceCount: 3, diceSides: 10 });
+    expect(saved).not.toHaveProperty('numberPayouts');
   });
 
   it('rejects RTP outside 0..1 and non-whole base prizes', () => {

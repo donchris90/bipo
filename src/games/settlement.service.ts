@@ -48,7 +48,7 @@ export class SettlementService {
     const rules = (game?.rulesJson as any) ?? {};
     const isSumDice = round.selectionCount == null && !!rules.diceCount && !!rules.diceSides;
     const isLuckyNumber = isSumDice && round.gameCode === 'SUM_DICE' && typeof rules.rtp === 'number' && typeof rules.basePrize === 'number';
-    const luckyConfig = isLuckyNumber ? validateLuckyConfig({ rtp: rules.rtp, basePrize: rules.basePrize }) : null;
+    const luckyConfig = isLuckyNumber ? validateLuckyConfig({ rtp: rules.rtp, basePrize: rules.basePrize, stakeWeightExponent: rules.stakeWeightExponent }) : null;
     const payoutMultiplier = rules.payoutMultiplier ?? 20;
 
     const drawResult = isSumDice

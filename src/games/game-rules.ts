@@ -87,7 +87,10 @@ export function validateGameRules(existing: any, incoming: any): GameRules {
     }
     out.diceCount = incoming.diceCount;
     out.diceSides = incoming.diceSides;
-    if (incoming.numberPayouts !== undefined) {
+    // Legacy numberPayouts belongs only to the old fixed-payout dice mode.
+    // Lucky Number never persists or uses that Admin map: its multiplier and
+    // stake are derived from the 3-digit probability formula below.
+    if (!isLuckyNumber && incoming.numberPayouts !== undefined) {
       if (!incoming.numberPayouts || typeof incoming.numberPayouts !== 'object' || Array.isArray(incoming.numberPayouts)) {
         errors.push('numberPayouts must be an object mapping each winning number to a coin payout');
       } else if (!errors.length) {

@@ -55,10 +55,9 @@ export class GamesController {
     private readonly crash: CrashService,
   ) {}
 
-  // Public-to-authenticated players: the per-number Lucky Number payouts
-  // configured by Admin. These are displayable game rules, not a secret;
-  // keeping them on the server prevents the mobile client from falling back
-  // to a hardcoded/default value when Admin has configured custom payouts.
+  // Public-to-authenticated players: Lucky Number's formula-derived odds,
+  // multipliers, and stake weights. The legacy numberPayouts Admin map is
+  // intentionally not read or returned for Lucky Number.
   @Get(':gameCode/config')
   async config(@Param('gameCode') gameCode: string) {
     const game = await this.prisma.gameDefinition.findUnique({
@@ -68,7 +67,7 @@ export class GamesController {
     const rules = (game?.rulesJson as any) ?? {};
     const isLuckyNumber = typeof rules.rtp === 'number' && typeof rules.basePrize === 'number' && rules.diceCount === 3 && rules.diceSides === 10;
     if (isLuckyNumber) {
-      const lucky = validateLuckyConfig({ rtp: rules.rtp, basePrize: rules.basePrize });
+      const lucky = validateLuckyConfig({ rtp: rules.rtp, basePrize: rules.basePrize, stakeWeightExponent: rules.stakeWeightExponent });
       const quotes = buildLuckyQuotes(lucky);
       return {
         gameCode,
@@ -77,7 +76,6 @@ export class GamesController {
         basePrize: lucky.basePrize,
         stakeWeightExponent: lucky.stakeWeightExponent,
         payoutMultiplier: null,
-        numberPayouts: Object.fromEntries(quotes.map((q) => [String(q.number), q.multiplier])),
         multipliers: Object.fromEntries(quotes.map((q) => [String(q.number), q.multiplier])),
         suggestedStakes: Object.fromEntries(quotes.map((q) => [String(q.number), q.suggestedStake])),
         odds: Object.fromEntries(quotes.map((q) => [String(q.number), q.probability])),
@@ -103,7 +101,7 @@ export class GamesController {
     if (gameCode !== 'SUM_DICE' || rules.diceCount !== 3 || rules.diceSides !== 10) {
       return { applicable: false };
     }
-    const lucky = validateLuckyConfig({ rtp: Number(rules.rtp), basePrize: Number(rules.basePrize) });
+    const lucky = validateLuckyConfig({ rtp: Number(rules.rtp), basePrize: Number(rules.basePrize), stakeWeightExponent: rules.stakeWeightExponent as number | undefined });
     const quotes = buildLuckyQuotes(lucky);
     return {
       applicable: true,
