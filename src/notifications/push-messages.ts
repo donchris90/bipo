@@ -58,6 +58,14 @@ export function describeForPush(
         : { title: 'Creator application', body: 'Your creator application was not approved' };
     case 'MISSED_CALL':
       return { title: 'Missed call', body: `Missed call from ${payload.callerDisplayName ?? 'someone'}` };
+    case 'HOST_LEVEL_UP':
+      return { title: `Host Level ${payload.level}`, body: `Congratulations! You reached ${payload.name ?? `Level ${payload.level}`}.` };
+    case 'HOST_TASK_COMPLETED':
+      return { title: 'Host task completed', body: `${payload.taskLabel ?? 'Daily host task'} completed${payload.rewardXp ? ` — +${payload.rewardXp} XP` : ''}` };
+    case 'HOST_ACHIEVEMENT':
+      return { title: 'Achievement unlocked', body: `You unlocked ${payload.label ?? 'a host achievement'}` };
+    case 'HOST_RANKING':
+      return { title: 'Host ranking update', body: `You are now ranked #${payload.rank ?? '?'} among hosts` };
     case 'SYSTEM':
       if (payload.event === 'PARTY_INVITE') {
         return { title: 'Party invitation', body: `${payload.hostDisplayName ?? 'A host'} invited you to ${payload.roomTitle ?? 'a party room'}` };

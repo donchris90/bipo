@@ -329,6 +329,26 @@ model DirectMessage {
   @@index([recipientId, senderId, createdAt])
 }
 
+
+model UserReport {
+  id          String   @id @default(uuid())
+  reporterId  String
+  targetUserId String
+  category    String
+  description String?
+  context     String?
+  contextId   String?
+  status      String   @default("OPEN")
+  reviewerId  String?
+  resolution  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([targetUserId, createdAt])
+  @@index([reporterId, createdAt])
+}
+
 model ModerationAction {
   id           String               @id @default(uuid())
   actorId      String
@@ -765,6 +785,10 @@ enum NotificationType {
   CREATOR_APPLICATION
   MISSED_CALL
   PROFILE_VISIT
+  HOST_LEVEL_UP
+  HOST_TASK_COMPLETED
+  HOST_ACHIEVEMENT
+  HOST_RANKING
 }
 
 enum LiveStatus {

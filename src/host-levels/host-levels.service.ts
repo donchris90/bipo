@@ -2,10 +2,11 @@ import { BadRequestException, ForbiddenException, Injectable, NotFoundException 
 import { RoleName } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class HostLevelsService {
-  constructor(private readonly prisma: PrismaService, private readonly audit: AuditService) {}
+  constructor(private readonly prisma: PrismaService, private readonly audit: AuditService, private readonly notifications: NotificationsService) {}
 
   async list() {
     return this.prisma.hostLevel.findMany({ orderBy: { level: 'asc' } });
@@ -52,8 +53,22 @@ export class HostLevelsService {
     if (!Number.isFinite(safe) || safe <= 0) return this.progress(userId);
     const levels = await this.prisma.hostLevel.findMany({ where: { active: true }, orderBy: { level: 'asc' } });
     const user = await this.prisma.user.update({ where: { id: userId }, data: { hostXp: { increment: safe } }, select: { hostXp: true } });
+    const previous = await this.prisma.user.findUnique({ where: { id: userId }, select: { hostLevel: true } });
     const level = [...levels].reverse().find((l) => l.xpRequired <= user.hostXp)?.level ?? 1;
     await this.prisma.user.update({ where: { id: userId }, data: { hostLevel: level } });
+    if ((previous?.hostLevel ?? 1) < level) {
+      const reached = levels.find((l) => l.level === level);
+      await this.notifications.notifyOnce(userId, 'HOST_LEVEL_UP', `host-level:${level}:${user.hostXp}`, {
+        level, name: reached?.name ?? `Level ${level}`, xp: user.hostXp,
+        unlocks: Array.isArray(reached?.unlocks) ? reached?.unlocks : [],
+      });
+      const achievement = this.achievementForLevel(level);
+      if (achievement) {
+        await this.notifications.notifyOnce(userId, 'HOST_ACHIEVEMENT', `host-achievement:${achievement.key}`, {
+          key: achievement.key, label: achievement.label, level,
+        });
+      }
+    }
     return this.progress(userId);
   }
 
@@ -99,10 +114,21 @@ export class HostLevelsService {
         update: { progress: next, completedAt: completed ? (existing?.completedAt ?? new Date()) : null },
         create: { userId, taskId: task.id, day: start, progress: next, completedAt: completed ? new Date() : null },
       });
-      if (completed && !existing?.completedAt && task.rewardXp > 0) {
-        await this.addXp(userId, task.rewardXp);
+      if (completed && !existing?.completedAt) {
+        await this.notifications.notifyOnce(userId, 'HOST_TASK_COMPLETED', `host-task:${task.key}:${start.toISOString().slice(0, 10)}`, {
+          taskKey: task.key, taskLabel: task.label, rewardXp: task.rewardXp, day: start.toISOString().slice(0, 10),
+        });
+        if (task.rewardXp > 0) await this.addXp(userId, task.rewardXp);
       }
     }
+  }
+
+  private achievementForLevel(level: number) {
+    if (level >= 10) return { key: 'ELITE_HOST', label: 'Elite Host' };
+    if (level >= 5) return { key: 'PRO_HOST', label: 'Pro Host' };
+    if (level >= 3) return { key: 'RISING_HOST', label: 'Rising Host' };
+    if (level >= 2) return { key: 'FIRST_HOST', label: 'First Host' };
+    return null;
   }
 
   async updateTask(key: string, body: any, actorId: string, roles: RoleName) {

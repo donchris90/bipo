@@ -51,7 +51,7 @@ export class RoundSchedulerService implements OnModuleInit, OnModuleDestroy {
   // fallback when that isn't set.
   private static readonly DEFAULT_OPEN_SECONDS: Record<string, number> = {
     CRASH: 8,
-    SUM_DICE: 15,
+    SUM_DICE: 30,
     LUCKY_NUMBER: 15,
   };
   // Minimum stake / entry price for a freshly-created round, same
@@ -247,7 +247,7 @@ export class RoundSchedulerService implements OnModuleInit, OnModuleDestroy {
         }
         return;
       }
-      const openSeconds = rules.openSeconds ?? RoundSchedulerService.DEFAULT_OPEN_SECONDS[gameCode] ?? 15;
+      const openSeconds = gameCode === 'SUM_DICE' ? 30 : (rules.openSeconds ?? RoundSchedulerService.DEFAULT_OPEN_SECONDS[gameCode] ?? 15);
       const entryPrice = rules.minStake ?? RoundSchedulerService.DEFAULT_ENTRY_PRICE[gameCode] ?? 10;
       const openAt = new Date();
       const lockAt = new Date(openAt.getTime() + openSeconds * 1000);
