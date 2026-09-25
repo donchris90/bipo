@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { WalletService } from '../economy/wallet.service';
+import { HostLevelsService } from '../host-levels/host-levels.service';
 import { UserStatus, RoleName, WalletType, LedgerEntryType } from '@prisma/client';
 import { CHECK_IN_REWARD_SCHEDULE, computeCheckInReward, resolveCheckIn, toUtcDateKey } from './check-in-rules';
 
@@ -13,6 +14,7 @@ export class UsersService {
     private readonly prisma: PrismaService,
     private readonly audit: AuditService,
     private readonly wallet: WalletService,
+    private readonly hostLevels: HostLevelsService,
   ) {}
 
   async findMe(userId: string) {
@@ -124,6 +126,16 @@ export class UsersService {
       if (typeof updates.oneOnOneEnabled !== 'boolean') throw new BadRequestException('oneOnOneEnabled must be true or false');
       const creator = await this.prisma.userRole.findFirst({ where: { userId, role: RoleName.CREATOR } });
       if (!creator) throw new BadRequestException('Only hosts can change 1-on-1 availability');
+      // Turning this ON before the host has unlocked ONE_ON_ONE_VIDEO used
+      // to save silently — the switch would sit "on" in the app with no
+      // indication that nobody could actually reach them, since the level
+      // was only ever checked later, at call time. Enforce it here too, so
+      // this endpoint can't be used to bypass the level requirement (the
+      // mobile UI now also gates the switch itself — see EditProfileScreen).
+      // Turning it OFF is always allowed, at any level.
+      if (updates.oneOnOneEnabled) {
+        await this.hostLevels.assertUnlock(userId, 'ONE_ON_ONE_VIDEO');
+      }
       data.oneOnOneEnabled = updates.oneOnOneEnabled;
     }
 

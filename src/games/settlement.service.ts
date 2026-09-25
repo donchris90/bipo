@@ -5,8 +5,8 @@ import { WalletService } from '../economy/wallet.service';
 import { RngService } from './rng.service';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { rollDice, isWinningNumber, computeSumDiceReward, DiceConfig } from './sum-dice-rules';
-import { computeMultipliers, settleLuckyNumber, settleLuckyNumberCombo } from './lucky-number/lucky-number-math';
 import { WalletType, LedgerEntryType } from '@prisma/client';
+import { multiplierForNumber, validateLuckyConfig, type LuckySelection } from './lucky-number-rules';
 
 // Pure and exported specifically so it's unit-testable without a database —
 // this is the line between "you won" and "you didn't" for real money, so it
@@ -46,15 +46,10 @@ export class SettlementService {
 
     const game = await this.prisma.gameDefinition.findUnique({ where: { code: round.gameCode } });
     const rules = (game?.rulesJson as any) ?? {};
-    const payoutMultiplier = rules.payoutMultiplier ?? 20;
     const isSumDice = round.selectionCount == null && !!rules.diceCount && !!rules.diceSides;
-    // RTP mode's multipliers are derived once per settlement (same formula
-    // EntryService.place() used to size stakes), never re-read from
-    // rules.numberPayouts directly — that field is only a cache of this
-    // same computation (see game-rules.ts), so computing it fresh here
-    // guarantees settlement can never disagree with what a stake was
-    // priced against, even if rulesJson were edited mid-round.
-    const luckyNumberMultipliers = typeof rules.rtp === 'number' ? computeMultipliers(rules.rtp, rules.multiplierCap) : null;
+    const isLuckyNumber = isSumDice && round.gameCode === 'SUM_DICE' && typeof rules.rtp === 'number' && typeof rules.basePrize === 'number';
+    const luckyConfig = isLuckyNumber ? validateLuckyConfig({ rtp: rules.rtp, basePrize: rules.basePrize, stakeWeightExponent: rules.stakeWeightExponent }) : null;
+    const payoutMultiplier = rules.payoutMultiplier ?? 20;
 
     const drawResult = isSumDice
       ? rollDice({ diceCount: rules.diceCount, diceSides: rules.diceSides } as DiceConfig, () =>
@@ -69,47 +64,24 @@ export class SettlementService {
       let won: boolean;
       let rewardAmount: number;
 
-      // RTP-mode entries store {number: stake} (an object), never the plain
-      // number[] the equal-split path below expects — see
-      // EntryService.place(). Dispatching on the entry's own stored shape
-      // (rather than trusting rules.rtp for every entry in the round) means
-      // a game that switched modes mid-flight still settles every entry
-      // the way it was actually priced, not the way the round is configured
-      // right now.
-      const isLuckyNumberEntry = luckyNumberMultipliers != null && !Array.isArray(entry.selection) && typeof entry.selection === 'object' && entry.selection !== null;
-      // Combo entries are LuckyNumber-shaped too (object, not array), but
-      // carry { mode: 'combo', ... } instead of a {number: stake} map —
-      // checked first so they never fall into the per-number branch below,
-      // which would silently re-apply the independent-stake math this mode
-      // exists to avoid.
-      const isComboEntry = isLuckyNumberEntry && (entry.selection as any).mode === 'combo';
-
-      if (isSumDice && isComboEntry) {
-        const { numbers, stake } = entry.selection as any;
-        const settled = settleLuckyNumberCombo(Number(stake), drawResult.sum!, numbers as number[], (entry.selection as any).multiplier);
-        won = settled.won;
-        rewardAmount = settled.payout;
-      } else if (isSumDice && isLuckyNumberEntry) {
-        const stakes = new Map(Object.entries(entry.selection as Record<string, number>).map(([n, s]) => [Number(n), Number(s)]));
-        const settled = settleLuckyNumber(stakes, drawResult.sum!, luckyNumberMultipliers!);
-        won = settled.won;
-        rewardAmount = settled.payout;
+      if (isLuckyNumber) {
+        const selected = entry.selection as unknown as LuckySelection;
+        const numbers = Array.isArray(selected?.numbers) ? selected.numbers : [];
+        const stakes = selected?.stakes && typeof selected.stakes === 'object' ? selected.stakes : {};
+        won = numbers.includes(drawResult.sum!);
+        const winningStake = Number((stakes as Record<string, unknown>)[String(drawResult.sum!)] ?? 0);
+        const winningMultiplier = multiplierForNumber(drawResult.sum!, luckyConfig!.rtp);
+        rewardAmount = won && winningStake > 0 ? winningStake * winningMultiplier : 0;
       } else if (isSumDice) {
         won = isWinningNumber(entry.selection as number[], drawResult.sum!);
         const selected = entry.selection as number[];
-        const winningMultiplier = rules.numberPayouts && typeof rules.numberPayouts === 'object'
-          ? Number((rules.numberPayouts as Record<string, unknown>)[String(drawResult.sum!) ] ?? 0)
-          : payoutMultiplier;
-        rewardAmount = computeSumDiceReward(
-          entry.coinAmount,
-          selected.length,
-          winningMultiplier,
-          won,
-        );
+        rewardAmount = computeSumDiceReward(entry.coinAmount, selected.length, payoutMultiplier, won);
       } else {
         won = isWinningSelection(entry.selection, drawResult.dice);
         rewardAmount = won ? entry.coinAmount * payoutMultiplier : 0;
       }
+
+      const netAmount = rewardAmount - entry.coinAmount;
 
       // Same per-entry atomicity fix as CrashService.settleCrash() — credit
       // and the WON/LOST status update commit together, so a failure in
@@ -125,13 +97,13 @@ export class SettlementService {
           );
           return tx.gameEntry.update({
             where: { id: entry.id },
-            data: { status: 'WON', rewardAmount },
+            data: { status: 'WON', rewardAmount, netAmount },
           });
         }, EXTENDED_TX_OPTIONS);
       } else {
         await this.prisma.gameEntry.update({
           where: { id: entry.id },
-          data: { status: 'LOST', rewardAmount: 0 },
+          data: { status: 'LOST', rewardAmount: 0, netAmount },
         });
       }
     }
@@ -190,7 +162,7 @@ export class SettlementService {
             tx,
           );
         }
-        await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'REFUNDED', rewardAmount: 0 } });
+        await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'REFUNDED', rewardAmount: 0, netAmount: -entry.coinAmount } });
       }, EXTENDED_TX_OPTIONS);
       refunded++;
     }
