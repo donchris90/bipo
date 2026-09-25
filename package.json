@@ -3,8 +3,9 @@
   "version": "0.1.0",
   "description": "Global live social + gaming platform backend (Phase 0/1 foundation skeleton)",
   "scripts": {
-    "build": "prisma generate && tsc -p tsconfig.build.json",
-    "start": "node dist/main.js",
+    "build": "nest build --builder swc",
+    "prebuild": "prisma generate",
+    "start": "nest start",
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
     "prisma:generate": "prisma generate",
@@ -15,7 +16,7 @@
     "admin:coins": "ts-node scripts/grant-coins.ts",
     "admin:grant": "ts-node scripts/grant-role.ts",
     "admin:password": "ts-node scripts/set-password.ts",
-    "build:tsc": "tsc -p tsconfig.build.json",
+    "build:tsc": "nest build",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
