@@ -5,7 +5,7 @@ import { WalletService } from '../economy/wallet.service';
 import { RngService } from './rng.service';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { rollDice, isWinningNumber, computeSumDiceReward, DiceConfig } from './sum-dice-rules';
-import { computeMultipliers, settleLuckyNumber } from './lucky-number/lucky-number-math';
+import { computeMultipliers, settleLuckyNumber, settleLuckyNumberCombo } from './lucky-number/lucky-number-math';
 import { WalletType, LedgerEntryType } from '@prisma/client';
 
 // Pure and exported specifically so it's unit-testable without a database —
@@ -77,8 +77,19 @@ export class SettlementService {
       // the way it was actually priced, not the way the round is configured
       // right now.
       const isLuckyNumberEntry = luckyNumberMultipliers != null && !Array.isArray(entry.selection) && typeof entry.selection === 'object' && entry.selection !== null;
+      // Combo entries are LuckyNumber-shaped too (object, not array), but
+      // carry { mode: 'combo', ... } instead of a {number: stake} map —
+      // checked first so they never fall into the per-number branch below,
+      // which would silently re-apply the independent-stake math this mode
+      // exists to avoid.
+      const isComboEntry = isLuckyNumberEntry && (entry.selection as any).mode === 'combo';
 
-      if (isSumDice && isLuckyNumberEntry) {
+      if (isSumDice && isComboEntry) {
+        const { numbers, stake } = entry.selection as any;
+        const settled = settleLuckyNumberCombo(Number(stake), drawResult.sum!, numbers as number[], (entry.selection as any).multiplier);
+        won = settled.won;
+        rewardAmount = settled.payout;
+      } else if (isSumDice && isLuckyNumberEntry) {
         const stakes = new Map(Object.entries(entry.selection as Record<string, number>).map(([n, s]) => [Number(n), Number(s)]));
         const settled = settleLuckyNumber(stakes, drawResult.sum!, luckyNumberMultipliers!);
         won = settled.won;

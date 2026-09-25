@@ -7,6 +7,8 @@ import {
   scaleStakesToTotal,
   planStakes,
   settleLuckyNumber,
+  computeComboMultiplier,
+  settleLuckyNumberCombo,
   TOTAL_OUTCOMES,
   MIN_SUM,
   MAX_SUM,
@@ -392,5 +394,66 @@ describe('RTP invariant under random play (1,000,000 simulated rounds)', () => {
     expect(max).toBeLessThanOrEqual(0.95 + 1e-9);
     expect(min).toBeGreaterThan(0.85); // sanity floor — flooring never loses more than ~10% of RTP even in the worst bucket
     expect(max - min).toBeGreaterThan(0.01); // the spread genuinely exceeds 1%, confirming "within 1%" can't hold for arbitrary picks
+  });
+});
+
+describe('computeComboMultiplier / settleLuckyNumberCombo (range/combo bets)', () => {
+  const CONFIG: LuckyNumberConfig = { rtp: 0.95, basePrize: 1000, minStake: 1, maxStake: 1_000_000 };
+
+  it('never loses money on a hit: net >= 0 whenever the result is in the selected set', () => {
+    const ranges = [[7, 25], [10, 17], [13, 14], [0, 27], [3, 24]];
+    for (const [lo, hi] of ranges) {
+      const selected = Array.from({ length: hi - lo + 1 }, (_, i) => lo + i);
+      let multiplier: number;
+      try {
+        multiplier = computeComboMultiplier(selected, CONFIG.rtp);
+      } catch {
+        continue; // range too wide for a no-loss combo at this RTP — see next test
+      }
+      const stake = 100;
+      for (const n of selected) {
+        const { won, net } = settleLuckyNumberCombo(stake, n, selected, multiplier);
+        expect(won).toBe(true);
+        expect(net).toBeGreaterThanOrEqual(0);
+      }
+    }
+  });
+
+  it('loses the full stake only when the result falls outside the selected set', () => {
+    const selected = Array.from({ length: 25 - 7 + 1 }, (_, i) => 7 + i); // 7..25
+    const multiplier = computeComboMultiplier(selected, CONFIG.rtp);
+    const stake = 100;
+    for (const outside of [0, 3, 6, 26, 27]) {
+      const { won, payout, net } = settleLuckyNumberCombo(stake, outside, selected, multiplier);
+      expect(won).toBe(false);
+      expect(payout).toBe(0);
+      expect(net).toBe(-stake);
+    }
+  });
+
+  it('7-25 (the case in the bug report) prices to a real, whole-number multiplier >= 1', () => {
+    const selected = Array.from({ length: 25 - 7 + 1 }, (_, i) => 7 + i);
+    const multiplier = computeComboMultiplier(selected, CONFIG.rtp);
+    expect(Number.isInteger(multiplier)).toBe(true);
+    expect(multiplier).toBeGreaterThanOrEqual(1);
+  });
+
+  it('still respects the house edge in expectation: P(set) * multiplier <= rtp', () => {
+    const probs = sumProbabilities();
+    const selected = [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25];
+    const multiplier = computeComboMultiplier(selected, CONFIG.rtp);
+    const comboProb = selected.reduce((sum, n) => sum + probs.get(n)!, 0);
+    expect(comboProb * multiplier).toBeLessThanOrEqual(CONFIG.rtp + 1e-9);
+  });
+
+  it('throws instead of quietly selling a no-loss combo it cannot actually pay (range too wide)', () => {
+    const allNumbers = Array.from({ length: MAX_SUM - MIN_SUM + 1 }, (_, i) => MIN_SUM + i); // 0..27, P=1
+    expect(() => computeComboMultiplier(allNumbers, CONFIG.rtp)).toThrow();
+  });
+
+  it('rejects an empty selection and out-of-range numbers', () => {
+    expect(() => computeComboMultiplier([], CONFIG.rtp)).toThrow();
+    expect(() => computeComboMultiplier([28], CONFIG.rtp)).toThrow();
+    expect(() => computeComboMultiplier([-1], CONFIG.rtp)).toThrow();
   });
 });

@@ -194,6 +194,72 @@ export function planStakes(
   return { multipliers, stakes, total: suggestedTotal(selected, stakes) };
 }
 
+/**
+ * Combo/range betting ("pick 7-25, don't lose if any of them hits"):
+ * unlike planStakes/settleLuckyNumber, which price and settle every
+ * selected number as an INDEPENDENT bet (so a hit only ever pays back the
+ * one number's stake, not the total staked across the whole selection),
+ * this treats the whole selected set as a SINGLE wagered event — one
+ * total stake, one multiplier, paid in full on ANY hit inside the set.
+ * That's what actually guarantees "no loss no matter which of my picked
+ * numbers is drawn": the payout is sized against the combined probability
+ * of the whole set, not against each number individually.
+ *
+ * m(set) = floor(RTP / P(set)), P(set) = sum of p(n) for n in the set.
+ * The wider the range, the closer P(set) is to 1, so the multiplier floors
+ * toward 1 (breakeven) rather than 0 — small profit, never a loss on a
+ * hit — which matches the "small profit" behavior you're describing.
+ *
+ * If the set is so wide that RTP / P(set) floors below 1, no whole-number
+ * multiplier can pay back the full stake on every hit without exceeding
+ * the game's RTP — this throws rather than silently selling a "no loss"
+ * combo that would actually lose. Narrower the selection, or raise
+ * multiplierCap's effective ceiling by design (not by faking the floor).
+ */
+export function computeComboMultiplier(
+  selected: number[],
+  rtp: number,
+  multiplierCap = DEFAULT_MULTIPLIER_CAP,
+): number {
+  if (!(rtp > 0) || rtp > 1) throw new Error('rtp must be in (0, 1]');
+  const unique = [...new Set(selected)];
+  if (unique.length === 0) throw new Error('Must select at least one number');
+  for (const n of unique) {
+    if (!Number.isInteger(n) || n < MIN_SUM || n > MAX_SUM) {
+      throw new Error(`Selected number ${n} is outside [${MIN_SUM}, ${MAX_SUM}]`);
+    }
+  }
+  const probs = sumProbabilities();
+  const comboProb = unique.reduce((sum, n) => sum + probs.get(n)!, 0);
+  const raw = Math.floor(rtp / comboProb + 1e-9);
+  if (raw < 1) {
+    throw new Error(
+      `Selection covers ${(comboProb * 100).toFixed(1)}% of outcomes — too wide for a ` +
+      `no-loss combo at RTP ${rtp}; narrow the range`,
+    );
+  }
+  return Math.min(raw, multiplierCap);
+}
+
+/**
+ * Settle a combo/range bet: one total stake, won if ANY selected number is
+ * drawn, and — unlike settleLuckyNumber — the payout on a win is the FULL
+ * stake times the combo multiplier, never just a fraction of it. This is
+ * what makes "no loss as long as the result is one of my picked numbers"
+ * actually true (net >= 0 whenever won === true, since comboMultiplier is
+ * always >= 1 — see computeComboMultiplier).
+ */
+export function settleLuckyNumberCombo(
+  stake: number,
+  resultSum: number,
+  selected: number[],
+  comboMultiplier: number,
+): { won: boolean; payout: number; totalStake: number; net: number } {
+  const won = selected.includes(resultSum);
+  const payout = won ? stake * comboMultiplier : 0;
+  return { won, payout, totalStake: stake, net: payout - stake };
+}
+
 /** Settlement is a pure lookup — no randomness, no I/O, so it's trivially idempotent to *compute*; see lucky-number-settlement.ts for making it idempotent to *apply*. */
 export function settleLuckyNumber(
   stakes: Map<number, number>,

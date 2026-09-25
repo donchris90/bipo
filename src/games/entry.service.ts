@@ -4,7 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
 import { RoundService } from './round.service';
 import { validateSelection as validateSumDiceSelection } from './sum-dice-rules';
-import { planStakes, LuckyNumberConfig } from './lucky-number/lucky-number-math';
+import { planStakes, computeComboMultiplier, LuckyNumberConfig } from './lucky-number/lucky-number-math';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { WalletType, LedgerEntryType } from '@prisma/client';
 
@@ -73,9 +73,6 @@ export class EntryService {
       // exactly mirroring what the suggested-stakes endpoint and the
       // client's own display already show — see
       // lucky-number/lucky-number-math.ts and lucky-number.controller.ts.
-      if (!Array.isArray(params.selection) || params.selection.length === 0) {
-        throw new BadRequestException('selection must be a non-empty array of numbers');
-      }
       const config: LuckyNumberConfig = {
         rtp: rules.rtp,
         basePrize: rules.basePrize ?? 1000,
@@ -83,14 +80,50 @@ export class EntryService {
         maxStake: rules.maxStake ?? 1_000_000_000,
         stakeWeightExponent: rules.stakeWeightExponent ?? 1,
       };
-      let plan;
-      try {
-        plan = planStakes(params.selection as number[], config, params.stakeAmount);
-      } catch (e: any) {
-        throw new BadRequestException(e?.message ?? 'Invalid selection');
+
+      // Combo/range mode: { mode: 'combo', numbers: [7,8,...,25] } — one
+      // total stake wagered on the WHOLE set as a single event, priced by
+      // computeComboMultiplier() so any hit inside the set pays back the
+      // full stake (see lucky-number-math.ts for why this is not the same
+      // as just calling planStakes on every number in the range). Kept as
+      // a distinct branch, never inferred from the plain array path, so
+      // existing per-number clients are completely unaffected.
+      const isCombo = !Array.isArray(params.selection)
+        && typeof params.selection === 'object'
+        && params.selection !== null
+        && (params.selection as any).mode === 'combo';
+
+      if (isCombo) {
+        const numbers = (params.selection as any).numbers;
+        if (!Array.isArray(numbers) || numbers.length === 0) {
+          throw new BadRequestException('selection.numbers must be a non-empty array of numbers');
+        }
+        let comboMultiplier: number;
+        try {
+          comboMultiplier = computeComboMultiplier(numbers as number[], config.rtp, rules.multiplierCap);
+        } catch (e: any) {
+          throw new BadRequestException(e?.message ?? 'Invalid selection');
+        }
+        const requested = params.stakeAmount ?? config.minStake;
+        const stake = Math.min(config.maxStake, Math.max(config.minStake, requested));
+        coinAmount = stake;
+        // multiplier is stored alongside the numbers so settlement pays
+        // exactly what this entry was priced at, even if an admin changes
+        // rtp/multiplierCap for the game before the round settles.
+        selectionToStore = { mode: 'combo', numbers, stake, multiplier: comboMultiplier };
+      } else {
+        if (!Array.isArray(params.selection) || params.selection.length === 0) {
+          throw new BadRequestException('selection must be a non-empty array of numbers');
+        }
+        let plan;
+        try {
+          plan = planStakes(params.selection as number[], config, params.stakeAmount);
+        } catch (e: any) {
+          throw new BadRequestException(e?.message ?? 'Invalid selection');
+        }
+        coinAmount = plan.total;
+        selectionToStore = Object.fromEntries(plan.stakes); // object shape — this is what tells settlement to use settleLuckyNumber() instead of the equal-split sum-dice path
       }
-      coinAmount = plan.total;
-      selectionToStore = Object.fromEntries(plan.stakes); // object shape — this is what tells settlement to use settleLuckyNumber() instead of the equal-split sum-dice path
     } else if (isVariableStake) {
       if (typeof params.stakeAmount !== 'number' || !Number.isInteger(params.stakeAmount) || params.stakeAmount <= 0) {
         throw new BadRequestException('stakeAmount is required for this game and must be a positive integer');
