@@ -45,7 +45,8 @@
     "rxjs": "^7.8.1",
     "socket.io": "^4.7.5",
     "uuid": "^9.0.1",
-    "prisma": "^5.19.0"
+    "prisma": "^5.19.0",
+    "express": "^4.19.2"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.4.5",
