@@ -35,6 +35,7 @@ export class LudoController {
     return users;
   }
 
+  @Get('history') history(@Req() req: AuthedRequest) { return this.ludo.matchHistory(req.user.userId); }
   @Post('matches/:matchId/invite') invite(@Req() req: AuthedRequest, @Param('matchId') matchId: string, @Body() body: { toUserId: string }) { return this.ludo.inviteToRoom(req.user.userId, matchId, body.toUserId); }
   @Get('invites') invites(@Req() req: AuthedRequest) { return this.ludo.listInvites(req.user.userId); }
   @Post('invites/:inviteId/accept') accept(@Req() req: AuthedRequest, @Param('inviteId') inviteId: string, @Body() body: { displayName?: string }) { return this.ludo.acceptInvite(req.user.userId, inviteId, body.displayName?.trim() || 'Player', req.user.countryCode || 'NG'); }

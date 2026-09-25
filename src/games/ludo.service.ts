@@ -19,7 +19,11 @@ const BOT_NAMES = ['Ava', 'Max', 'Zara', 'Leo', 'Nia', 'Kai'];
 interface QueueItem { userId: string; displayName: string; entryFee: number; playerCount: 2 | 4; ticket?: string; synthetic?: boolean; }
 interface QuickTicket { ticket: string; userId: string; entryFee: number; playerCount: 2 | 4; status: 'WAITING' | 'STARTED' | 'CANCELLED'; matchId?: string; roomCode?: string; players?: number; state?: LudoState; createdAt: string; lastSeenAt?: number; }
 interface Room { matchId: string; roomCode: string; entryFee: number; playerCount: 2 | 4; players: QueueItem[]; creatorId: string; started: boolean; }
-interface LudoInvite { id: string; matchId: string; roomCode: string; fromUserId: string; toUserId: string; createdAt: string; expiresAt: string; }
+interface LudoInvite {
+  id: string; matchId: string; roomCode: string; fromUserId: string; toUserId: string; createdAt: string; expiresAt: string;
+  // So the invite can say how much is staked and by whom without the client having to look the room up separately.
+  entryFee: number; playerCount: 2 | 4; fromDisplayName: string;
+}
 
 @Injectable()
 export class LudoService implements OnModuleDestroy {
@@ -262,12 +266,16 @@ export class LudoService implements OnModuleDestroy {
   async quickMatchLobby() {
     const keys = new Set<string>(this.queues.keys());
     try { for (const k of await this.redis.keys('ludo:queue:*')) keys.add(k.replace('ludo:queue:', '')); } catch { /* local queues only */ }
-    const rows: Array<{ entryFee: number; playerCount: number; waiting: number }> = [];
+    // A few real display names per queue, so the lobby can show who is actually waiting
+    // rather than a bare count. Capped well below the queue size — this is a taste of who
+    // is there, not a directory, and it keeps the payload small when a queue is long.
+    const NAMES_SHOWN = 5;
+    const rows: Array<{ entryFee: number; playerCount: number; waiting: number; players: string[] }> = [];
     for (const key of keys) {
       const [fee, count] = key.split(':').map(Number);
       if (!Number.isFinite(fee) || !Number.isFinite(count)) continue;
-      const waiting = (await this.pruneStale(await this.readQueue(key))).length;
-      if (waiting > 0) rows.push({ entryFee: fee, playerCount: count, waiting });
+      const pruned = await this.pruneStale(await this.readQueue(key));
+      if (pruned.length > 0) rows.push({ entryFee: fee, playerCount: count, waiting: pruned.length, players: pruned.slice(0, NAMES_SHOWN).map((q) => q.displayName) });
     }
     return rows;
   }
@@ -624,6 +632,50 @@ export class LudoService implements OnModuleDestroy {
     return this.prisma.user.findMany({ where: { id: { in: userIds }, ...base }, select: { id: true, displayName: true, avatarUrl: true }, orderBy: { displayName: 'asc' }, take: 100 });
   }
 
+  // A player's own recent paid Ludo matches, newest first, with the other seats at the table
+  // and what they won or lost. Practice matches never create a GameEntry (nothing was staked),
+  // so they never show up here, which matches "no coins were at stake" everywhere else.
+  // Two reads rather than a join: GameEntry carries no relation to GameRound in this schema,
+  // and this mirrors the same read-time-aggregation tradeoff already made in games.controller.ts.
+  async matchHistory(userId: string, limit = 20) {
+    const ROUNDS_SCANNED = 200; // enough recent Ludo rounds to almost always contain this player's last `limit` matches
+    const rounds = await this.prisma.gameRound.findMany({
+      where: { gameCode: 'LUDO', status: 'SETTLED' },
+      orderBy: { settledAt: 'desc' },
+      take: ROUNDS_SCANNED,
+      select: { id: true, settledAt: true, entryPrice: true, result: true, hiddenState: true },
+    });
+    if (!rounds.length) return [];
+    const entries = await this.prisma.gameEntry.findMany({
+      where: { roundId: { in: rounds.map((r) => r.id) }, userId },
+      select: { roundId: true, coinAmount: true, rewardAmount: true, status: true },
+    });
+    if (!entries.length) return [];
+    const entryByRound = new Map(entries.map((e) => [e.roundId, e]));
+    return rounds
+      .filter((r) => entryByRound.has(r.id))
+      .slice(0, limit)
+      .map((r) => {
+        const entry = entryByRound.get(r.id)!;
+        const result = (r.result ?? {}) as { winnerUserId?: string; secondPlaceUserId?: string };
+        const hidden = (r.hiddenState ?? {}) as { players?: Array<{ userId: string; displayName: string; color: string }> };
+        const seats = Array.isArray(hidden.players) ? hidden.players : [];
+        const place = result.winnerUserId === userId ? 1 : result.secondPlaceUserId === userId ? 2 : null;
+        return {
+          matchId: r.id,
+          settledAt: r.settledAt,
+          entryFee: r.entryPrice,
+          playerCount: seats.length || undefined,
+          place,
+          won: entry.status === 'WON',
+          stake: entry.coinAmount,
+          reward: entry.rewardAmount,
+          net: entry.rewardAmount - entry.coinAmount,
+          opponents: seats.filter((p) => p.userId !== userId).map((p) => ({ displayName: p.displayName, color: p.color })),
+        };
+      });
+  }
+
   async inviteToRoom(fromUserId: string, matchId: string, toUserId: string) {
     const room = [...this.rooms.values()].find(r => r.matchId === matchId) ?? await this.findRoomByMatchId(matchId);
     if (!room) throw new NotFoundException('Ludo room not found');
@@ -631,7 +683,11 @@ export class LudoService implements OnModuleDestroy {
     if (room.started) throw new BadRequestException('Match already started');
     if (room.players.some(p => p.userId === toUserId)) throw new BadRequestException('Player is already in the room');
     if (room.players.length >= room.playerCount) throw new BadRequestException('Room is full');
-    const invite: LudoInvite = { id: uuid(), matchId, roomCode: room.roomCode, fromUserId, toUserId, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() };
+    const fromDisplayName = room.players.find((p) => p.userId === fromUserId)?.displayName || 'A player';
+    const invite: LudoInvite = {
+      id: uuid(), matchId, roomCode: room.roomCode, fromUserId, toUserId, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+      entryFee: room.entryFee, playerCount: room.playerCount, fromDisplayName,
+    };
     this.localInvites.set(invite.id, invite);
     const ids = this.localInviteIds.get(toUserId) ?? new Set<string>(); ids.add(invite.id); this.localInviteIds.set(toUserId, ids);
     try {
