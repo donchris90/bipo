@@ -33,6 +33,9 @@ import { KycModule } from './kyc/kyc.module';
 import { AnnouncementsModule } from './announcements/announcements.module';
 import { ProfilesModule } from './profiles/profiles.module';
 import { WebhookRouterModule } from './common/webhook-router.service';
+import { HostLevelsModule } from './host-levels/host-levels.module';
+import { ModerationModule } from './moderation/moderation.module';
+import { HealthModule } from './health/health.module';
 
 @Module({
   imports: [
@@ -70,6 +73,9 @@ import { WebhookRouterModule } from './common/webhook-router.service';
     AnnouncementsModule,
     ProfilesModule,
     WebhookRouterModule,
+    HostLevelsModule,
+    ModerationModule,
+    HealthModule,
   ],
 })
 export class AppModule {}

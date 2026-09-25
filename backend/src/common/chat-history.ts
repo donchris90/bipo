@@ -1,6 +1,7 @@
 import { BadRequestException } from '@nestjs/common';
 import { ChatContext } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { publicName } from './public-name';
 
 export interface ChatHistoryItem {
   id: string;
@@ -48,7 +49,7 @@ export async function fetchChatHistory(
   return rows.reverse().map((r) => ({
     id: r.id,
     senderId: r.senderId,
-    senderName: nameById.get(r.senderId) ?? null,
+    senderName: publicName(nameById.get(r.senderId), r.senderId),
     content: r.content,
     createdAt: r.createdAt,
   }));

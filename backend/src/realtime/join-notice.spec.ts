@@ -51,10 +51,10 @@ describe('"X joined" notice in the chat', () => {
     expect(emitted).toHaveLength(3);
   });
 
-  it('a person with no display name shows as "Someone", and a failed name lookup never blocks joining', async () => {
+  it('a person with no display name shows as a short handle (never "Someone"/"Guest"), and a failed name lookup never blocks joining', async () => {
     const anon = build({ nameLookup: async () => ({ displayName: null }) });
     await anon.gw.handleJoin({ context: 'LIVE', contextId: 's1' }, anon.client);
-    expect(anon.emitted[0].payload.content).toBe('Someone joined');
+    expect(anon.emitted[0].payload.content).toBe('User U1 joined');
     const broken = build({ nameLookup: async () => { throw new Error('db'); } });
     expect(await broken.gw.handleJoin({ context: 'LIVE', contextId: 's1' }, broken.client)).toEqual({ joined: true });
     expect(broken.rooms).toEqual(['LIVE:s1']);

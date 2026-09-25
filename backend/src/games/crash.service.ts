@@ -56,10 +56,8 @@ export class CrashService {
   // settlement (see the schema comment and games.controller.ts's ROUND_SELECT) —
   // and returns the wall-clock instant the round will actually crash, so the
   // caller can schedule the one job that reveals it.
-  async initializeCrashRound(roundId: string, rules: CrashRules, lockAt: Date, secret: string, roundData: string): Promise<Date> {
-    // Crash results are derived from the committed server secret, so the
-    // revealed secret + public round data can reproduce the exact result.
-    const randomInt = this.rng.randomInRangeFromSecret(secret, `crash:${roundData}`, 0, 2 ** 32 - 1);
+  async initializeCrashRound(roundId: string, rules: CrashRules, lockAt: Date): Promise<Date> {
+    const randomInt = this.rng.randomInRange(0, 2 ** 31 - 1);
     const crashPoint = generateCrashPoint(randomInt, rules.houseEdge);
 
     await this.prisma.gameRound.update({

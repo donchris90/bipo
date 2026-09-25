@@ -115,19 +115,31 @@ async function main() {
     },
   });
 
-  // Sum-dice numbers game (Big/Small/Odd/Even + individual number picks
-  // against the sum of 3 dice, 0-9 each — see games/sum-dice-rules.ts for
-  // the actual math). payoutMultiplier here is flat across every number
-  // 0-27, per the confirmed design — not probability-weighted, so the
-  // house edge comes from the aggregate distribution, not per-number odds.
+  // Lucky Number: three independent secure server-side digits (0-9) are
+  // summed to 0-27. RTP and base prize drive the per-number multiplier and
+  // suggested stake table at runtime; nothing is hard-coded into the payout
+  // table. SUM_DICE remains the code for existing navigation/API compatibility.
   await prisma.gameDefinition.upsert({
     where: { code: 'SUM_DICE' },
-    update: { rulesJson: { payoutMultiplier: 9, diceCount: 3, diceSides: 10, openSeconds: 30, minStake: 10 } },
+    update: {},
     create: {
       code: 'SUM_DICE',
-      name: 'Big Small Odd Even',
+      name: 'Lucky Number',
       status: 'DISABLED',
-      rulesJson: { payoutMultiplier: 9, diceCount: 3, diceSides: 10, openSeconds: 30, minStake: 10 },
+      rulesJson: { rtp: 0.95, basePrize: 1000, stakeWeightExponent: 1.2798473, diceCount: 3, diceSides: 10, openSeconds: 30, minStake: 1, maxStake: 1000000 },
+    },
+  });
+
+  // Ludo is a persistent real-time paid match. It is disabled by default
+  // until the operator enables the game and its country region.
+  await prisma.gameDefinition.upsert({
+    where: { code: 'LUDO' },
+    update: {},
+    create: {
+      code: 'LUDO',
+      name: 'Ludo',
+      status: 'DISABLED',
+      rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 20, reconnectSeconds: 120, prizeFirstPercent: 70, prizeSecondPercent: 30 },
     },
   });
 

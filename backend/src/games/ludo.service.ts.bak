@@ -1,0 +1,247 @@
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { WalletService } from '../economy/wallet.service';
+import { RoundService } from './round.service';
+import { LedgerEntryType, WalletType } from '@prisma/client';
+import { v4 as uuid } from 'uuid';
+import { randomInt } from 'node:crypto';
+import { createLudoState, LudoState, RECONNECT_GRACE_MS, TURN_MS, advanceTurn, applyMove, legalMoves, playerFinished, rollForTurn } from './ludo.rules';
+
+interface QueueItem { userId: string; displayName: string; entryFee: number; playerCount: 2 | 4; }
+interface Room { matchId: string; roomCode: string; entryFee: number; playerCount: 2 | 4; players: QueueItem[]; creatorId: string; started: boolean; }
+
+@Injectable()
+export class LudoService {
+  private readonly queues = new Map<string, QueueItem[]>();
+  private readonly rooms = new Map<string, Room>();
+  private readonly states = new Map<string, LudoState>();
+  private readonly disconnectTimers = new Map<string, NodeJS.Timeout>();
+
+  constructor(private readonly prisma: PrismaService, private readonly wallet: WalletService, private readonly rounds: RoundService) {}
+
+  private queueKey(entryFee: number, playerCount: 2 | 4) { return `${entryFee}:${playerCount}`; }
+
+  async ensureDefinition() {
+    return this.prisma.gameDefinition.upsert({
+      where: { code: 'LUDO' },
+      update: {},
+      create: {
+        code: 'LUDO', name: 'Ludo', status: 'DISABLED', version: 1,
+        rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 20, reconnectSeconds: 120, prizeFirstPercent: 70, prizeSecondPercent: 30 },
+      },
+    });
+  }
+
+  async quickMatch(userId: string, displayName: string, entryFee: number, playerCount: 2 | 4, countryCode = 'NG') {
+    const game = await this.ensureDefinition();
+    await this.rounds.assertGameAvailable('LUDO', countryCode);
+    if (playerCount !== 2 && playerCount !== 4) throw new BadRequestException('Invalid Ludo player count');
+    const rules = (game.rulesJson ?? {}) as any;
+    if (!Number.isInteger(entryFee) || entryFee < Number(rules.minEntry ?? 100) || entryFee > Number(rules.maxEntry ?? 500000)) throw new BadRequestException('Invalid Ludo entry amount');
+    await this.requireBalance(userId, entryFee);
+    const key = this.queueKey(entryFee, playerCount);
+    const queue = (this.queues.get(key) ?? []).filter(x => x.userId !== userId);
+    queue.push({ userId, displayName, entryFee, playerCount });
+    this.queues.set(key, queue);
+    if (queue.length < playerCount) return { status: 'WAITING', players: queue.length, playerCount };
+    const players = queue.splice(0, playerCount);
+    this.queues.set(key, queue);
+    return this.startMatch(players, undefined);
+  }
+
+  async createRoom(userId: string, displayName: string, entryFee: number, playerCount: 2 | 4, countryCode = 'NG') {
+    const game = await this.ensureDefinition();
+    await this.rounds.assertGameAvailable('LUDO', countryCode);
+    if (playerCount !== 2 && playerCount !== 4) throw new BadRequestException('Invalid Ludo player count');
+    const rules = (game.rulesJson ?? {}) as any;
+    if (!Number.isInteger(entryFee) || entryFee < Number(rules.minEntry ?? 100) || entryFee > Number(rules.maxEntry ?? 500000)) throw new BadRequestException('Invalid Ludo entry amount');
+    await this.requireBalance(userId, entryFee);
+    const matchId = uuid();
+    const roomCode = this.makeRoomCode();
+    this.rooms.set(roomCode, { matchId, roomCode, entryFee, playerCount, players: [{ userId, displayName, entryFee, playerCount }], creatorId: userId, started: false });
+    return { status: 'WAITING', matchId, roomCode, players: 1, playerCount };
+  }
+
+  async joinRoom(userId: string, displayName: string, roomCode: string, countryCode = 'NG') {
+    const room = this.rooms.get(roomCode.toUpperCase());
+    if (!room) throw new NotFoundException('Ludo room not found');
+    await this.rounds.assertGameAvailable('LUDO', countryCode);
+    if (room.started) throw new BadRequestException('Match already started');
+    if (room.players.some(p => p.userId === userId)) return this.startIfReady(room);
+    if (room.players.length >= room.playerCount) throw new BadRequestException('Room is full');
+    await this.requireBalance(userId, room.entryFee);
+    room.players.push({ userId, displayName, entryFee: room.entryFee, playerCount: room.playerCount });
+    return this.startIfReady(room);
+  }
+
+  private async startIfReady(room: Room) {
+    if (room.players.length < room.playerCount) return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount };
+    room.started = true;
+    this.rooms.set(room.roomCode, room);
+    return this.startMatch(room.players, room);
+  }
+
+  private async startMatch(players: QueueItem[], room?: Room) {
+    const matchId = room?.matchId ?? uuid();
+    const roomCode = room?.roomCode ?? this.makeRoomCode();
+    const entryFee = players[0].entryFee;
+    const playerCount = players.length as 2 | 4;
+    const totalPool = entryFee * playerCount;
+    const game = await this.prisma.gameDefinition.findUnique({ where: { code: 'LUDO' }, select: { rulesJson: true } });
+    const rules = (game?.rulesJson ?? {}) as any;
+    const firstPct = Number(rules.prizeFirstPercent ?? 70);
+    const prizeFirst = Math.floor(totalPool * (firstPct / 100));
+    const prizeSecond = totalPool - prizeFirst;
+    const now = new Date();
+
+    // Debit all entries atomically with their durable GameEntry records.
+    const round = await this.prisma.$transaction(async tx => {
+      const created = await tx.gameRound.create({ data: { id: matchId, gameCode: 'LUDO', rulesVersion: 1, entryPrice: entryFee, openAt: now, lockAt: new Date(now.getTime() + 10_000), status: 'OPEN', hiddenState: {} as any } });
+      for (const p of players) {
+        await this.wallet.debit({ userId: p.userId, walletType: WalletType.COIN, amount: BigInt(entryFee), ledgerType: LedgerEntryType.GAME_ENTRY, reference: created.id, idempotencyKey: `ludo_entry:${created.id}:${p.userId}` }, tx);
+        await tx.gameEntry.create({ data: { roundId: created.id, userId: p.userId, selection: { roomCode }, coinAmount: entryFee, idempotencyKey: `ludo_entry_record:${created.id}:${p.userId}` } });
+      }
+      return created;
+    });
+
+    const state = createLudoState({ matchId, roomCode, entryFee, playerCount, players, prizeFirst, prizeSecond });
+    this.states.set(matchId, state);
+    await this.persistState(state);
+    return { status: 'STARTED', matchId, roomCode, state };
+  }
+
+  async getState(matchId: string) {
+    const local = this.states.get(matchId);
+    if (local) return this.publicState(local);
+    const round = await this.prisma.gameRound.findUnique({ where: { id: matchId } });
+    if (!round || round.gameCode !== 'LUDO') throw new NotFoundException('Ludo match not found');
+    if (round.hiddenState && typeof round.hiddenState === 'object') return round.hiddenState;
+    throw new NotFoundException('Ludo state unavailable');
+  }
+
+  async roll(userId: string, matchId: string) {
+    const state = await this.requireState(matchId);
+    const player = this.playerFor(state, userId);
+    if (state.currentSeat !== player.seat) throw new BadRequestException('Not your turn');
+    const result = rollForTurn(state, player.seat);
+    if (result.threeSixPenalty) {
+      player.consecutiveSixes = 0;
+      advanceTurn(state, player.seat, false);
+    } else if (result.legalMoves.length === 0) {
+      advanceTurn(state, player.seat, result.dice === 6);
+    }
+    await this.persistState(state);
+    return this.publicState(state);
+  }
+
+  async move(userId: string, matchId: string, tokenIndex: number) {
+    const state = await this.requireState(matchId);
+    const player = this.playerFor(state, userId);
+    if (state.currentSeat !== player.seat) throw new BadRequestException('Not your turn');
+    if (state.lastRoll == null) throw new BadRequestException('Roll the dice first');
+    const dice = state.lastRoll;
+    const legal = legalMoves(state, player.seat, dice);
+    if (!legal.includes(tokenIndex)) throw new BadRequestException('Illegal token');
+    applyMove(state, player.seat, tokenIndex, dice);
+    const finished = playerFinished(player);
+    if (finished && !player.finishedAt) player.finishedAt = new Date().toISOString();
+    const placementCount = state.players.filter(p => p.finishedAt).length;
+    if (placementCount === 1) state.winnerUserId = player.userId;
+    if (placementCount === 2 && !state.secondPlaceUserId) state.secondPlaceUserId = player.userId;
+    if (placementCount >= 2 || finished && state.players.filter(p => !p.finishedAt).length === 1) {
+      await this.finishMatch(state);
+      return this.publicState(state);
+    }
+    const extraTurn = dice === 6;
+    advanceTurn(state, player.seat, extraTurn);
+    await this.persistState(state);
+    return this.publicState(state);
+  }
+
+  async reconnect(userId: string, matchId: string) {
+    const state = await this.requireState(matchId);
+    const player = this.playerFor(state, userId);
+    player.connected = true; player.bot = false;
+    const timer = this.disconnectTimers.get(`${matchId}:${userId}`);
+    if (timer) { clearTimeout(timer); this.disconnectTimers.delete(`${matchId}:${userId}`); }
+    await this.persistState(state);
+    return this.publicState(state);
+  }
+
+  async disconnect(userId: string, matchId: string) {
+    const state = this.states.get(matchId); if (!state) return;
+    const player = state.players.find(p => p.userId === userId); if (!player) return;
+    player.connected = false; player.bot = true;
+    await this.persistState(state);
+    const key = `${matchId}:${userId}`;
+    const old = this.disconnectTimers.get(key); if (old) clearTimeout(old);
+    this.disconnectTimers.set(key, setTimeout(() => { this.disconnectTimers.delete(key); }, RECONNECT_GRACE_MS));
+  }
+
+  async tickActiveMatches() {
+    const states: LudoState[] = [];
+    for (const matchId of this.states.keys()) {
+      try { states.push(await this.tick(matchId)); } catch { /* one match must never stop the bot loop for others */ }
+    }
+    return states;
+  }
+
+  async tick(matchId: string) {
+    const state = await this.requireState(matchId);
+    if (state.status !== 'ACTIVE' || Date.now() < Date.parse(state.turnExpiresAt)) return this.publicState(state);
+    const player = state.players[state.currentSeat];
+    if (!player) return this.publicState(state);
+    // A timed-out turn is always resolved by the same server-side bot rules.
+    const result = rollForTurn(state, player.seat);
+    if (result.threeSixPenalty || result.legalMoves.length === 0) {
+      player.consecutiveSixes = 0;
+      advanceTurn(state, player.seat, false);
+    } else {
+      const tokenIndex = result.legalMoves[0];
+      applyMove(state, player.seat, tokenIndex, result.dice);
+      if (playerFinished(player)) {
+        player.finishedAt = new Date().toISOString();
+        if (!state.winnerUserId) state.winnerUserId = player.userId;
+        else if (!state.secondPlaceUserId) state.secondPlaceUserId = player.userId;
+      }
+      if (state.winnerUserId && state.secondPlaceUserId) await this.finishMatch(state);
+      else advanceTurn(state, player.seat, result.dice === 6);
+    }
+    await this.persistState(state);
+    return this.publicState(state);
+  }
+
+  private async finishMatch(state: LudoState) {
+    if (state.status === 'FINISHED') return;
+    state.status = 'FINISHED';
+    const round = await this.prisma.gameRound.findUnique({ where: { id: state.matchId } });
+    if (!round || round.status === 'SETTLED') return;
+    const payouts = new Map<string, number>();
+    if (state.winnerUserId) payouts.set(state.winnerUserId, state.prizeFirst);
+    if (state.secondPlaceUserId) payouts.set(state.secondPlaceUserId, state.prizeSecond);
+    await this.prisma.$transaction(async tx => {
+      for (const [userId, amount] of payouts) {
+        const entry = await tx.gameEntry.findFirst({ where: { roundId: state.matchId, userId, status: 'PLACED' } });
+        if (!entry) continue;
+        if (amount > 0) {
+          await this.wallet.credit({ userId, walletType: WalletType.COIN, amount: BigInt(amount), ledgerType: LedgerEntryType.GAME_REWARD, reference: entry.id, idempotencyKey: `ludo_reward:${entry.id}` }, tx);
+        }
+        await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'WON', rewardAmount: amount } });
+      }
+      await tx.gameEntry.updateMany({ where: { roundId: state.matchId, status: 'PLACED' }, data: { status: 'LOST', rewardAmount: 0 } });
+      await tx.gameRound.update({ where: { id: state.matchId }, data: { status: 'SETTLED', result: { winnerUserId: state.winnerUserId, secondPlaceUserId: state.secondPlaceUserId, prizeFirst: state.prizeFirst, prizeSecond: state.prizeSecond }, settledAt: new Date(), hiddenState: state as any } });
+    });
+  }
+
+  private async requireState(matchId: string) { const state = this.states.get(matchId); if (state) return state; const data = await this.getState(matchId); this.states.set(matchId, data as LudoState); return data as LudoState; }
+  private playerFor(state: LudoState, userId: string) { const p = state.players.find(p => p.userId === userId); if (!p) throw new BadRequestException('You are not a player in this match'); return p; }
+  private async requireBalance(userId: string, amount: number) { const balance = await this.wallet.getBalance(userId, WalletType.COIN); if (balance < BigInt(amount)) throw new BadRequestException('Insufficient balance'); }
+  private async persistState(state: LudoState) { await this.prisma.gameRound.update({ where: { id: state.matchId }, data: { hiddenState: state as any } }); }
+  private publicState(state: LudoState) { return state; }
+  private makeRoomCode() {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 6; i += 1) code += alphabet[randomInt(0, alphabet.length)];
+    return code;
+  }
+}

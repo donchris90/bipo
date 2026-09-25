@@ -1,5 +1,5 @@
 import { Injectable } from '@nestjs/common';
-import { randomInt, randomBytes, createHash, createHmac } from 'crypto';
+import { randomInt, randomBytes, createHash } from 'crypto';
 
 // Never Math.random() for anything financial (spec §41/§94). This is the
 // only place a game result should be generated — RoundService calls this,
@@ -13,25 +13,6 @@ export class RngService {
 
   generateSecret(): string {
     return randomBytes(32).toString('hex');
-  }
-
-  /**
-   * Deterministic, cryptographically-derived integer for commit/reveal games.
-   * Rejection sampling avoids modulo bias for ranges that do not divide 2^32.
-   */
-  randomInRangeFromSecret(secret: string, context: string, min: number, max: number): number {
-    if (!Number.isInteger(min) || !Number.isInteger(max) || max < min) {
-      throw new Error('Invalid deterministic RNG range');
-    }
-    const range = max - min + 1;
-    const UINT32 = 2 ** 32;
-    const limit = Math.floor(UINT32 / range) * range;
-    for (let counter = 0; counter < 1024; counter++) {
-      const digest = createHmac('sha256', secret).update(`${context}:${counter}`).digest();
-      const value = digest.readUInt32BE(0);
-      if (value < limit) return min + (value % range);
-    }
-    throw new Error('Deterministic RNG failed to produce a value');
   }
 
   // Commit-reveal (spec §42): publish the hash before the round opens (so

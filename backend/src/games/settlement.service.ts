@@ -4,9 +4,9 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
 import { RngService } from './rng.service';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
-import { isWinningNumber, computeSumDiceReward, DiceConfig } from './sum-dice-rules';
+import { rollDice, isWinningNumber, computeSumDiceReward, DiceConfig } from './sum-dice-rules';
 import { WalletType, LedgerEntryType } from '@prisma/client';
-import { buildRoundData } from './game-fairness';
+import { multiplierForNumber, validateLuckyConfig, type LuckySelection } from './lucky-number-rules';
 
 // Pure and exported specifically so it's unit-testable without a database —
 // this is the line between "you won" and "you didn't" for real money, so it
@@ -46,22 +46,16 @@ export class SettlementService {
 
     const game = await this.prisma.gameDefinition.findUnique({ where: { code: round.gameCode } });
     const rules = (game?.rulesJson as any) ?? {};
-    const payoutMultiplier = rules.payoutMultiplier ?? 20;
     const isSumDice = round.selectionCount == null && !!rules.diceCount && !!rules.diceSides;
-
-    const roundData = buildRoundData(round);
-    const secret = round.revealData;
-    if (!secret) throw new BadRequestException('Round has no fairness secret');
+    const isLuckyNumber = isSumDice && round.gameCode === 'SUM_DICE' && typeof rules.rtp === 'number' && typeof rules.basePrize === 'number';
+    const luckyConfig = isLuckyNumber ? validateLuckyConfig({ rtp: rules.rtp, basePrize: rules.basePrize, stakeWeightExponent: rules.stakeWeightExponent }) : null;
+    const payoutMultiplier = rules.payoutMultiplier ?? 20;
 
     const drawResult = isSumDice
-      ? (() => {
-          const config = { diceCount: rules.diceCount, diceSides: rules.diceSides } as DiceConfig;
-          const dice = Array.from({ length: config.diceCount }, (_, index) =>
-            this.rng.randomInRangeFromSecret(secret, `dice:${roundData}:${index}`, 0, config.diceSides - 1),
-          );
-          return { dice, sum: dice.reduce((a, b) => a + b, 0) };
-        })()
-      : { dice: this.generateResult(round, secret, roundData), sum: null as number | null };
+      ? rollDice({ diceCount: rules.diceCount, diceSides: rules.diceSides } as DiceConfig, () =>
+          this.rng.randomInRange(0, rules.diceSides - 1),
+        )
+      : { dice: this.generateResult(round), sum: null as number | null };
 
     // Only live entries: anything already refunded/settled must never be paid again.
     const entries = await this.prisma.gameEntry.findMany({ where: { roundId, status: 'PLACED' } });
@@ -70,22 +64,24 @@ export class SettlementService {
       let won: boolean;
       let rewardAmount: number;
 
-      if (isSumDice) {
+      if (isLuckyNumber) {
+        const selected = entry.selection as unknown as LuckySelection;
+        const numbers = Array.isArray(selected?.numbers) ? selected.numbers : [];
+        const stakes = selected?.stakes && typeof selected.stakes === 'object' ? selected.stakes : {};
+        won = numbers.includes(drawResult.sum!);
+        const winningStake = Number((stakes as Record<string, unknown>)[String(drawResult.sum!)] ?? 0);
+        const winningMultiplier = multiplierForNumber(drawResult.sum!, luckyConfig!.rtp);
+        rewardAmount = won && winningStake > 0 ? winningStake * winningMultiplier : 0;
+      } else if (isSumDice) {
         won = isWinningNumber(entry.selection as number[], drawResult.sum!);
         const selected = entry.selection as number[];
-        const winningMultiplier = rules.numberPayouts && typeof rules.numberPayouts === 'object'
-          ? Number((rules.numberPayouts as Record<string, unknown>)[String(drawResult.sum!) ] ?? 0)
-          : payoutMultiplier;
-        rewardAmount = computeSumDiceReward(
-          entry.coinAmount,
-          selected.length,
-          winningMultiplier,
-          won,
-        );
+        rewardAmount = computeSumDiceReward(entry.coinAmount, selected.length, payoutMultiplier, won);
       } else {
         won = isWinningSelection(entry.selection, drawResult.dice);
         rewardAmount = won ? entry.coinAmount * payoutMultiplier : 0;
       }
+
+      const netAmount = rewardAmount - entry.coinAmount;
 
       // Same per-entry atomicity fix as CrashService.settleCrash() — credit
       // and the WON/LOST status update commit together, so a failure in
@@ -101,13 +97,13 @@ export class SettlementService {
           );
           return tx.gameEntry.update({
             where: { id: entry.id },
-            data: { status: 'WON', rewardAmount },
+            data: { status: 'WON', rewardAmount, netAmount },
           });
         }, EXTENDED_TX_OPTIONS);
       } else {
         await this.prisma.gameEntry.update({
           where: { id: entry.id },
-          data: { status: 'LOST', rewardAmount: 0 },
+          data: { status: 'LOST', rewardAmount: 0, netAmount },
         });
       }
     }
@@ -166,7 +162,7 @@ export class SettlementService {
             tx,
           );
         }
-        await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'REFUNDED', rewardAmount: 0 } });
+        await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'REFUNDED', rewardAmount: 0, netAmount: -entry.coinAmount } });
       }, EXTENDED_TX_OPTIONS);
       refunded++;
     }
@@ -175,16 +171,11 @@ export class SettlementService {
     return { refunded };
   }
 
-  private generateResult(
-    round: { gameCode: string; openAt: Date; lockAt: Date; numberRange: number | null; selectionCount: number | null },
-    secret: string,
-    roundData: string,
-  ): number[] {
+  private generateResult(round: { numberRange: number | null; selectionCount: number | null }): number[] {
     if (round.numberRange && round.selectionCount) {
       const drawn = new Set<number>();
-      let index = 0;
       while (drawn.size < round.selectionCount) {
-        drawn.add(this.rng.randomInRangeFromSecret(secret, `pick:${roundData}:${index++}`, 1, round.numberRange));
+        drawn.add(this.rng.randomInRange(1, round.numberRange));
       }
       return Array.from(drawn);
     }

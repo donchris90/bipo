@@ -14,6 +14,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ModerationService } from '../moderation/moderation.service';
 import { ChatContext } from '@prisma/client';
 import { isBlockedEitherWay } from '../common/blocks';
+import { publicName } from '../common/public-name';
 
 interface AuthedSocket extends Socket {
   data: { userId?: string };
@@ -117,16 +118,19 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     // needs played back. Only LIVE/ROOM have an actual chat feed for this
     // to appear in — 'pk' and other free-form contexts reuse this handler
     // too but have nowhere to show it.
-    if (data.context === 'LIVE' && this.shouldAnnounceJoin(userId, `${data.context}:${data.contextId}`)) {
+    if ((data.context === 'LIVE' || data.context === 'ROOM') && this.shouldAnnounceJoin(userId, `${data.context}:${data.contextId}`)) {
       try {
         const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true } });
         client.to(`${data.context}:${data.contextId}`).emit('chat:message', {
           id: `join:${userId}:${Date.now()}`,
           senderId: 'system',
           senderName: null,
-          content: `${user?.displayName?.trim() || 'Someone'} joined`,
+          content: `${publicName(user?.displayName, userId)} joined`,
           createdAt: new Date().toISOString(),
           system: true,
+          // Who arrived, so the app can open their profile when the line is tapped.
+          presence: true,
+          userId,
         });
       } catch {
         /* an arrival notice must never stop someone joining */
@@ -168,7 +172,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(`${data.context}:${data.contextId}`).emit('chat:message', {
       id: message.id,
       senderId: message.senderId,
-      senderName: sender?.displayName ?? null,
+      senderName: publicName(sender?.displayName, userId),
       content: message.content,
       createdAt: message.createdAt,
     });

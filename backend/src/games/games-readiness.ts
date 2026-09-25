@@ -33,8 +33,8 @@ const ROUNDS_STALE_MS = 3 * 60 * 1000;
 // Mirrors what the round scheduler can create rounds for: a dice game (diceCount + diceSides)
 // or a crash game (houseEdge + growthRate). Anything else would take bets that can never win.
 export function canRunRounds(rulesJson: unknown): boolean {
-  const r = (rulesJson ?? {}) as { diceCount?: unknown; diceSides?: unknown; houseEdge?: unknown; growthRate?: unknown };
-  return (!!r.diceCount && !!r.diceSides) || (typeof r.houseEdge === 'number' && typeof r.growthRate === 'number');
+  const r = (rulesJson ?? {}) as { diceCount?: unknown; diceSides?: unknown; houseEdge?: unknown; growthRate?: unknown; turnSeconds?: unknown; prizeFirstPercent?: unknown };
+  return (!!r.diceCount && !!r.diceSides) || (typeof r.houseEdge === 'number' && typeof r.growthRate === 'number') || (typeof r.turnSeconds === 'number' && typeof r.prizeFirstPercent === 'number');
 }
 
 export function evaluateReadiness(i: ReadinessInput) {
@@ -61,7 +61,7 @@ export function evaluateReadiness(i: ReadinessInput) {
       problems.push({
         key: 'unsupported',
         title: `${g.name} is Active but cannot run`,
-        hint: 'This game has no dice or crash rules, so no rounds can be created for it (they could not be won). Set it to Disabled — the Lucky Number screen in the app is the Big Small Odd Even game.',
+        hint: 'This game is missing its supported game-engine rules. Set it to Disabled until its rules are configured.',
         fix: { action: 'disable_game', gameCode: g.code },
       });
     } else if (!isActive && !unsupported) {
@@ -87,9 +87,10 @@ export function evaluateReadiness(i: ReadinessInput) {
       return { countryCode: c.countryCode, countryName: c.countryName, playable: ok, problems: cp };
     });
 
-    // Rounds are what players actually bet on: an active game should always have one open or recent.
-    let roundsRunning: boolean | null = null;
-    if (isActive && !unsupported) {
+    // Ludo uses a persistent match room instead of the scheduler's timed rounds.
+    const realTimeMatch = g.code === 'LUDO';
+    let roundsRunning: boolean | null = realTimeMatch ? null : null;
+    if (isActive && !unsupported && !realTimeMatch) {
       const last = i.lastRoundAt[g.code];
       roundsRunning = !!i.hasOpenRound[g.code] || (!!last && i.now.getTime() - last.getTime() < ROUNDS_STALE_MS);
       if (!roundsRunning && i.redis.ok) {

@@ -19,6 +19,7 @@ import { ModerationService } from '../moderation/moderation.service';
 import { WalletService } from '../economy/wallet.service';
 import { RevenueSplitService } from '../economy/revenue-split.service';
 import { LedgerEntryType, WalletType } from '@prisma/client';
+import { HostLevelsService } from '../host-levels/host-levels.service';
 
 export const RTC_PROVIDER = 'RTC_PROVIDER';
 
@@ -35,6 +36,7 @@ export class LiveService {
     // Optional parameters must come last (TypeScript rejects a required one
     // after it; SWC let it through, ts-jest did not).
     @Optional() private readonly media?: LiveMediaService,
+    @Optional() private readonly hostLevels?: HostLevelsService,
   ) {}
 
   // Per-user like throttle: recent (timestamp, count) entries within the
@@ -100,6 +102,9 @@ export class LiveService {
     let normalizedPrivatePrice: number | null = null;
     let normalizedPrivateDuration: number | null = null;
     if (normalizedPrivacy === 'PRIVATE') {
+      if (this.hostLevels) await this.hostLevels.assertUnlock(hostId, 'ONE_ON_ONE_VIDEO');
+      const host = await this.prisma.user.findUnique({ where: { id: hostId }, select: { oneOnOneEnabled: true } });
+      if (!host?.oneOnOneEnabled) throw new ForbiddenException('Enable 1-on-1 availability in your profile before starting a private live');
       normalizedPrivatePrice = Math.round(Number(privatePriceCoins));
       normalizedPrivateDuration = Math.round(Number(privateDurationMinutes)) * 60;
       if (!Number.isInteger(normalizedPrivatePrice) || normalizedPrivatePrice < 1 || normalizedPrivatePrice > 10_000_000) {
@@ -207,6 +212,8 @@ export class LiveService {
     if (!session || session.status !== 'LIVE') throw new NotFoundException('Live session not found or not active');
     if (session.privacy !== 'PRIVATE') throw new BadRequestException('This live is not private');
     if (session.hostId === viewerId) throw new BadRequestException('The host cannot request their own private live');
+    const host = await this.prisma.user.findUnique({ where: { id: session.hostId }, select: { oneOnOneEnabled: true } });
+    if (!host?.oneOnOneEnabled) throw new ForbiddenException('This host is not currently accepting 1-on-1 requests');
     if (!session.privatePriceCoins || !session.privateDurationSeconds) {
       throw new BadRequestException('Private live pricing is not configured');
     }
@@ -365,6 +372,11 @@ export class LiveService {
       });
 
       return tx.privateLiveRequest.findUniqueOrThrow({ where: { id: requestId } });
+    }).then(async (result) => {
+      if (this.hostLevels && result.status === 'ACTIVE') {
+        try { await this.hostLevels.awardRule(session.hostId, 'PRIVATE_MINUTE', Math.floor(result.durationSeconds / 60)); } catch { /* progression must never block private billing */ }
+      }
+      return result;
     });
   }
 
@@ -397,6 +409,20 @@ export class LiveService {
 
   async sweepPrivateSessions() {
     const now = new Date();
+    // Requests are paid upfront, so a request that sits unanswered must not
+    // hold the viewer's coins forever. Expire and refund pending requests
+    // after 45 seconds.
+    const pendingCutoff = new Date(now.getTime() - 45_000);
+    const staleRequests = await this.prisma.privateLiveRequest.findMany({
+      where: { status: 'PENDING', createdAt: { lte: pendingCutoff } },
+      select: { id: true, viewerId: true, priceCoins: true },
+      take: 100,
+    });
+    for (const request of staleRequests) {
+      await this.refundPrivateRequest(request.id, request.viewerId, request.priceCoins, 'Private live request expired');
+      await this.prisma.privateLiveRequest.updateMany({ where: { id: request.id, status: 'REFUNDED' }, data: { status: 'EXPIRED' } });
+    }
+
     const expired = await this.prisma.liveSession.findMany({
       where: { status: 'LIVE', privacy: 'PRIVATE', privateEndsAt: { lte: now } },
       select: { id: true },
@@ -492,6 +518,10 @@ export class LiveService {
       where: { id: session.id },
       data: { status: 'ENDED', endedAt, durationSeconds },
     });
+
+    if (this.hostLevels && durationSeconds >= 60) {
+      try { await this.hostLevels.awardRule(session.hostId, 'LIVE_MINUTE', Math.floor(durationSeconds / 60)); } catch { /* progression must never block ending a live */ }
+    }
 
     // Viewers used to sit on a frozen picture: nothing told them it was over.
     try {

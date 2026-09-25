@@ -4,7 +4,6 @@ import { RegionalConfigService } from '../config/regional-config.service';
 import { FeatureFlagsService } from '../feature-flags/feature-flags.service';
 import { RngService } from './rng.service';
 import { maxSum, DiceConfig } from './sum-dice-rules';
-import { buildRoundData } from './game-fairness';
 import { CrashService } from './crash.service';
 import type { Queue } from 'bullmq';
 import { GAME_QUEUE } from '../queue/queue.module';
@@ -99,11 +98,11 @@ export class RoundService {
     }
 
     const secret = this.rng.generateSecret();
-    const roundData = buildRoundData({
+    const roundData = JSON.stringify({
       gameCode: params.gameCode,
       openAt: params.openAt,
       lockAt: params.lockAt,
-      numberRange: numberRange ?? null,
+      numberRange,
     });
     const commitmentHash = this.rng.commitmentHash(secret, roundData);
 
@@ -137,8 +136,6 @@ export class RoundService {
           created.id,
           { houseEdge: rules.houseEdge, growthRate: rules.growthRate },
           params.lockAt,
-          secret,
-          roundData,
         );
       } catch (e) {
         // A Crash round with no crash point can never be settled honestly.

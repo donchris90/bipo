@@ -9,9 +9,10 @@ export type GameRules = Record<string, number | null>;
 
 const SHARED = ['openSeconds', 'minStake', 'maxStake'] as const;
 const SHAPES = {
-  dice: ['payoutMultiplier', 'diceCount', 'diceSides', 'numberPayouts', ...SHARED],
+  dice: ['payoutMultiplier', 'rtp', 'basePrize', 'stakeWeightExponent', 'diceCount', 'diceSides', 'numberPayouts', ...SHARED],
   crash: ['houseEdge', 'growthRate', ...SHARED],
   lucky: ['payoutMultiplier', ...SHARED],
+  ludo: ['minEntry', 'maxEntry', 'turnSeconds', 'reconnectSeconds', 'prizeFirstPercent', 'prizeSecondPercent', 'prizeFirstPercent2p', 'botFillSeconds', 'botMatchPaid', 'botPrizePercent'],
 } as const;
 
 type Shape = keyof typeof SHAPES;
@@ -21,6 +22,7 @@ export function shapeOf(rules: any): Shape | null {
   if (typeof rules.houseEdge === 'number' && typeof rules.growthRate === 'number') return 'crash';
   if (rules.diceCount && rules.diceSides) return 'dice';
   if (typeof rules.payoutMultiplier === 'number') return 'lucky';
+  if (typeof rules.turnSeconds === 'number' && typeof rules.prizeFirstPercent === 'number') return 'ludo';
   return null;
 }
 
@@ -38,17 +40,6 @@ export function maxSumProbability(dice: number, sides: number): number {
 }
 
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
-
-function sumProbabilities(dice: number, sides: number): Map<number, number> {
-  let dist = new Map<number, number>([[0, 1]]);
-  for (let i = 0; i < dice; i++) {
-    const next = new Map<number, number>();
-    for (const [sum, ways] of dist) for (let face = 0; face < sides; face++) next.set(sum + face, (next.get(sum + face) ?? 0) + ways);
-    dist = next;
-  }
-  const total = sides ** dice;
-  return new Map([...dist.entries()].map(([n, ways]) => [n, ways / total]));
-}
 
 const isInt = (v: unknown, min: number, max: number): v is number => isNum(v) && Number.isInteger(v) && v >= min && v <= max;
 
@@ -73,35 +64,50 @@ export function validateGameRules(existing: any, incoming: any): GameRules {
     // dice themselves can't be changed from here — only how the game pays.
     if (existing?.diceCount && incoming.diceCount !== existing.diceCount) errors.push('diceCount cannot be changed');
     if (existing?.diceSides && incoming.diceSides !== existing.diceSides) errors.push('diceSides cannot be changed');
-    if (!isNum(incoming.payoutMultiplier) || incoming.payoutMultiplier < 1.01 || incoming.payoutMultiplier > 1000) {
-      errors.push('payoutMultiplier must be a number from 1.01 to 1000');
-    } else if (!errors.length) {
-      // Guard rail: backing the single likeliest number must not have a
-      // positive expected return, or players beat the house on average.
-      const best = maxSumProbability(incoming.diceCount, incoming.diceSides);
-      if (incoming.payoutMultiplier * best >= 1) {
-        const limit = Math.floor((1 / best) * 100) / 100;
-        errors.push(`payoutMultiplier is too high: at ${incoming.payoutMultiplier}x players would win money on average. It must be below ${limit}x`);
+    const isLuckyNumber = incoming.rtp !== undefined || incoming.basePrize !== undefined || (existing?.rtp !== undefined) || (existing?.basePrize !== undefined);
+    if (isLuckyNumber) {
+      if (!isNum(incoming.rtp) || incoming.rtp <= 0 || incoming.rtp > 1) errors.push('rtp must be greater than 0 and at most 1');
+      if (!isInt(incoming.basePrize, 1, 1_000_000_000)) errors.push('basePrize must be a whole number from 1 to 1000000000');
+      if (!isNum(incoming.stakeWeightExponent) || incoming.stakeWeightExponent < 1 || incoming.stakeWeightExponent > 3) errors.push('stakeWeightExponent must be from 1 to 3');
+      if (incoming.diceCount !== 3 || incoming.diceSides !== 10) errors.push('Lucky Number requires exactly 3 dice with 10 sides (0-9)');
+      out.rtp = incoming.rtp;
+      out.basePrize = incoming.basePrize;
+      out.stakeWeightExponent = incoming.stakeWeightExponent;
+    } else {
+      if (!isNum(incoming.payoutMultiplier) || incoming.payoutMultiplier < 1.01 || incoming.payoutMultiplier > 1000) {
+        errors.push('payoutMultiplier must be a number from 1.01 to 1000');
+      } else if (!errors.length) {
+        const best = maxSumProbability(incoming.diceCount, incoming.diceSides);
+        if (incoming.payoutMultiplier * best >= 1) {
+          const limit = Math.floor((1 / best) * 100) / 100;
+          errors.push(`payoutMultiplier is too high: at ${incoming.payoutMultiplier}x players would win money on average. It must be below ${limit}x`);
+        }
       }
+      out.payoutMultiplier = incoming.payoutMultiplier;
     }
-    out.payoutMultiplier = incoming.payoutMultiplier;
     out.diceCount = incoming.diceCount;
     out.diceSides = incoming.diceSides;
-    if (incoming.numberPayouts !== undefined) {
+    // Legacy numberPayouts belongs only to the old fixed-payout dice mode.
+    // Lucky Number never persists or uses that Admin map: its multiplier and
+    // stake are derived from the 3-digit probability formula below.
+    if (!isLuckyNumber && incoming.numberPayouts !== undefined) {
       if (!incoming.numberPayouts || typeof incoming.numberPayouts !== 'object' || Array.isArray(incoming.numberPayouts)) {
-        errors.push('numberPayouts must be an object mapping each winning number to a multiplier');
+        errors.push('numberPayouts must be an object mapping each winning number to a coin payout');
       } else if (!errors.length) {
         const max = incoming.diceCount * (incoming.diceSides - 1);
-        const probabilities = sumProbabilities(incoming.diceCount, incoming.diceSides);
         const clean: Record<string, number> = {};
-        for (let n = 0; n <= max; n++) {
-          const raw = incoming.numberPayouts[String(n)];
-          if (!isNum(raw) || raw < 0 || raw > 1000) { errors.push(`numberPayouts[${n}] must be a number from 0 to 1000`); continue; }
-          const p = probabilities.get(n) ?? 0;
-          if (raw > 0 && p > 0 && raw * p >= 1) { errors.push(`numberPayouts[${n}] is too high for its probability`); continue; }
-          clean[String(n)] = raw;
+        for (const [key, value] of Object.entries(incoming.numberPayouts as Record<string, unknown>)) {
+          if (!/^\d+$/.test(key) || Number(key) < 0 || Number(key) > max) {
+            errors.push(`numberPayouts may only contain numbers 0-${max}`);
+            continue;
+          }
+          const raw = value;
+          if (!isNum(raw) || raw < 0 || raw > 1000) {
+            errors.push(`numberPayouts[${key}] must be a number from 0 to 1000`);
+            continue;
+          }
+          clean[key] = raw;
         }
-        if (Object.keys(incoming.numberPayouts).some((k) => !/^\d+$/.test(k) || Number(k) < 0 || Number(k) > max)) errors.push(`numberPayouts may only contain numbers 0-${max}`);
         if (!errors.length) out.numberPayouts = clean as any;
       }
     }
@@ -110,6 +116,21 @@ export function validateGameRules(existing: any, incoming: any): GameRules {
     if (!isNum(incoming.growthRate) || incoming.growthRate < 0.01 || incoming.growthRate > 1) errors.push('growthRate must be a number from 0.01 to 1');
     out.houseEdge = incoming.houseEdge;
     out.growthRate = incoming.growthRate;
+  } else if (shape === 'ludo') {
+    const ints: Array<[string, number, number]> = [['minEntry', 1, 1_000_000_000], ['maxEntry', 1, 1_000_000_000], ['turnSeconds', 5, 120], ['reconnectSeconds', 10, 900]];
+    for (const [key, min, max] of ints) if (!isInt(incoming[key], min, max)) errors.push(`${key} must be a whole number from ${min} to ${max}`);
+    if (isInt(incoming.minEntry, 1, 1_000_000_000) && isInt(incoming.maxEntry, 1, 1_000_000_000) && incoming.maxEntry < incoming.minEntry) errors.push('maxEntry cannot be below minEntry');
+    if (!isNum(incoming.prizeFirstPercent) || incoming.prizeFirstPercent < 0 || incoming.prizeFirstPercent > 100) errors.push('prizeFirstPercent must be from 0 to 100');
+    if (!isNum(incoming.prizeSecondPercent) || incoming.prizeSecondPercent < 0 || incoming.prizeSecondPercent > 100) errors.push('prizeSecondPercent must be from 0 to 100');
+    if (isNum(incoming.prizeFirstPercent) && isNum(incoming.prizeSecondPercent) && Math.abs((incoming.prizeFirstPercent + incoming.prizeSecondPercent) - 100) > 0.001) errors.push('Ludo prize percentages must add up to 100');
+    if (!errors.length) { out.minEntry = incoming.minEntry; out.maxEntry = incoming.maxEntry; out.turnSeconds = incoming.turnSeconds; out.reconnectSeconds = incoming.reconnectSeconds; out.prizeFirstPercent = incoming.prizeFirstPercent; out.prizeSecondPercent = incoming.prizeSecondPercent; }
+    // Optional Ludo settings. Only kept when supplied, so saving the form never silently resets them.
+    const optional: Array<[string, number, number]> = [['prizeFirstPercent2p', 0, 100], ['botFillSeconds', 0, 300], ['botMatchPaid', 0, 1], ['botPrizePercent', 0, 100]];
+    for (const [key, min, max] of optional) {
+      if (incoming[key] === undefined) continue;
+      if (!isNum(incoming[key]) || incoming[key] < min || incoming[key] > max) errors.push(`${key} must be a number from ${min} to ${max}`);
+      else out[key] = incoming[key];
+    }
   } else {
     if (!isNum(incoming.payoutMultiplier) || incoming.payoutMultiplier < 1.01 || incoming.payoutMultiplier > 1000) errors.push('payoutMultiplier must be a number from 1.01 to 1000');
     out.payoutMultiplier = incoming.payoutMultiplier;

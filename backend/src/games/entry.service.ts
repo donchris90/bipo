@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
 import { RoundService } from './round.service';
 import { validateSelection as validateSumDiceSelection } from './sum-dice-rules';
+import { validateLuckySelection } from './lucky-number-rules';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { WalletType, LedgerEntryType } from '@prisma/client';
 
@@ -33,7 +34,9 @@ export class EntryService {
 
     await this.rounds.assertGameAvailable(round.gameCode, params.countryCode);
     await this.rounds.assertAcceptingEntries(round);
-    this.validateSelection(round, params.selection);
+    const game = await this.prisma.gameDefinition.findUnique({ where: { code: round.gameCode }, select: { rulesJson: true } });
+    const rules = ((game?.rulesJson ?? {}) as Record<string, unknown>);
+    const isLuckyNumber = round.gameCode === 'SUM_DICE' && typeof rules.rtp === 'number' && typeof rules.basePrize === 'number';
 
     if (params.autoCashoutMultiplier != null) {
       if (typeof params.autoCashoutMultiplier !== 'number' || !Number.isFinite(params.autoCashoutMultiplier) || params.autoCashoutMultiplier <= 1) {
@@ -41,27 +44,29 @@ export class EntryService {
       }
     }
 
-    // Variable-stake rounds (selectionCount is null — sum-dice or crash,
-    // see RoundService) let the player choose their own total stake;
-    // round.entryPrice is repurposed as the minimum for those games, not a
-    // fixed price. Every other game keeps the original fixed-price
-    // behavior.
+    // Variable-stake rounds (selectionCount is null — Lucky Number, legacy
+    // sum-dice, or crash) let the player choose their own total stake. For
+    // Lucky Number the selection also carries an explicit integer stake for
+    // every picked number; the server validates that map and its total before
+    // any wallet debit happens.
     const isVariableStake = round.selectionCount == null;
     let coinAmount = round.entryPrice;
     if (isVariableStake) {
       if (typeof params.stakeAmount !== 'number' || !Number.isInteger(params.stakeAmount) || params.stakeAmount <= 0) {
         throw new BadRequestException('stakeAmount is required for this game and must be a positive integer');
       }
-      if (params.stakeAmount < round.entryPrice) {
-        throw new BadRequestException(`Minimum stake is ${round.entryPrice} coins`);
-      }
-      // The admin's optional per-game maximum, read live so a change applies to the next entry.
-      const game = await this.prisma.gameDefinition.findUnique({ where: { code: round.gameCode }, select: { rulesJson: true } });
-      const maxStake = ((game?.rulesJson ?? {}) as { maxStake?: number }).maxStake;
-      if (typeof maxStake === 'number' && params.stakeAmount > maxStake) {
-        throw new BadRequestException(`Maximum stake is ${maxStake} coins`);
+      const minStake = typeof rules.minStake === 'number' ? rules.minStake : round.entryPrice;
+      const maxStake = typeof rules.maxStake === 'number' ? rules.maxStake : undefined;
+      if (isLuckyNumber) {
+        validateLuckySelection(params.selection, params.stakeAmount, minStake, maxStake);
+      } else {
+        this.validateSelection(round, params.selection);
+        if (params.stakeAmount < minStake) throw new BadRequestException(`Minimum stake is ${minStake} coins`);
+        if (maxStake != null && params.stakeAmount > maxStake) throw new BadRequestException(`Maximum stake is ${maxStake} coins`);
       }
       coinAmount = params.stakeAmount;
+    } else {
+      this.validateSelection(round, params.selection);
     }
 
     // Debit and entry-creation must succeed or fail together — wrapping

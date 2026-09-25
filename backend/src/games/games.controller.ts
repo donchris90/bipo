@@ -11,11 +11,11 @@ import { SettlementService } from './settlement.service';
 import { CrashService } from './crash.service';
 import { GameAdminService } from './game-admin.service';
 import { classifyResult, computePerNumberPool } from './sum-dice-rules';
-import { buildRoundData } from './game-fairness';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RoleName, GameStatus } from '@prisma/client';
+import { buildLuckyQuotes, validateLuckyConfig, suggestedStakes, type LuckyNumberRulesConfig } from './lucky-number-rules';
 
 interface AuthedRequest extends Request {
   user: { userId: string; roles: RoleName[]; countryCode: string };
@@ -38,6 +38,7 @@ const ROUND_SELECT = {
   lockAt: true,
   result: true,
   commitmentHash: true,
+  revealData: true,
   status: true,
   createdAt: true,
   settledAt: true,
@@ -54,16 +55,72 @@ export class GamesController {
     private readonly crash: CrashService,
   ) {}
 
+  // Public-to-authenticated players: Lucky Number's formula-derived odds,
+  // multipliers, and stake weights. The legacy numberPayouts Admin map is
+  // intentionally not read or returned for Lucky Number.
+  @Get(':gameCode/config')
+  async config(@Param('gameCode') gameCode: string) {
+    const game = await this.prisma.gameDefinition.findUnique({
+      where: { code: gameCode },
+      select: { code: true, rulesJson: true },
+    });
+    const rules = (game?.rulesJson as any) ?? {};
+    const isLuckyNumber = typeof rules.rtp === 'number' && typeof rules.basePrize === 'number' && rules.diceCount === 3 && rules.diceSides === 10;
+    if (isLuckyNumber) {
+      const lucky = validateLuckyConfig({ rtp: rules.rtp, basePrize: rules.basePrize, stakeWeightExponent: rules.stakeWeightExponent });
+      const quotes = buildLuckyQuotes(lucky);
+      return {
+        gameCode,
+        mode: 'LUCKY_NUMBER',
+        rtp: lucky.rtp,
+        basePrize: lucky.basePrize,
+        stakeWeightExponent: lucky.stakeWeightExponent,
+        payoutMultiplier: null,
+        multipliers: Object.fromEntries(quotes.map((q) => [String(q.number), q.multiplier])),
+        suggestedStakes: Object.fromEntries(quotes.map((q) => [String(q.number), q.suggestedStake])),
+        odds: Object.fromEntries(quotes.map((q) => [String(q.number), q.probability])),
+      };
+    }
+    return {
+      gameCode,
+      mode: 'LEGACY',
+      rtp: null,
+      basePrize: null,
+      payoutMultiplier: typeof rules.payoutMultiplier === 'number' ? rules.payoutMultiplier : null,
+      numberPayouts: rules.numberPayouts && typeof rules.numberPayouts === 'object' ? rules.numberPayouts : {},
+      multipliers: {},
+      suggestedStakes: {},
+      odds: {},
+    };
+  }
+
+  @Get(':gameCode/lucky-number/suggestions')
+  async luckySuggestions(@Param('gameCode') gameCode: string) {
+    const game = await this.prisma.gameDefinition.findUnique({ where: { code: gameCode }, select: { rulesJson: true } });
+    const rules = (game?.rulesJson ?? {}) as Record<string, unknown>;
+    if (gameCode !== 'SUM_DICE' || rules.diceCount !== 3 || rules.diceSides !== 10) {
+      return { applicable: false };
+    }
+    const lucky = validateLuckyConfig({ rtp: Number(rules.rtp), basePrize: Number(rules.basePrize), stakeWeightExponent: rules.stakeWeightExponent as number | undefined });
+    const quotes = buildLuckyQuotes(lucky);
+    return {
+      applicable: true,
+      rtp: lucky.rtp,
+      basePrize: lucky.basePrize,
+      stakeWeightExponent: lucky.stakeWeightExponent,
+      quotes,
+      suggestedStakes: suggestedStakes(quotes.map((q) => q.number), lucky),
+    };
+  }
+
   @Get(':gameCode/rounds')
-  async listRounds(@Param('gameCode') gameCode: string) {
-    const rounds = await this.prisma.gameRound.findMany({
+  listRounds(@Param('gameCode') gameCode: string) {
+    return this.prisma.gameRound.findMany({
       where: { gameCode },
       orderBy: { createdAt: 'desc' },
       take: 20,
       select: ROUND_SELECT,
     });
-    const serverNow = Date.now();
-    return rounds.map((round) => ({ ...round, serverNow }));
   }
 
   // Matches the "Time | Result | Winners | Prize" history table observed
@@ -102,7 +159,6 @@ export class GamesController {
           roundId: round.id,
           settledAt: round.settledAt,
           result: round.result,
-          commitmentHash: round.commitmentHash,
           winners: wonAgg._count._all, // counts winning entries, not distinct users — a player who places 2 winning entries counts as 2 here
           prize: wonAgg._sum.rewardAmount ?? 0,
           players: totalAgg._count._all, // same caveat — entry count, not distinct-user count
@@ -110,6 +166,18 @@ export class GamesController {
         };
       }),
     );
+  }
+
+  // Live totals shown above the Lucky Number board. Players are distinct
+  // users, while totalWagered is the sum of currently placed stakes.
+  @Get('rounds/:roundId/live-stats')
+  async liveStats(@Param('roundId') roundId: string) {
+    const where = { roundId, status: 'PLACED' as const };
+    const [players, total] = await Promise.all([
+      this.prisma.gameEntry.findMany({ where, distinct: ['userId'], select: { userId: true } }),
+      this.prisma.gameEntry.aggregate({ where, _sum: { coinAmount: true } }),
+    ]);
+    return { players: players.length, totalWagered: total._sum.coinAmount ?? 0 };
   }
 
   @Get('rounds/:roundId')
@@ -127,7 +195,7 @@ export class GamesController {
     return this.prisma.gameEntry.findMany({
       where: { roundId, userId: req.user.userId },
       orderBy: { createdAt: 'desc' },
-      select: { id: true, selection: true, coinAmount: true, rewardAmount: true, status: true, createdAt: true },
+      select: { id: true, selection: true, coinAmount: true, rewardAmount: true, netAmount: true, status: true, createdAt: true },
     });
   }
 
@@ -147,7 +215,16 @@ export class GamesController {
       where: { roundId },
       select: { selection: true, coinAmount: true },
     });
-    const pool = computePerNumberPool(entries as unknown as Array<{ selection: number[]; coinAmount: number }>);
+    const pool = new Map<number, number>();
+    for (const entry of entries) {
+      const selection: any = entry.selection;
+      if (selection && !Array.isArray(selection) && selection.stakes && typeof selection.stakes === 'object') {
+        for (const [key, value] of Object.entries(selection.stakes)) pool.set(Number(key), (pool.get(Number(key)) ?? 0) + Number(value));
+      } else if (Array.isArray(selection)) {
+        const per = selection.length ? Math.floor(entry.coinAmount / selection.length) : 0;
+        for (const n of selection) pool.set(Number(n), (pool.get(Number(n)) ?? 0) + per);
+      }
+    }
     return { applicable: true, pool: Object.fromEntries(pool) };
   }
 
@@ -207,24 +284,8 @@ export class GamesController {
 
   @Get('rounds/:roundId/reveal')
   async reveal(@Param('roundId') roundId: string) {
-    const round = await this.prisma.gameRound.findUniqueOrThrow({
-      where: { id: roundId },
-      select: { status: true, revealData: true, commitmentHash: true, gameCode: true, openAt: true, lockAt: true, numberRange: true, result: true },
-    });
-    const reveal = this.rounds.reveal(round);
-    return { ...reveal, roundData: buildRoundData(round), result: round.result };
-  }
-
-  @Get('rounds/:roundId/live-stats')
-  async liveStats(@Param('roundId') roundId: string) {
-    const entries = await this.prisma.gameEntry.findMany({
-      where: { roundId },
-      select: { userId: true, coinAmount: true },
-    });
-    return {
-      players: new Set(entries.map((entry) => entry.userId)).size,
-      totalWagered: entries.reduce((sum, entry) => sum + entry.coinAmount, 0),
-    };
+    const round = await this.prisma.gameRound.findUniqueOrThrow({ where: { id: roundId }, select: ROUND_SELECT });
+    return this.rounds.reveal(round);
   }
 
   // Crash only — live, poll-friendly multiplier for the client's
