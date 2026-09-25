@@ -84,13 +84,14 @@ export class NowPaymentsPaymentProvider implements PaymentProvider {
       headers: { 'x-api-key': this.apiKey },
     });
     const body: any = await response.json().catch(() => null);
-    if (!response.ok || !body) return { verified: false, amountMinor: 0, currencyCode: '' };
+    if (!response.ok || !body) return { verified: false, amountMinor: 0, currencyCode: '', status: 'unknown' };
     const status = String(body.payment_status ?? 'unknown').toLowerCase();
     const price = Number(body.price_amount);
     return {
       verified: status === 'finished',
       amountMinor: Number.isFinite(price) ? Math.round(price * 100) : 0,
       currencyCode: String(body.price_currency ?? '').toUpperCase(),
+      status,
     };
   }
 

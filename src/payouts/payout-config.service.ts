@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, RoleName } from '@prisma/client';
+import { RoleName } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { PayoutQuote, PayoutRules, quoteWithdrawal, computePayout, validatePayoutConfig } from './payout-math';
@@ -40,14 +40,10 @@ export class PayoutConfigService {
     const input = validatePayoutConfig(body);
 
     const before = await this.prisma.payoutConfig.findUnique({ where: { countryCode: code } });
-    // Prisma's Json columns don't accept a plain `null` for "set to null" —
-    // it needs the Prisma.JsonNull sentinel, or the create/update input's
-    // checked/unchecked union can't be resolved.
-    const allowedProviders = input.allowedProviders === null ? Prisma.JsonNull : input.allowedProviders;
     const saved = await this.prisma.payoutConfig.upsert({
       where: { countryCode: code },
-      update: { ...input, allowedProviders, updatedBy: actorId },
-      create: { countryCode: code, currencyCode: region.currencyCode, ...input, allowedProviders, updatedBy: actorId },
+      update: { ...input, updatedBy: actorId },
+      create: { countryCode: code, currencyCode: region.currencyCode, ...input, updatedBy: actorId },
     });
 
     // Money rules are exactly what an audit trail is for: who changed what, from what.

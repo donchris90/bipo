@@ -1,19 +1,5 @@
 {
   "extends": "./tsconfig.json",
-  "include": [
-    "src/**/*"
-  ],
-  "exclude": [
-    "node_modules",
-    "dist",
-    "test",
-    "tests",
-    "prisma",
-    "scripts",
-    "**/*.spec.ts",
-    "**/*.test.ts",
-    "src/games/lucky-number.controller.ts",
-    "src/games/lucky-number-settlement.ts",
-    "src/games/lucky-number/lucky-number.controller.ts"
-  ]
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "test", "prisma", "scripts", "**/*.spec.ts"]
 }

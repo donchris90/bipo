@@ -3,8 +3,7 @@
   "version": "0.1.0",
   "description": "Global live social + gaming platform backend (Phase 0/1 foundation skeleton)",
   "scripts": {
-    "build": "node --max-old-space-size=4096 node_modules/.bin/nest build --builder swc --type-check false",
-    "prebuild": "prisma generate",
+    "build": "nest build --builder swc",
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
