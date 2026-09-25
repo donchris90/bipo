@@ -19,7 +19,11 @@
     "emitDecoratorMetadata": true
   },
   "include": [
-    "src/**/*.ts",
-    "tests/**/*.ts"
+    "src/**/*.ts"
+  ],
+  "exclude": [
+    "tests/**/*.ts",
+    "node_modules",
+    "dist"
   ]
 }
