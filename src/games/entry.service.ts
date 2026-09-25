@@ -4,7 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
 import { RoundService } from './round.service';
 import { validateSelection as validateSumDiceSelection } from './sum-dice-rules';
-import { validateLuckySelection } from './lucky-number-rules';
+import { planStakes, LuckyNumberConfig } from './lucky-number/lucky-number-math';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { WalletType, LedgerEntryType } from '@prisma/client';
 
@@ -34,9 +34,7 @@ export class EntryService {
 
     await this.rounds.assertGameAvailable(round.gameCode, params.countryCode);
     await this.rounds.assertAcceptingEntries(round);
-    const game = await this.prisma.gameDefinition.findUnique({ where: { code: round.gameCode }, select: { rulesJson: true } });
-    const rules = ((game?.rulesJson ?? {}) as Record<string, unknown>);
-    const isLuckyNumber = round.gameCode === 'SUM_DICE' && typeof rules.rtp === 'number' && typeof rules.basePrize === 'number';
+    this.validateSelection(round, params.selection);
 
     if (params.autoCashoutMultiplier != null) {
       if (typeof params.autoCashoutMultiplier !== 'number' || !Number.isFinite(params.autoCashoutMultiplier) || params.autoCashoutMultiplier <= 1) {
@@ -44,29 +42,66 @@ export class EntryService {
       }
     }
 
-    // Variable-stake rounds (selectionCount is null — Lucky Number, legacy
-    // sum-dice, or crash) let the player choose their own total stake. For
-    // Lucky Number the selection also carries an explicit integer stake for
-    // every picked number; the server validates that map and its total before
-    // any wallet debit happens.
+    // Variable-stake rounds (selectionCount is null — sum-dice or crash,
+    // see RoundService) let the player choose their own total stake;
+    // round.entryPrice is repurposed as the minimum for those games, not a
+    // fixed price. Every other game keeps the original fixed-price
+    // behavior.
     const isVariableStake = round.selectionCount == null;
     let coinAmount = round.entryPrice;
-    if (isVariableStake) {
+    // What actually gets written to gameEntry.selection. Defaults to the
+    // client's raw selection (existing sum-dice / fixed-price behavior);
+    // RTP-mode dice below replaces this with a server-computed stake map.
+    let selectionToStore: unknown = params.selection;
+
+    // The admin's rulesJson, read live once here (rather than trusting a
+    // cached copy) so a config change takes effect on the very next entry —
+    // both the variable-stake maxStake check below and RTP mode need it.
+    const game = isVariableStake
+      ? await this.prisma.gameDefinition.findUnique({ where: { code: round.gameCode }, select: { rulesJson: true } })
+      : null;
+    const rules = (game?.rulesJson ?? {}) as Partial<LuckyNumberConfig> & { rtp?: number; maxStake?: number };
+
+    if (isVariableStake && typeof rules.rtp === 'number') {
+      // RTP mode ("Lucky Number" per-number stakes): the client sends WHICH
+      // numbers it picked and, optionally, a desired TOTAL — never
+      // individual per-number stakes. Accepting client-supplied per-number
+      // amounts directly would let a player claim any split they like
+      // (e.g. dumping the whole stake on the rarest, highest-multiplier
+      // number while reporting a tiny total); instead the server is the
+      // only thing that ever computes the stake map, from planStakes(),
+      // exactly mirroring what the suggested-stakes endpoint and the
+      // client's own display already show — see
+      // lucky-number/lucky-number-math.ts and lucky-number.controller.ts.
+      if (!Array.isArray(params.selection) || params.selection.length === 0) {
+        throw new BadRequestException('selection must be a non-empty array of numbers');
+      }
+      const config: LuckyNumberConfig = {
+        rtp: rules.rtp,
+        basePrize: rules.basePrize ?? 1000,
+        minStake: rules.minStake ?? round.entryPrice ?? 1,
+        maxStake: rules.maxStake ?? 1_000_000_000,
+        stakeWeightExponent: rules.stakeWeightExponent ?? 1,
+      };
+      let plan;
+      try {
+        plan = planStakes(params.selection as number[], config, params.stakeAmount);
+      } catch (e: any) {
+        throw new BadRequestException(e?.message ?? 'Invalid selection');
+      }
+      coinAmount = plan.total;
+      selectionToStore = Object.fromEntries(plan.stakes); // object shape — this is what tells settlement to use settleLuckyNumber() instead of the equal-split sum-dice path
+    } else if (isVariableStake) {
       if (typeof params.stakeAmount !== 'number' || !Number.isInteger(params.stakeAmount) || params.stakeAmount <= 0) {
         throw new BadRequestException('stakeAmount is required for this game and must be a positive integer');
       }
-      const minStake = typeof rules.minStake === 'number' ? rules.minStake : round.entryPrice;
-      const maxStake = typeof rules.maxStake === 'number' ? rules.maxStake : undefined;
-      if (isLuckyNumber) {
-        validateLuckySelection(params.selection, params.stakeAmount, minStake, maxStake);
-      } else {
-        this.validateSelection(round, params.selection);
-        if (params.stakeAmount < minStake) throw new BadRequestException(`Minimum stake is ${minStake} coins`);
-        if (maxStake != null && params.stakeAmount > maxStake) throw new BadRequestException(`Maximum stake is ${maxStake} coins`);
+      if (params.stakeAmount < round.entryPrice) {
+        throw new BadRequestException(`Minimum stake is ${round.entryPrice} coins`);
+      }
+      if (typeof rules.maxStake === 'number' && params.stakeAmount > rules.maxStake) {
+        throw new BadRequestException(`Maximum stake is ${rules.maxStake} coins`);
       }
       coinAmount = params.stakeAmount;
-    } else {
-      this.validateSelection(round, params.selection);
     }
 
     // Debit and entry-creation must succeed or fail together — wrapping
@@ -121,8 +156,10 @@ export class EntryService {
           // — just a stake and an optional cash-out target), but the
           // schema field is required, not nullable. Defaulting to []
           // avoids a schema migration for what's genuinely "no
-          // selection," not a missing one.
-          selection: (params.selection ?? []) as any,
+          // selection," not a missing one. RTP-mode dice stores the
+          // server-computed per-number stake map here (see above), not
+          // the client's raw picks.
+          selection: (selectionToStore ?? []) as any,
           coinAmount,
           bonusAmount: funding.bonus,
           autoCashoutMultiplier: params.autoCashoutMultiplier,
