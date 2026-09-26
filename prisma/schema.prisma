@@ -839,6 +839,9 @@ enum NotificationType {
   // (see common/friend-announce.ts).
   FOLLOWED_HOST_LIVE
   FOLLOWED_HOST_ROOM
+  // Supporter level-up on a specific creator (see SUPPORTER_LEVEL_UP for the creator-only
+  // equivalent of RRYDA_LEVEL_UP / HOST_LEVEL_UP — this one is per (supporter, creator) pair).
+  SUPPORTER_LEVEL_UP
 }
 
 enum LiveStatus {
@@ -1217,6 +1220,44 @@ model UserBadge {
 
   @@unique([userId, badgeKey])
   @@index([userId])
+}
+
+// The level curve for SupporterLevelsService — mirrors RrydaLevel/HostLevel in shape
+// (admin-configurable table + addXp()), but the XP it tracks is scoped to ONE creator at a
+// time: it's "how much you've supported THIS creator", not a platform-wide stat. xpRequired is
+// denominated directly in lifetime coins gifted, since that's the one thing this progression is
+// meant to reward — no unit conversion, unlike RrydaLevel's smaller everyday-XP curve.
+model SupporterLevel {
+  level      Int      @id
+  name       String
+  xpRequired Int
+  badgeUrl   String?
+  active     Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+}
+
+// The per-relationship record itself: one row per (supporter, creator) pair, holding that pair's
+// lifetime gifted coins and current level. Deliberately its own table rather than a column on
+// GiftTransaction — GiftTransaction is an immutable ledger of individual gifts; this is the
+// running total derived from it, updated once per gift the same way User.rrydaXp is.
+model CreatorSupporter {
+  id             String   @id @default(uuid())
+  supporterId    String
+  creatorId      String
+  xp             Int      @default(0)
+  level          Int      @default(1)
+  totalGiftCoins Int      @default(0)
+  giftCount      Int      @default(0)
+  firstGiftAt    DateTime @default(now())
+  lastGiftAt     DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([supporterId, creatorId])
+  // Powers a creator's "top supporters" leaderboard (lifetime, unlike live.service.ts's
+  // per-session topGifters groupBy) — ordered by creatorId, then rank within it.
+  @@index([creatorId, xp])
+  // Powers "creators I support" on a user's own profile.
+  @@index([supporterId])
 }
 
 model HostDailyTask {

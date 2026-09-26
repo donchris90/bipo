@@ -9,6 +9,7 @@ import { WalletType, LedgerEntryType, ChatContext } from '@prisma/client';
 import { pkPointsForCoins, pkSideForRecipient } from './pk-score';
 import { HostLevelsService } from '../host-levels/host-levels.service';
 import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
+import { SupporterLevelsService } from '../supporters/supporter-levels.service';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -142,6 +143,7 @@ export class GiftService {
     // result, never able to fail a gift. This one grows the SENDER's Rryda Identity (the doc's
     // "Support" dimension) — separate from hostLevels above, which grows the RECIPIENT's.
     @Optional() private readonly rrydaLevels?: RrydaLevelsService,
+    @Optional() private readonly supporterLevels?: SupporterLevelsService,
   ) {}
 
   // Backing for a gift-picker UI — before this, the only way a client
@@ -285,6 +287,13 @@ export class GiftService {
     }
     if (this.rrydaLevels) {
       void this.rrydaLevels.addXp(params.senderId, Math.floor(coinAmount / 50));
+    }
+    // Grows the (sender, recipient) supporter relationship specifically — separate from
+    // rrydaLevels above, which grows the sender's platform-wide identity. Full coinAmount, no
+    // conversion (see supporter-levels.service.ts): this is meant to track cumulative spend on
+    // this one creator directly.
+    if (this.supporterLevels) {
+      void this.supporterLevels.addXp(params.senderId, params.recipientId, coinAmount);
     }
 
     // 4. If sent during an active PK battle, feed the score. Kept outside

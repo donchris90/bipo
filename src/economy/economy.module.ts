@@ -19,11 +19,12 @@ import { RealtimeModule } from '../realtime/realtime.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { HostLevelsModule } from '../host-levels/host-levels.module';
 import { RrydaLevelsModule } from '../rryda-levels/rryda-levels.module';
+import { SupporterLevelsModule } from '../supporters/supporter-levels.module';
 
 const logger = new Logger('EconomyModule');
 
 @Module({
-  imports: [ConfigModule, RealtimeModule, NotificationsModule, HostLevelsModule, RrydaLevelsModule],
+  imports: [ConfigModule, RealtimeModule, NotificationsModule, HostLevelsModule, RrydaLevelsModule, SupporterLevelsModule],
   providers: [CoinPackageAdminService, GiftAdminService, 
     WalletService,
     RevenueSplitService,
