@@ -675,6 +675,39 @@ export class LudoService implements OnModuleDestroy {
 
   private queueRedisKey(key: string) { return `ludo:queue:${key}`; }
   private roomKey(code: string) { return `ludo:room:${code.toUpperCase()}`; }
+
+  /**
+   * Called by RoomsService right before a Party Room closes (host tapped Close, or the room was
+   * swept up as abandoned) — the only two ways a Party Room stops existing. This is also how a
+   * host "leaving" is handled: in this app the host cannot leave their own room without closing
+   * it (leaveSeat refuses them), so closing IS the host-leaves event described in the flow spec.
+   *
+   *  - No table, or a table that hasn't started: entries are only ever debited once the table
+   *    fills and the match starts (see startMatch), so nobody has paid anything yet — the table
+   *    is simply discarded. Nothing to refund.
+   *  - A table already in progress has real coins staked in it. It must not be deleted: deleting
+   *    it here would silently take players' entries with no winner and no payout. Instead it is
+   *    left to run to completion exactly as it would if the Party Room had never closed (the
+   *    existing reconnect / bot-takeover / settlement logic already covers a player going away);
+   *    only the Party Room's pointer to it is removed, since the room itself is gone.
+   */
+  async resolvePartyLudoOnRoomClose(roomId: string): Promise<void> {
+    const code = await this.redis.get(`ludo:party:${roomId}`).catch(() => null);
+    if (!code) return;
+    await this.redis.del(`ludo:party:${roomId}`).catch(() => undefined);
+    const room = this.rooms.get(code) ?? await this.readRoom(code);
+    if (!room) return;
+    if (!room.started) {
+      this.rooms.delete(room.roomCode);
+      await this.redis.del(this.roomKey(room.roomCode)).catch(() => undefined);
+      this.broadcastPartyLudo(room, 'FINISHED');
+      return;
+    }
+    // Already running with real stakes: leave the match itself untouched, just stop pointing the
+    // (now-closed) Party Room at it.
+    this.broadcastPartyLudo(room, 'FINISHED');
+  }
+
   private async readQueue(key: string): Promise<QueueItem[]> {
     try { const raw = await this.redis.get(this.queueRedisKey(key)); if (raw) return JSON.parse(raw); } catch {}
     return this.queues.get(key) ?? [];

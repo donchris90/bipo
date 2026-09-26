@@ -11,6 +11,7 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { NotificationsService } from '../notifications/notifications.service';
 import { assertNotBlocked } from '../common/blocks';
 import { publicName } from '../common/public-name';
+import { LudoService } from '../games/ludo.service';
 
 @Injectable()
 export class RoomsService {
@@ -21,6 +22,7 @@ export class RoomsService {
     @Inject(RTC_PROVIDER) private readonly rtc: RtcProvider,
     private readonly realtime: RealtimeGateway,
     private readonly notifications: NotificationsService,
+    private readonly ludo: LudoService,
   ) {}
 
   async create(hostId: string, title: string, privacy: RoomPrivacy, seatCount: number, countryCode: string, category?: string, themeColor?: string, mode?: string) {
@@ -749,6 +751,14 @@ export class RoomsService {
       });
     } catch {
       /* best effort — findMyInvites already hides closed rooms */
+    }
+    // A Ludo table hosted by this room must not become an orphan: cancel it if nothing was
+    // staked yet, or leave it running to a normal finish if real coins are already in it. Never
+    // silently delete a table with money in it.
+    try {
+      await this.ludo.resolvePartyLudoOnRoomClose(room.id);
+    } catch {
+      /* the table's own reconnect/timeout handling still resolves it either way */
     }
     return closed;
   }

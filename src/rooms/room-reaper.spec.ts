@@ -54,8 +54,9 @@ describe('RoomsService closing', () => {
   const build = (status: string) => {
     const prisma: any = { partyRoom: { findUnique: jest.fn().mockResolvedValue(room(status)), findUniqueOrThrow: jest.fn().mockResolvedValue(room('CLOSED')), update: jest.fn(async ({ data }: any) => data) } };
     const rtc: any = { destroyChannel: jest.fn() };
-    const svc = new RoomsService(prisma, {} as any, {} as any, rtc, {} as any, {} as any);
-    return { svc, prisma, rtc };
+    const ludo: any = { resolvePartyLudoOnRoomClose: jest.fn().mockResolvedValue(undefined) };
+    const svc = new RoomsService(prisma, {} as any, {} as any, rtc, {} as any, {} as any, ludo);
+    return { svc, prisma, rtc, ludo };
   };
 
   it('closing a room that is already closed changes nothing', async () => {
@@ -69,6 +70,23 @@ describe('RoomsService closing', () => {
     const { svc, prisma } = build('OPEN');
     await expect(svc.close('r', 'someone-else')).rejects.toThrow('Only the host');
     await svc.closeAbandoned('r');
+    expect(prisma.partyRoom.update.mock.calls[0][0].data.status).toBe('CLOSED');
+  });
+
+  it('tells LudoService to resolve any Ludo table hosted by the room, on both a host close and a sweeper close', async () => {
+    const { svc, ludo } = build('OPEN');
+    await svc.close('r', 'h');
+    expect(ludo.resolvePartyLudoOnRoomClose).toHaveBeenCalledWith('r');
+
+    const { svc: svc2, ludo: ludo2 } = build('OPEN');
+    await svc2.closeAbandoned('r');
+    expect(ludo2.resolvePartyLudoOnRoomClose).toHaveBeenCalledWith('r');
+  });
+
+  it('closing still succeeds even if resolving the Ludo table fails (the table\'s own timeout/reconnect logic still resolves it)', async () => {
+    const { svc, prisma, ludo } = build('OPEN');
+    ludo.resolvePartyLudoOnRoomClose.mockRejectedValue(new Error('redis down'));
+    await svc.close('r', 'h');
     expect(prisma.partyRoom.update.mock.calls[0][0].data.status).toBe('CLOSED');
   });
 });
