@@ -18,23 +18,39 @@ export class ImageUploadService {
   private readonly bucket: string;
   private readonly publicBaseUrl: string;
 
+  // ConfigService.getOrThrow() only rejects a key that is completely UNSET (undefined) — a
+  // variable that exists in .env but is left blank (`S3_ENDPOINT=`) still passes it, since ''
+  // is a defined value. That let a blank S3_ENDPOINT slip through here silently: the app booted
+  // fine, and every upload failed at runtime with a generic "storage host rejected it" message
+  // that gave no hint the actual cause was a blank endpoint. This requires the value to be a
+  // non-empty string after trimming whitespace, and fails at startup — loud and immediate,
+  // naming exactly which variable is blank — instead of failing quietly per-upload later.
+  private requireNonEmpty(key: string): string {
+    const value = this.config.getOrThrow<string>(key).trim();
+    if (!value) {
+      throw new Error(`${key} is set but empty — image uploads (avatar, live cover, etc.) cannot work without a real value here.`);
+    }
+    return value;
+  }
+
   constructor(private readonly config: ConfigService) {
-    this.bucket = this.config.getOrThrow<string>('S3_BUCKET');
+    this.bucket = this.requireNonEmpty('S3_BUCKET');
     // Custom domain or CDN URL images are served from publicly (e.g.
     // https://cdn.yourapp.com) — NOT S3_ENDPOINT, which is the API
     // endpoint used to talk to the storage host, not a public URL.
-    this.publicBaseUrl = this.config.getOrThrow<string>('S3_PUBLIC_BASE_URL').replace(/\/+$/, '');
+    this.publicBaseUrl = this.requireNonEmpty('S3_PUBLIC_BASE_URL').replace(/\/+$/, '');
 
     this.s3 = new S3Client({
-      region: this.config.getOrThrow<string>('S3_REGION'),
-      endpoint: this.config.getOrThrow<string>('S3_ENDPOINT'),
+      region: this.requireNonEmpty('S3_REGION'),
+      endpoint: this.requireNonEmpty('S3_ENDPOINT'),
       forcePathStyle: true,
       credentials: {
-        accessKeyId: this.config.getOrThrow<string>('S3_ACCESS_KEY_ID'),
-        secretAccessKey: this.config.getOrThrow<string>('S3_SECRET_ACCESS_KEY'),
+        accessKeyId: this.requireNonEmpty('S3_ACCESS_KEY_ID'),
+        secretAccessKey: this.requireNonEmpty('S3_SECRET_ACCESS_KEY'),
       },
     });
   }
+
 
   /**
    * Takes whatever the client sent (plain base64 or a data: URI — see
