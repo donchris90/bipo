@@ -27,20 +27,19 @@ export class ImageUploadService {
   private readonly publicBaseUrl: string;
 
   constructor(private readonly config: ConfigService) {
-    const accountId = this.config.getOrThrow<string>('S2_ACCOUNT_ID');
-    this.bucket = this.config.getOrThrow<string>('S2_BUCKET_NAME');
-    // Your R2 custom domain (e.g. https://cdn.yourapp.com) or, for testing
-    // only, the bucket's r2.dev URL. r2.dev is rate-limited and meant for
-    // dev/preview, not production traffic — set up a custom domain in the
-    // R2 dashboard (Settings → Public access) before shipping this.
-    this.publicBaseUrl = this.config.getOrThrow<string>('S2_PUBLIC_URL').replace(/\/+$/, '');
+    this.bucket = this.config.getOrThrow<string>('S3_BUCKET');
+    // Custom domain or CDN URL images are served from publicly (e.g.
+    // https://cdn.yourapp.com) — NOT the S3_ENDPOINT above, which is the
+    // API endpoint used to talk to the storage host, not a public URL.
+    this.publicBaseUrl = this.config.getOrThrow<string>('S3_PUBLIC_BASE_URL').replace(/\/+$/, '');
 
     this.s3 = new S3Client({
-      region: 'auto',
-      endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+      region: this.config.getOrThrow<string>('S3_REGION'),
+      endpoint: this.config.getOrThrow<string>('S3_ENDPOINT'),
+      forcePathStyle: true,
       credentials: {
-        accessKeyId: this.config.getOrThrow<string>('S2_ACCESS_KEY_ID'),
-        secretAccessKey: this.config.getOrThrow<string>('S2_SECRET_ACCESS_KEY'),
+        accessKeyId: this.config.getOrThrow<string>('S3_ACCESS_KEY_ID'),
+        secretAccessKey: this.config.getOrThrow<string>('S3_SECRET_ACCESS_KEY'),
       },
     });
   }
