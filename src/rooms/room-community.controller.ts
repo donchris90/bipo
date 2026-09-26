@@ -28,6 +28,14 @@ export class RoomCommunityController {
     return this.service.listRegulars(hostId, limit ? Number(limit) : undefined);
   }
 
+  // The caller's own room-community achievements (catalog + earned state) — see
+  // RoomCommunityService.listAchievementsForHost. `listAchievements(roomId, userId)` on the
+  // service existed with no route calling it at all before this.
+  @Get('achievements')
+  achievements(@Param('hostId') hostId: string, @Req() req: AuthedRequest) {
+    return this.service.listAchievementsForHost(hostId, req.user.userId);
+  }
+
   @Patch()
   updateIdentity(@Param('hostId') hostId: string, @Body() body: any, @Req() req: AuthedRequest) {
     // The host editing their own room identity — RoomsService's existing host/moderator checks
@@ -53,5 +61,24 @@ export class AdminRoomLevelsController {
   @Put(':level')
   update(@Param('level') level: string, @Body() body: any, @Req() req: AuthedRequest) {
     return this.service.updateRoomLevel(Number(level), body, req.user.userId, req.user.roles);
+  }
+}
+
+// The visitor's own standing curve inside a room — distinct from AdminRoomLevelsController above,
+// which edits the room's own level. No admin UI or endpoints existed for this curve at all before.
+@Controller('api/v1/admin/room-member-levels')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(RoleName.SUPER_ADMIN)
+export class AdminRoomMemberLevelsController {
+  constructor(private readonly service: RoomCommunityService) {}
+
+  @Get()
+  list() {
+    return this.service.listRoomMemberLevels();
+  }
+
+  @Put(':level')
+  update(@Param('level') level: string, @Body() body: any, @Req() req: AuthedRequest) {
+    return this.service.updateRoomMemberLevel(Number(level), body, req.user.userId, req.user.roles);
   }
 }

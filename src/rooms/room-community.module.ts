@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { RoomCommunityService } from './room-community.service';
-import { RoomCommunityController, AdminRoomLevelsController } from './room-community.controller';
+import { RoomCommunityController, AdminRoomLevelsController, AdminRoomMemberLevelsController } from './room-community.controller';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { HostLevelsModule } from '../host-levels/host-levels.module';
 
@@ -9,7 +9,7 @@ import { HostLevelsModule } from '../host-levels/host-levels.module';
 // neither RoomsModule nor EconomyModule keeps that a plain import on both sides — no forwardRef.
 @Module({
   imports: [NotificationsModule, HostLevelsModule],
-  controllers: [RoomCommunityController, AdminRoomLevelsController],
+  controllers: [RoomCommunityController, AdminRoomLevelsController, AdminRoomMemberLevelsController],
   providers: [RoomCommunityService],
   exports: [RoomCommunityService],
 })

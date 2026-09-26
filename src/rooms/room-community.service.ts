@@ -349,6 +349,24 @@ export class RoomCommunityService {
     return this.prisma.roomMemberAchievement.findMany({ where: { roomId, userId }, orderBy: { earnedAt: 'asc' } });
   }
 
+  // Full catalog (locked achievements included, so a member can see what to aim for — same
+  // "show the locked ones greyed out" reasoning as BadgesService.myBadges) plus this user's
+  // earned/earnedAt state for each, resolved from the host id the mobile app already has
+  // rather than requiring the caller to know the persistent Room's own id.
+  async listAchievementsForHost(hostId: string, userId: string) {
+    const room = await this.prisma.room.findUnique({ where: { hostId }, select: { id: true } });
+    if (!room) return [];
+    const [catalog, earned] = await Promise.all([
+      this.prisma.roomAchievement.findMany({ where: { active: true } }),
+      this.listAchievements(room.id, userId),
+    ]);
+    const earnedByKey = new Map(earned.map((e) => [e.achievementKey, e]));
+    return catalog.map((a) => {
+      const e = earnedByKey.get(a.key);
+      return { key: a.key, label: a.label, emoji: a.emoji, description: a.description, earned: !!e, earnedAt: e?.earnedAt.toISOString() ?? null };
+    });
+  }
+
   // ---- Admin: level-curve editing, same shape as SupporterLevelsService.updateLevel --------
 
   async listRoomLevels() {
@@ -367,6 +385,28 @@ export class RoomCommunityService {
       create: { level, name, xpRequired, unlocks: body.unlocks ?? null, badgeUrl: body.badgeUrl ? String(body.badgeUrl) : null, active: body.active !== false },
     });
     await this.audit.record({ actorId, actorRole: roles[0], action: 'room_level.update', targetType: 'room_level', targetId: String(level), metadata: { xpRequired, name } });
+    return updated;
+  }
+
+  // ---- Admin: RoomMemberLevel curve editing — a visitor's own standing inside a room, distinct
+  // from the room's own level above. Same shape as updateRoomLevel/listRoomLevels minus the
+  // `unlocks` field, which RoomMemberLevel doesn't have (see schema.prisma).
+  async listRoomMemberLevels() {
+    return this.prisma.roomMemberLevel.findMany({ orderBy: { level: 'asc' } });
+  }
+
+  async updateRoomMemberLevel(level: number, body: any, actorId: string, roles: RoleName[]) {
+    if (!Number.isInteger(level) || level < 1 || level > 100) throw new BadRequestException('Level must be between 1 and 100');
+    const xpRequired = Math.floor(Number(body.xpRequired));
+    if (!Number.isFinite(xpRequired) || xpRequired < 0) throw new BadRequestException('xpRequired must be a non-negative number');
+    const name = String(body.name ?? '').trim();
+    if (!name || name.length > 60) throw new BadRequestException('Level name is required and must be 60 characters or less');
+    const updated = await this.prisma.roomMemberLevel.upsert({
+      where: { level },
+      update: { name, xpRequired, badgeUrl: body.badgeUrl ? String(body.badgeUrl) : null, active: body.active !== false },
+      create: { level, name, xpRequired, badgeUrl: body.badgeUrl ? String(body.badgeUrl) : null, active: body.active !== false },
+    });
+    await this.audit.record({ actorId, actorRole: roles[0], action: 'room_member_level.update', targetType: 'room_member_level', targetId: String(level), metadata: { xpRequired, name } });
     return updated;
   }
 }
