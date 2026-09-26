@@ -266,6 +266,19 @@ export class RoomCommunityService {
     }
   }
 
+  // Lightweight version of communitySnapshot's room-progress half, with the streak folded in —
+  // meant to be embedded directly into another payload (RoomsController.getRoomDetails) rather
+  // than fetched as its own round trip. Deliberately excludes viewer-specific fields, member/
+  // regular counts and the regulars list, which stay behind the full communitySnapshot/
+  // listRegulars endpoints for the Community tab.
+  async roomLevelSummary(roomId: string | null) {
+    if (!roomId) return null;
+    const room = await this.prisma.room.findUnique({ where: { id: roomId } });
+    if (!room) return null;
+    const roomLevels = await this.prisma.roomLevel.findMany({ where: { active: true }, orderBy: { level: 'asc' } });
+    return { streak: room.streak, ...this.shapeProgress(room.roomXp, roomLevels) };
+  }
+
   // ---- Reads -----------------------------------------------------------
 
   // Full snapshot for a room's "Community" tab: identity, room-level progress, streak, and the

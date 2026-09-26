@@ -135,12 +135,17 @@ export class RoomsService {
     // ever told the client who the moderators actually are, so mobile
     // could only ever show those controls to the literal host, hiding
     // real capabilities a moderator genuinely has.
-    const [moderators, mutedUserIds, locks, giftAgg, giftByRecipient] = await Promise.all([
+    const [moderators, mutedUserIds, locks, giftAgg, giftByRecipient, community] = await Promise.all([
       this.prisma.roomModerator.findMany({ where: { roomId }, select: { userId: true } }),
       this.moderation.mutedUserIds('ROOM', roomId),
       this.prisma.roomSeatLock.findMany({ where: { roomId }, select: { seatNumber: true } }),
       this.prisma.giftTransaction.aggregate({ where: { context: 'ROOM', contextId: roomId }, _sum: { coinAmount: true } }),
       this.prisma.giftTransaction.groupBy({ by: ['recipientId'], where: { context: 'ROOM', contextId: roomId }, _sum: { coinAmount: true } }),
+      // The persistent Room's level/streak, folded straight into the session payload so the
+      // header badge on mobile doesn't need a second request to the community endpoint — that
+      // endpoint (and communitySnapshot's fuller shape) is still what the Community tab itself
+      // uses for member/regular counts and the viewer's own standing.
+      this.roomCommunity.roomLevelSummary(room.roomId),
     ]);
     const profileGiftAgg = await this.prisma.giftTransaction.aggregate({
       where: { recipientId: viewerId },
@@ -157,6 +162,7 @@ export class RoomsService {
       giftCoins: giftAgg._sum.coinAmount ?? 0,
       seatGiftCoins,
       profileGiftCoins: profileGiftAgg._sum.coinAmount ?? 0,
+      community,
       seats: seats.map((s) => ({
         seatNumber: s.seatNumber,
         userId: s.userId,
