@@ -43,7 +43,7 @@ export class ImageUploadService {
    * allowlist via magic-byte sniffing) is delegated to image-rules.ts,
    * which is already unit-tested — this service only owns the upload.
    */
-  async uploadBase64(input: unknown): Promise<string> {
+  async upload(input: unknown): Promise<string> {
     const { bytes, type } = decodeImage(input);
     const key = `uploads/${new Date().toISOString().slice(0, 10)}/${randomUUID()}.${type === 'jpeg' ? 'jpg' : type}`;
 
