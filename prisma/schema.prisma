@@ -559,6 +559,17 @@ model MissionTierClaim {
   @@index([userId, periodKey])
 }
 
+// Singleton config row (id is always "default") for the Rryda Journey chest rewards — what
+// admin.controller/missions previously hardcoded as JOURNEY_HALFWAY_REWARD_COINS /
+// JOURNEY_ALL_REWARD_COINS. Missing row = MissionsService falls back to those same defaults, so a
+// fresh install with no admin edits yet behaves exactly as before this table existed.
+model JourneyConfig {
+  id                 String   @id @default("default")
+  halfwayRewardCoins Int      @default(50)
+  allRewardCoins     Int      @default(150)
+  updatedAt          DateTime @updatedAt
+}
+
 model MissionClaim {
   id          String            @id @default(uuid())
   userId      String

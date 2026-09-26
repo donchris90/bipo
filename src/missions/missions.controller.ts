@@ -1,10 +1,12 @@
-import { BadRequestException, Body, Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, Param, Post, Put, Req, UseGuards } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { UserThrottlerGuard } from '../common/guards/user-throttler.guard';
 import { Request } from 'express';
 import { RoleName } from '@prisma/client';
 import { MissionsService } from './missions.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
 import type { JourneyTierKey } from './journey-tiers';
 
 interface AuthedRequest extends Request {
@@ -45,5 +47,59 @@ export class MissionsController {
       throw new BadRequestException('Invalid Journey tier');
     }
     return this.missions.claimTier(req.user.userId, tier as JourneyTierKey);
+  }
+}
+
+// Mission/Journey configuration for the admin app: mission definitions (title, description,
+// target, reward, creator-only, active, ordering) and the Journey chest reward tiers. SUPER_ADMIN
+// only, same tier as HostLevels/RrydaLevels — these values directly control coin payouts.
+@Controller('api/v1/admin/missions')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(RoleName.SUPER_ADMIN)
+export class AdminMissionsController {
+  constructor(private readonly missions: MissionsService) {}
+
+  @Get()
+  list() {
+    return this.missions.adminList();
+  }
+
+  @Get('metrics')
+  metrics() {
+    return this.missions.adminMetrics();
+  }
+
+  @Post()
+  create(@Body() body: Record<string, unknown>, @Req() req: AuthedRequest) {
+    return this.missions.adminCreate(body, req.user.userId, req.user.roles);
+  }
+
+  // Literal routes ('journey-config') must be registered before ':id' below — Nest/Express
+  // match routes in registration order, and ':id' would otherwise swallow "journey-config" as
+  // if it were a mission id.
+  @Get('journey-config')
+  journeyConfig() {
+    return this.missions.adminGetJourneyConfig();
+  }
+
+  @Put('journey-config')
+  updateJourneyConfig(@Body() body: Record<string, unknown>, @Req() req: AuthedRequest) {
+    return this.missions.adminUpdateJourneyConfig(body, req.user.userId, req.user.roles);
+  }
+
+  @Put(':id')
+  update(@Param('id') id: string, @Body() body: Record<string, unknown>, @Req() req: AuthedRequest) {
+    return this.missions.adminUpdate(id, body, req.user.userId, req.user.roles);
+  }
+
+  @Put(':id/move/:direction')
+  move(@Param('id') id: string, @Param('direction') direction: string, @Req() req: AuthedRequest) {
+    if (direction !== 'up' && direction !== 'down') throw new BadRequestException('direction must be "up" or "down"');
+    return this.missions.adminMove(id, direction, req.user.userId, req.user.roles);
+  }
+
+  @Delete(':id')
+  remove(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.missions.adminDelete(id, req.user.userId, req.user.roles);
   }
 }
