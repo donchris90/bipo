@@ -1,64 +1,92 @@
-import { BadGatewayException, Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
+import { BadGatewayException, BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { decodeImage } from './image-rules';
+import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { randomUUID } from 'crypto';
 
-// Forwards an already-validated image to ImgBB using a key that lives only on
-// this server (IMGBB_API_KEY). The mobile app used to carry that key in its
-// bundle, where anyone could extract it from the APK; now the app only ever
-// talks to this backend, behind login and a rate limit.
-//
-// Not exercised against ImgBB's live API in this sandbox (no network to it):
-// upload a real image with your key before relying on it.
+const MAX_BYTES = 5 * 1024 * 1024; // 5 MB, same limit the mobile app already checks client-side
+
+// Base64 doesn't carry a mime type, so we sniff the first few decoded bytes
+// (the same "magic numbers" every image format starts with) to pick a
+// Content-Type and extension. ImgBB used to do this for us; R2 won't.
+const SIGNATURES: { bytes: number[]; mime: string; ext: string }[] = [
+  { bytes: [0xff, 0xd8, 0xff], mime: 'image/jpeg', ext: 'jpg' },
+  { bytes: [0x89, 0x50, 0x4e, 0x47], mime: 'image/png', ext: 'png' },
+  { bytes: [0x47, 0x49, 0x46, 0x38], mime: 'image/gif', ext: 'gif' },
+  { bytes: [0x52, 0x49, 0x46, 0x46], mime: 'image/webp', ext: 'webp' }, // RIFF container; WebP specifically has "WEBP" at byte 8, but RIFF alone is a safe enough signal here since we only ever accept images
+];
+
+function detectImageType(buffer: Buffer): { mime: string; ext: string } | null {
+  return SIGNATURES.find((sig) => sig.bytes.every((byte, i) => buffer[i] === byte)) ?? null;
+}
+
 @Injectable()
 export class ImageUploadService {
   private readonly logger = new Logger(ImageUploadService.name);
+  private readonly s3: S3Client;
+  private readonly bucket: string;
+  private readonly publicBaseUrl: string;
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(private readonly config: ConfigService) {
+    const accountId = this.config.getOrThrow<string>('S2_ACCOUNT_ID');
+    this.bucket = this.config.getOrThrow<string>('S2_BUCKET_NAME');
+    // Your R2 custom domain (e.g. https://cdn.yourapp.com) or, for testing
+    // only, the bucket's r2.dev URL. r2.dev is rate-limited and meant for
+    // dev/preview, not production traffic — set up a custom domain in the
+    // R2 dashboard (Settings → Public access) before shipping this.
+    this.publicBaseUrl = this.config.getOrThrow<string>('S2_PUBLIC_URL').replace(/\/+$/, '');
 
-  async upload(base64Input: unknown): Promise<{ url: string }> {
-    const key = this.config.get<string>('IMGBB_API_KEY');
-    if (!key) throw new ServiceUnavailableException('Image uploads are not configured');
+    this.s3 = new S3Client({
+      region: 'auto',
+      endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+      credentials: {
+        accessKeyId: this.config.getOrThrow<string>('S2_ACCESS_KEY_ID'),
+        secretAccessKey: this.config.getOrThrow<string>('S2_SECRET_ACCESS_KEY'),
+      },
+    });
+  }
 
-    const { base64 } = decodeImage(base64Input); // validates size + real image type
-
-    // ImgBB accepts the image as a normal form field. URL-encoded requests are
-    // simpler and more reliable with Node's fetch than relying on multipart
-    // boundary handling through different Node/undici versions. Retry transient
-    // upstream failures because a 502/503 from the image host is not the user's
-    // connection failing.
-    const endpoint = `https://api.imgbb.com/1/upload?key=${encodeURIComponent(key)}`;
-    let lastStatus = 0;
-    let lastMessage = 'no detail';
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const form = new URLSearchParams();
-        form.set('image', base64);
-        const response = await fetch(endpoint, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: form.toString(),
-          signal: AbortSignal.timeout(30_000),
-        });
-        lastStatus = response.status;
-        const json: any = await response.json().catch(() => null);
-        const url = json?.data?.url;
-        if (response.ok && typeof url === 'string') return { url };
-        lastMessage = json?.error?.message ?? 'no detail';
-        // Retry only transient upstream failures. Validation/auth failures will
-        // not become better on the next attempt.
-        if (![408, 429, 500, 502, 503, 504].includes(response.status)) break;
-      } catch (e: any) {
-        lastMessage = e?.message ?? String(e);
-        if (attempt === 2) {
-          this.logger.warn(`ImgBB request failed: ${lastMessage}`);
-          throw new BadGatewayException('Image host is unreachable');
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+  /**
+   * Takes the raw base64 string the mobile app sends (no data: prefix —
+   * see src/api/uploads.ts on the client) and returns a publicly-viewable
+   * URL, same contract the old ImgBB-backed version had.
+   */
+  async uploadBase64(base64: string): Promise<string> {
+    let buffer: Buffer;
+    try {
+      buffer = Buffer.from(base64, 'base64');
+      if (buffer.length === 0) throw new Error('empty');
+    } catch {
+      throw new BadRequestException('Invalid base64 string.');
     }
 
-    this.logger.warn(`ImgBB rejected the upload (${lastStatus}): ${lastMessage}`);
-    throw new BadGatewayException('Image upload failed at the image host. Please retry.');
+    if (buffer.length > MAX_BYTES) {
+      throw new BadRequestException('Image is too large. Maximum size is 5 MB.');
+    }
+
+    const detected = detectImageType(buffer);
+    if (!detected) {
+      throw new BadRequestException('Unsupported image format. Use JPEG, PNG, GIF or WebP.');
+    }
+
+    const key = `uploads/${new Date().toISOString().slice(0, 10)}/${randomUUID()}.${detected.ext}`;
+
+    try {
+      await this.s3.send(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+          Body: buffer,
+          ContentType: detected.mime,
+          // R2 doesn't use ACLs the way S3 does — public access is granted
+          // at the bucket/custom-domain level in the R2 dashboard, not per
+          // object, so no ACL field is set here.
+        }),
+      );
+    } catch (err) {
+      this.logger.warn(`R2 rejected the upload: ${(err as Error).message}`);
+      throw new BadGatewayException('Image upload failed at the storage host. Please retry.');
+    }
+
+    return `${this.publicBaseUrl}/${key}`;
   }
 }
