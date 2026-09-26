@@ -1,6 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { RoleName } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { AuditService } from '../audit/audit.service';
 
 // Rryda Identity: every user's level, independent of HostLevel (creator-only, gates creator
 // features). This one gates nothing — it exists so that everything a user does across the app
@@ -11,7 +13,11 @@ import { NotificationsService } from '../notifications/notifications.service';
 // (RrydaLevel) plus addXp() incrementing xp and recomputing the level, notifying once on level-up.
 @Injectable()
 export class RrydaLevelsService {
-  constructor(private readonly prisma: PrismaService, private readonly notifications: NotificationsService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly notifications: NotificationsService,
+    private readonly audit: AuditService,
+  ) {}
 
   async list() {
     return this.prisma.rrydaLevel.findMany({ orderBy: { level: 'asc' } });
@@ -65,5 +71,20 @@ export class RrydaLevelsService {
     } catch {
       /* identity XP is a bonus signal, never a reason to fail the action that earned it */
     }
+  }
+
+  async updateLevel(level: number, body: any, actorId: string, roles: RoleName[]) {
+    if (!Number.isInteger(level) || level < 1 || level > 100) throw new BadRequestException('Level must be between 1 and 100');
+    const xpRequired = Math.floor(Number(body.xpRequired));
+    if (!Number.isFinite(xpRequired) || xpRequired < 0) throw new BadRequestException('xpRequired must be a non-negative number');
+    const name = String(body.name ?? '').trim();
+    if (!name || name.length > 60) throw new BadRequestException('Level name is required and must be 60 characters or less');
+    const updated = await this.prisma.rrydaLevel.upsert({
+      where: { level },
+      update: { name, xpRequired, badgeUrl: body.badgeUrl ? String(body.badgeUrl) : null, active: body.active !== false },
+      create: { level, name, xpRequired, badgeUrl: body.badgeUrl ? String(body.badgeUrl) : null, active: body.active !== false },
+    });
+    await this.audit.record({ actorId, actorRole: roles[0], action: 'rryda_level.update', targetType: 'rryda_level', targetId: String(level), metadata: { xpRequired, name } });
+    return updated;
   }
 }
