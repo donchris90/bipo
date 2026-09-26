@@ -64,6 +64,10 @@ export function describeForPush(
       return { title: `Rryda Level ${payload.level}`, body: `You're now ${payload.name ?? `Level ${payload.level}`}! Keep going.` };
     case 'BADGE_EARNED':
       return { title: 'Badge earned', body: `${payload.emoji ?? '🏅'} You earned the ${payload.label ?? 'a'} badge` };
+    case 'FOLLOWED_HOST_LIVE':
+      return { title: `${payload.hostDisplayName ?? 'Someone you follow'} is live`, body: payload.title ? String(payload.title) : 'Tap to join now' };
+    case 'FOLLOWED_HOST_ROOM':
+      return { title: `${payload.hostDisplayName ?? 'Someone you follow'} opened a room`, body: payload.title ? String(payload.title) : 'Tap to join now' };
     case 'HOST_TASK_COMPLETED':
       return { title: 'Host task completed', body: `${payload.taskLabel ?? 'Daily host task'} completed${payload.rewardXp ? ` — +${payload.rewardXp} XP` : ''}` };
     case 'HOST_ACHIEVEMENT':

@@ -12,11 +12,12 @@ import { RealtimeModule } from '../realtime/realtime.module';
 import { ModerationModule } from '../moderation/moderation.module';
 import { EconomyModule } from '../economy/economy.module';
 import { HostLevelsModule } from '../host-levels/host-levels.module';
+import { NotificationsModule } from '../notifications/notifications.module';
 
 const logger = new Logger('LiveModule');
 
 @Module({
-  imports: [FeatureFlagsModule, ConfigModule, RealtimeModule, ModerationModule, EconomyModule, HostLevelsModule],
+  imports: [FeatureFlagsModule, ConfigModule, RealtimeModule, ModerationModule, EconomyModule, HostLevelsModule, NotificationsModule],
   providers: [
     LiveService,
     LiveMediaService,

@@ -824,6 +824,10 @@ enum NotificationType {
   // Rryda Identity level-up, for every user (see HOST_LEVEL_UP for the creator-only equivalent).
   RRYDA_LEVEL_UP
   BADGE_EARNED
+  // Sent to a host's followers and fellow agency members when they go live or open a party room
+  // (see common/friend-announce.ts).
+  FOLLOWED_HOST_LIVE
+  FOLLOWED_HOST_ROOM
 }
 
 enum LiveStatus {

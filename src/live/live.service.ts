@@ -20,6 +20,8 @@ import { WalletService } from '../economy/wallet.service';
 import { RevenueSplitService } from '../economy/revenue-split.service';
 import { LedgerEntryType, WalletType } from '@prisma/client';
 import { HostLevelsService } from '../host-levels/host-levels.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { announceToFollowersAndAgency } from '../common/friend-announce';
 
 export const RTC_PROVIDER = 'RTC_PROVIDER';
 
@@ -37,6 +39,7 @@ export class LiveService {
     // after it; SWC let it through, ts-jest did not).
     @Optional() private readonly media?: LiveMediaService,
     @Optional() private readonly hostLevels?: HostLevelsService,
+    @Optional() private readonly notifications?: NotificationsService,
   ) {}
 
   // Per-user like throttle: recent (timestamp, count) entries within the
@@ -140,6 +143,14 @@ export class LiveService {
     });
 
     const token = await this.rtc.generateToken(channelName, hostId, 'host');
+
+    if (this.notifications) {
+      const host = await this.prisma.user.findUnique({ where: { id: hostId }, select: { displayName: true } });
+      void announceToFollowersAndAgency(this.prisma, this.notifications, hostId, 'FOLLOWED_HOST_LIVE', {
+        hostId, hostDisplayName: host?.displayName ?? null, sessionId, title,
+      });
+    }
+
     return { session, token };
   }
 

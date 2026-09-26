@@ -12,6 +12,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { assertNotBlocked } from '../common/blocks';
 import { publicName } from '../common/public-name';
 import { LudoService } from '../games/ludo.service';
+import { announceToFollowersAndAgency } from '../common/friend-announce';
 
 @Injectable()
 export class RoomsService {
@@ -49,6 +50,12 @@ export class RoomsService {
     // used when there is no vacant unlocked seat (or when the guest explicitly
     // presses Join queue). Locks are explicit host/moderator actions only.
     await this.prisma.roomSeat.create({ data: { roomId: room.id, userId: hostId, seatNumber: 0 } });
+
+    const host = await this.prisma.user.findUnique({ where: { id: hostId }, select: { displayName: true } });
+    void announceToFollowersAndAgency(this.prisma, this.notifications, hostId, 'FOLLOWED_HOST_ROOM', {
+      hostId, hostDisplayName: host?.displayName ?? null, roomId: room.id, title,
+    });
+
     return room;
   }
 
