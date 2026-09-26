@@ -21,6 +21,12 @@ model User {
   referredById  String?
   lastCheckInAt DateTime?
   checkInStreak Int            @default(0)
+  // "Rryda Journey": consecutive days every one of that day's EVERYONE-audience missions was
+  // completed (see MissionDefinition.creatorOnly and MissionTierClaim). Same UTC-day rule as
+  // checkInStreak, kept separate because completing a Perfect Day is a different act from
+  // checking in.
+  perfectDayStreak Int         @default(0)
+  lastPerfectDayAt DateTime?
   hostXp        Int            @default(0)
   hostLevel     Int            @default(1)
   oneOnOneEnabled Boolean       @default(true)
@@ -522,10 +528,30 @@ model MissionDefinition {
   target      Int
   // Paid in coins into the claimer's BONUS wallet.
   rewardCoins Int
+  // false ("everyone"): shown and claimable by every signed-in user — the Rryda Journey.
+  // true: shown only to users with the CREATOR role (the original 4 hosting-activity missions).
+  // A user with the CREATOR role sees both sets.
+  creatorOnly Boolean        @default(false)
   active      Boolean        @default(true)
   sortOrder   Int            @default(0)
   createdAt   DateTime       @default(now())
   claims      MissionClaim[]
+}
+
+// One row per (user, day, tier) chest claimed from the Rryda Journey — completing several of
+// that day's EVERYONE missions, on top of whatever each mission already pays on its own. `tier`
+// is a key from journeyTiers() (e.g. "HALFWAY", "ALL"), not a fixed number, so the reward scales
+// automatically if an admin adds or removes Journey missions later.
+model MissionTierClaim {
+  id          String   @id @default(uuid())
+  userId      String
+  periodKey   String
+  tier        String
+  rewardCoins Int
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, periodKey, tier])
+  @@index([userId, periodKey])
 }
 
 model MissionClaim {
@@ -940,6 +966,14 @@ enum MissionMetric {
   PK_WINS
   GIFT_COINS_RECEIVED
   NEW_FOLLOWERS
+  // Added for the Rryda Journey: available to every user, not only creators (see
+  // MissionDefinition.creatorOnly). Each is counted from data that already exists elsewhere
+  // (chat, gifts, game rounds, live viewing, follows) — no new activity logging was needed.
+  MESSAGES_SENT
+  GIFTS_SENT
+  GAMES_PLAYED
+  LIVE_SESSIONS_WATCHED
+  NEW_FOLLOWS_MADE
 }
 
 enum WithdrawalStatus {
