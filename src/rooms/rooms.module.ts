@@ -7,11 +7,14 @@ import { LiveModule } from '../live/live.module';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { GamesModule } from '../games/games.module';
+import { RoomCommunityModule } from './room-community.module';
 
 @Module({
   // GamesModule is needed so a closing Party Room can tell LudoService to resolve any Ludo
   // table it's hosting (see RoomsService.finishClose) instead of leaving it orphaned.
-  imports: [ModerationModule, LiveModule, RealtimeModule, NotificationsModule, GamesModule],
+  // RoomCommunityModule is the persistent-identity/XP/streak layer on top of PartyRoom
+  // sessions — see room-community.service.ts.
+  imports: [ModerationModule, LiveModule, RealtimeModule, NotificationsModule, GamesModule, RoomCommunityModule],
   providers: [RoomsService, RoomReaperService],
   controllers: [RoomsController],
   exports: [RoomsService],

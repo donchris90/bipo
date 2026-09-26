@@ -13,6 +13,7 @@ import { assertNotBlocked } from '../common/blocks';
 import { publicName } from '../common/public-name';
 import { LudoService } from '../games/ludo.service';
 import { announceToFollowersAndAgency } from '../common/friend-announce';
+import { RoomCommunityService } from './room-community.service';
 
 @Injectable()
 export class RoomsService {
@@ -24,6 +25,7 @@ export class RoomsService {
     private readonly realtime: RealtimeGateway,
     private readonly notifications: NotificationsService,
     private readonly ludo: LudoService,
+    private readonly roomCommunity: RoomCommunityService,
   ) {}
 
   async create(hostId: string, title: string, privacy: RoomPrivacy, seatCount: number, countryCode: string, category?: string, themeColor?: string, mode?: string) {
@@ -32,6 +34,15 @@ export class RoomsService {
     // could be created, seats assigned, moderation applied, but nothing
     // ever gave anyone in it an actual voice channel to speak on.
     const { channelName } = await this.rtc.createChannel(`room-${Date.now()}`);
+    // Persistent Room identity (see RoomCommunityService) — created once per host on their
+    // very first session, reused (never overwritten from session input) on every one after.
+    // This is the piece that used to be missing entirely: a host's room used to only ever
+    // exist for the lifetime of one PartyRoom row.
+    const persistentRoom = await this.roomCommunity.getOrCreateRoomForHost(hostId, {
+      title,
+      themeColor: themeColor && /^#[0-9A-Fa-f]{6}$/.test(themeColor) ? themeColor : null,
+      category,
+    });
     const room = await this.prisma.partyRoom.create({
       data: {
         hostId,
@@ -43,6 +54,7 @@ export class RoomsService {
         category,
         themeColor: themeColor && /^#[0-9A-Fa-f]{6}$/.test(themeColor) ? themeColor : null,
         mode: mode === 'VIDEO' ? 'VIDEO' : 'AUDIO',
+        roomId: persistentRoom.id,
       },
     });
     // Host occupies seat 0 by convention. Guest seats start EMPTY and OPEN.
@@ -176,6 +188,9 @@ export class RoomsService {
     const muted = await this.moderation.isMuted('ROOM', roomId, userId);
     const role = seat && !muted ? 'host' : 'audience';
     const token = await this.rtc.generateToken(room.providerChannel, userId, role);
+    // Best-effort, never awaited into the join path's latency: this is what turns "entered a
+    // session" into "visited this community" (see RoomCommunityService.recordVisit).
+    void this.roomCommunity.recordVisit(room.roomId, userId);
     return { room, token, role, muted };
   }
 
@@ -736,13 +751,16 @@ export class RoomsService {
 
   // Idempotent: closing a room that is already closed returns it untouched, so a
   // repeated call (or the sweeper racing the host) can't rewrite the close time.
-  private async finishClose(room: { id: string; providerChannel: string; status: string }) {
+  private async finishClose(room: { id: string; providerChannel: string; status: string; roomId?: string | null }) {
     if (room.status === 'CLOSED') return this.prisma.partyRoom.findUniqueOrThrow({ where: { id: room.id } });
     await this.rtc.destroyChannel(room.providerChannel);
     const closed = await this.prisma.partyRoom.update({
       where: { id: room.id },
       data: { status: 'CLOSED', closedAt: new Date() },
     });
+    // Room streak bookkeeping (see RoomCommunityService.recordHostSession) — a session having
+    // actually happened and closed is what counts as "the room was live today".
+    void this.roomCommunity.recordHostSession(closed.roomId);
     // Everyone still inside must be told. Before, guests sat in a dead,
     // silent room until they left on their own.
     try {

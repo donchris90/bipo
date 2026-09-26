@@ -268,9 +268,120 @@ model PartyRoom {
   // A video party (seats show camera) or an audio lounge (voice only). Chosen by
   // the host when starting the room; the Party tab's two filters use it.
   mode            RoomMode    @default(AUDIO)
+  // The persistent Room this session belongs to (see Room below). Nullable because
+  // existing rows predate the Room Community feature; backfilled by the migration
+  // for any host who already has sessions, and set on every create() from here on.
+  roomId          String?
 
   @@index([hostId])
   @@index([status])
+  @@index([roomId])
+}
+
+// A host's persistent room IDENTITY — separate from PartyRoom, which is one LIVE
+// SESSION of it. Before this, "the room" only ever existed for as long as one
+// session did: closing it (or the host's app dying) erased the title, theme,
+// category and any sense that the same audience had been here before. This is
+// the thing that carries across sessions, the way a Twitch channel outlives any
+// one stream. One per host for now (hostId is unique) — multiple named rooms per
+// host is a real possible future, but nothing in the product today asks a host to
+// juggle more than one, so it isn't modeled until something does.
+model Room {
+  id          String    @id @default(uuid())
+  hostId      String    @unique
+  title       String
+  description String?
+  themeColor  String?
+  category    String?
+  // Community-wide progression — grows from members visiting and gifting here
+  // (see RoomCommunityService.awardRoomXp), gated against RoomLevel below the
+  // same way HostLevel gates hostXp.
+  roomXp      Int       @default(0)
+  roomLevel   Int       @default(1)
+  // Consecutive UTC days with at least one closed session — same day-boundary
+  // rule as User.checkInStreak (see check-in-rules.ts's resolveCheckIn, reused
+  // here rather than re-implemented).
+  streak      Int       @default(0)
+  lastLiveAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([roomLevel])
+}
+
+// The room's own level curve — admin-configurable, same shape as HostLevel/
+// RrydaLevel/SupporterLevel. unlocks (room banners, entry effects, exclusive
+// seat frames) works exactly like HostLevel.unlocks.
+model RoomLevel {
+  level      Int      @id
+  name       String
+  xpRequired Int
+  unlocks    Json?
+  badgeUrl   String?
+  active     Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+}
+
+// One row per (room, member) — a visitor's standing INSIDE one specific room,
+// the room-scoped counterpart to CreatorSupporter (which tracks gifting to a
+// creator across all their content). xp grows from visiting and gifting in
+// THIS room; visitStreak/visitCount are what "regular" is computed from.
+model RoomMember {
+  id          String    @id @default(uuid())
+  roomId      String
+  userId      String
+  xp          Int       @default(0)
+  level       Int       @default(1)
+  visitCount  Int       @default(0)
+  // Same resolveCheckIn day-boundary logic as Room.streak and User.checkInStreak,
+  // scoped to this member's visits to this one room.
+  visitStreak Int       @default(0)
+  lastVisitAt DateTime?
+  // Cached, not computed on every read: true once visitCount/visitStreak cross
+  // the thresholds in RoomCommunityService, recomputed on each visit. A "regulars"
+  // list is then a plain WHERE isRegular = true, not a full-table scan every time
+  // the host opens the community tab.
+  isRegular   Boolean   @default(false)
+  joinedAt    DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([roomId, userId])
+  @@index([roomId, xp])
+  @@index([userId])
+}
+
+// The member-side level curve — global, like SupporterLevel, not per-room. A
+// member's rank in one room is denominated on the same scale as any other room,
+// the way SupporterLevel is one scale reused for every (supporter, creator) pair.
+model RoomMemberLevel {
+  level      Int      @id
+  name       String
+  xpRequired Int
+  badgeUrl   String?
+  active     Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+}
+
+// Small catalog of room-community achievements — same shape as Badge (earned
+// once, kept forever even if the underlying stat later drops).
+model RoomAchievement {
+  key         String   @id
+  label       String
+  emoji       String
+  description String
+  active      Boolean  @default(true)
+  updatedAt   DateTime @updatedAt
+}
+
+model RoomMemberAchievement {
+  id             String   @id @default(uuid())
+  roomId         String
+  userId         String
+  achievementKey String
+  earnedAt       DateTime @default(now())
+
+  @@unique([roomId, userId, achievementKey])
+  @@index([roomId, userId])
 }
 
 model RoomSeat {
@@ -842,6 +953,14 @@ enum NotificationType {
   // Supporter level-up on a specific creator (see SUPPORTER_LEVEL_UP for the creator-only
   // equivalent of RRYDA_LEVEL_UP / HOST_LEVEL_UP — this one is per (supporter, creator) pair).
   SUPPORTER_LEVEL_UP
+  // Room Community: the room's own level curve (sent to the host) vs. ROOM_MEMBER_LEVEL_UP
+  // (sent to a visitor about their own standing in one room — the Room/RoomMember split
+  // mirrors HOST_LEVEL_UP/SUPPORTER_LEVEL_UP above).
+  ROOM_LEVEL_UP
+  ROOM_MEMBER_LEVEL_UP
+  // A visitor just crossed the "regular" threshold in one of the rooms they attend.
+  ROOM_REGULAR
+  ROOM_ACHIEVEMENT
 }
 
 enum LiveStatus {

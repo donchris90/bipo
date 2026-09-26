@@ -10,6 +10,7 @@ import { pkPointsForCoins, pkSideForRecipient } from './pk-score';
 import { HostLevelsService } from '../host-levels/host-levels.service';
 import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
 import { SupporterLevelsService } from '../supporters/supporter-levels.service';
+import { RoomCommunityService } from '../rooms/room-community.service';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -144,6 +145,10 @@ export class GiftService {
     // "Support" dimension) — separate from hostLevels above, which grows the RECIPIENT's.
     @Optional() private readonly rrydaLevels?: RrydaLevelsService,
     @Optional() private readonly supporterLevels?: SupporterLevelsService,
+    // Same optional pattern as the others above, never able to fail a gift. Only fires for
+    // ROOM-context gifts (see the hook below) — awardGiftXp itself resolves the session's
+    // contextId to the persistent Room.
+    @Optional() private readonly roomCommunity?: RoomCommunityService,
   ) {}
 
   // Backing for a gift-picker UI — before this, the only way a client
@@ -294,6 +299,13 @@ export class GiftService {
     // this one creator directly.
     if (this.supporterLevels) {
       void this.supporterLevels.addXp(params.senderId, params.recipientId, coinAmount);
+    }
+    // A gift sent inside a Party Room also grows the sender's standing in that room's
+    // community (and, more slowly, the room's own level) — see RoomCommunityService.
+    // params.contextId here is the live PartyRoom session id; awardGiftXp resolves it to the
+    // persistent Room itself.
+    if (this.roomCommunity && params.context === 'ROOM' && params.contextId) {
+      void this.roomCommunity.awardGiftXp(params.contextId, params.senderId, coinAmount);
     }
 
     // 4. If sent during an active PK battle, feed the score. Kept outside
