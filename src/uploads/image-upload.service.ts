@@ -1,23 +1,15 @@
-import { BadGatewayException, BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { BadGatewayException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { randomUUID } from 'crypto';
+import { decodeImage } from './image-rules';
 
-const MAX_BYTES = 5 * 1024 * 1024; // 5 MB, same limit the mobile app already checks client-side
-
-// Base64 doesn't carry a mime type, so we sniff the first few decoded bytes
-// (the same "magic numbers" every image format starts with) to pick a
-// Content-Type and extension. ImgBB used to do this for us; R2 won't.
-const SIGNATURES: { bytes: number[]; mime: string; ext: string }[] = [
-  { bytes: [0xff, 0xd8, 0xff], mime: 'image/jpeg', ext: 'jpg' },
-  { bytes: [0x89, 0x50, 0x4e, 0x47], mime: 'image/png', ext: 'png' },
-  { bytes: [0x47, 0x49, 0x46, 0x38], mime: 'image/gif', ext: 'gif' },
-  { bytes: [0x52, 0x49, 0x46, 0x46], mime: 'image/webp', ext: 'webp' }, // RIFF container; WebP specifically has "WEBP" at byte 8, but RIFF alone is a safe enough signal here since we only ever accept images
-];
-
-function detectImageType(buffer: Buffer): { mime: string; ext: string } | null {
-  return SIGNATURES.find((sig) => sig.bytes.every((byte, i) => buffer[i] === byte)) ?? null;
-}
+const MIME_BY_TYPE: Record<string, string> = {
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  webp: 'image/webp',
+};
 
 @Injectable()
 export class ImageUploadService {
@@ -29,8 +21,8 @@ export class ImageUploadService {
   constructor(private readonly config: ConfigService) {
     this.bucket = this.config.getOrThrow<string>('S3_BUCKET');
     // Custom domain or CDN URL images are served from publicly (e.g.
-    // https://cdn.yourapp.com) — NOT the S3_ENDPOINT above, which is the
-    // API endpoint used to talk to the storage host, not a public URL.
+    // https://cdn.yourapp.com) — NOT S3_ENDPOINT, which is the API
+    // endpoint used to talk to the storage host, not a public URL.
     this.publicBaseUrl = this.config.getOrThrow<string>('S3_PUBLIC_BASE_URL').replace(/\/+$/, '');
 
     this.s3 = new S3Client({
@@ -45,44 +37,30 @@ export class ImageUploadService {
   }
 
   /**
-   * Takes the raw base64 string the mobile app sends (no data: prefix —
-   * see src/api/uploads.ts on the client) and returns a publicly-viewable
-   * URL, same contract the old ImgBB-backed version had.
+   * Takes whatever the client sent (plain base64 or a data: URI — see
+   * decodeImage) and returns a publicly-viewable URL, same contract the
+   * old ImgBB-backed version had. Validation (size limit, format
+   * allowlist via magic-byte sniffing) is delegated to image-rules.ts,
+   * which is already unit-tested — this service only owns the upload.
    */
-  async uploadBase64(base64: string): Promise<string> {
-    let buffer: Buffer;
-    try {
-      buffer = Buffer.from(base64, 'base64');
-      if (buffer.length === 0) throw new Error('empty');
-    } catch {
-      throw new BadRequestException('Invalid base64 string.');
-    }
-
-    if (buffer.length > MAX_BYTES) {
-      throw new BadRequestException('Image is too large. Maximum size is 5 MB.');
-    }
-
-    const detected = detectImageType(buffer);
-    if (!detected) {
-      throw new BadRequestException('Unsupported image format. Use JPEG, PNG, GIF or WebP.');
-    }
-
-    const key = `uploads/${new Date().toISOString().slice(0, 10)}/${randomUUID()}.${detected.ext}`;
+  async uploadBase64(input: unknown): Promise<string> {
+    const { bytes, type } = decodeImage(input);
+    const key = `uploads/${new Date().toISOString().slice(0, 10)}/${randomUUID()}.${type === 'jpeg' ? 'jpg' : type}`;
 
     try {
       await this.s3.send(
         new PutObjectCommand({
           Bucket: this.bucket,
           Key: key,
-          Body: buffer,
-          ContentType: detected.mime,
+          Body: bytes,
+          ContentType: MIME_BY_TYPE[type],
           // R2 doesn't use ACLs the way S3 does — public access is granted
-          // at the bucket/custom-domain level in the R2 dashboard, not per
+          // at the bucket/custom-domain level in the dashboard, not per
           // object, so no ACL field is set here.
         }),
       );
     } catch (err) {
-      this.logger.warn(`R2 rejected the upload: ${(err as Error).message}`);
+      this.logger.warn(`Storage host rejected the upload: ${(err as Error).message}`);
       throw new BadGatewayException('Image upload failed at the storage host. Please retry.');
     }
 
