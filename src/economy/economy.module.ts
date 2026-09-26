@@ -18,11 +18,12 @@ import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { HostLevelsModule } from '../host-levels/host-levels.module';
+import { RrydaLevelsModule } from '../rryda-levels/rryda-levels.module';
 
 const logger = new Logger('EconomyModule');
 
 @Module({
-  imports: [ConfigModule, RealtimeModule, NotificationsModule, HostLevelsModule],
+  imports: [ConfigModule, RealtimeModule, NotificationsModule, HostLevelsModule, RrydaLevelsModule],
   providers: [CoinPackageAdminService, GiftAdminService, 
     WalletService,
     RevenueSplitService,

@@ -60,6 +60,10 @@ export function describeForPush(
       return { title: 'Missed call', body: `Missed call from ${payload.callerDisplayName ?? 'someone'}` };
     case 'HOST_LEVEL_UP':
       return { title: `Host Level ${payload.level}`, body: `Congratulations! You reached ${payload.name ?? `Level ${payload.level}`}.` };
+    case 'RRYDA_LEVEL_UP':
+      return { title: `Rryda Level ${payload.level}`, body: `You're now ${payload.name ?? `Level ${payload.level}`}! Keep going.` };
+    case 'BADGE_EARNED':
+      return { title: 'Badge earned', body: `${payload.emoji ?? '🏅'} You earned the ${payload.label ?? 'a'} badge` };
     case 'HOST_TASK_COMPLETED':
       return { title: 'Host task completed', body: `${payload.taskLabel ?? 'Daily host task'} completed${payload.rewardXp ? ` — +${payload.rewardXp} XP` : ''}` };
     case 'HOST_ACHIEVEMENT':

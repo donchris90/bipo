@@ -2,11 +2,14 @@ import { BadRequestException } from '@nestjs/common';
 import { ChatContext } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { publicName } from './public-name';
+import { topBadgesFor, type BadgeSummary } from '../badges/badge-lookup';
 
 export interface ChatHistoryItem {
   id: string;
   senderId: string;
   senderName: string | null;
+  // The one badge (if any) that shows beside this sender's name — see badge-lookup.ts.
+  senderBadge: BadgeSummary | null;
   content: string;
   createdAt: Date;
 }
@@ -40,16 +43,18 @@ export async function fetchChatHistory(
   });
   if (rows.length === 0) return [];
 
-  const senders = await prisma.user.findMany({
-    where: { id: { in: [...new Set(rows.map((r) => r.senderId))] } },
-    select: { id: true, displayName: true },
-  });
+  const senderIds = [...new Set(rows.map((r) => r.senderId))];
+  const [senders, badgesById] = await Promise.all([
+    prisma.user.findMany({ where: { id: { in: senderIds } }, select: { id: true, displayName: true } }),
+    topBadgesFor(prisma, senderIds).catch(() => new Map<string, BadgeSummary>()),
+  ]);
   const nameById = new Map(senders.map((u) => [u.id, u.displayName]));
 
   return rows.reverse().map((r) => ({
     id: r.id,
     senderId: r.senderId,
     senderName: publicName(nameById.get(r.senderId), r.senderId),
+    senderBadge: badgesById.get(r.senderId) ?? null,
     content: r.content,
     createdAt: r.createdAt,
   }));

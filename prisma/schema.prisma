@@ -29,6 +29,11 @@ model User {
   lastPerfectDayAt DateTime?
   hostXp        Int            @default(0)
   hostLevel     Int            @default(1)
+  // Rryda Identity: EVERY user's level, not only creators. Grows from Journey missions/chests,
+  // checking in, following someone new, and sending gifts — see RrydaLevelsService.addXp() and
+  // its call sites. Separate from hostXp/hostLevel, which stay creator-only.
+  rrydaXp       Int            @default(0)
+  rrydaLevel    Int            @default(1)
   oneOnOneEnabled Boolean       @default(true)
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
@@ -816,6 +821,9 @@ enum NotificationType {
   HOST_TASK_COMPLETED
   HOST_ACHIEVEMENT
   HOST_RANKING
+  // Rryda Identity level-up, for every user (see HOST_LEVEL_UP for the creator-only equivalent).
+  RRYDA_LEVEL_UP
+  BADGE_EARNED
 }
 
 enum LiveStatus {
@@ -1157,6 +1165,43 @@ model HostXpRule {
   unit        String
   enabled     Boolean  @default(true)
   updatedAt   DateTime @updatedAt
+}
+
+// The generic level curve for RrydaLevelsService — every user's identity level, independent of
+// HostLevel (which only ever applies to creators and gates creator features). This one gates
+// nothing yet; it exists to give every user's activity somewhere to add up to.
+model RrydaLevel {
+  level      Int      @id
+  name       String
+  xpRequired Int
+  badgeUrl   String?
+  active     Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+}
+
+// A small, deliberately short catalog of prestige badges (see BadgesService) — earned once and
+// kept forever, never re-evaluated away if the underlying stat later drops (a 7-day streak badge
+// stays even if the streak later breaks; that is the point of a badge versus a live stat).
+model Badge {
+  key         String      @id
+  label       String
+  emoji       String
+  description String
+  active      Boolean     @default(true)
+  sortOrder   Int         @default(0)
+  updatedAt   DateTime    @updatedAt
+  earners     UserBadge[]
+}
+
+model UserBadge {
+  id        String   @id @default(uuid())
+  userId    String
+  badgeKey  String
+  earnedAt  DateTime @default(now())
+  badge     Badge    @relation(fields: [badgeKey], references: [key])
+
+  @@unique([userId, badgeKey])
+  @@index([userId])
 }
 
 model HostDailyTask {

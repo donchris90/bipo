@@ -3,6 +3,8 @@ import { ConfigService } from '@nestjs/config';
 import { Prisma, LedgerEntryType, MissionMetric, WalletType } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
+import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
+import { BadgesService } from '../badges/badges.service';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { overlapSeconds } from '../creators/creator-analytics.service';
 
@@ -28,6 +30,8 @@ export class MissionsService {
     private readonly prisma: PrismaService,
     private readonly wallet: WalletService,
     private readonly config: ConfigService,
+    private readonly rrydaLevels: RrydaLevelsService,
+    private readonly badges: BadgesService,
   ) {}
 
   private offsetMinutes(): number {
@@ -61,6 +65,7 @@ export class MissionsService {
 
   async list(userId: string, isCreator: boolean) {
     const now = new Date();
+    void this.badges.evaluateAndAward(userId);
     const { period, definitions, claimed, claimedTiers, progress } = await this.today(userId, isCreator, now);
 
     const [bonus, user] = await Promise.all([
@@ -152,6 +157,7 @@ export class MissionsService {
     }
 
     const bonus = await this.wallet.getBalance(userId, WalletType.BONUS);
+    void this.rrydaLevels.addXp(userId, mission.rewardCoins); // Rryda Identity: every mission counts, not only creator ones
     return { claimed: true, rewardCoins: mission.rewardCoins, bonusBalance: bonus.toString() };
   }
 
@@ -207,6 +213,7 @@ export class MissionsService {
     }
 
     const bonus = await this.wallet.getBalance(userId, WalletType.BONUS);
+    void this.rrydaLevels.addXp(userId, target.rewardCoins);
     return {
       claimed: true,
       tier,

@@ -15,6 +15,7 @@ import { ModerationService } from '../moderation/moderation.service';
 import { ChatContext } from '@prisma/client';
 import { isBlockedEitherWay } from '../common/blocks';
 import { publicName } from '../common/public-name';
+import { topBadgeFor } from '../badges/badge-lookup';
 
 interface AuthedSocket extends Socket {
   data: { userId?: string };
@@ -161,11 +162,12 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     if (await this.moderation.isBanned(data.context, data.contextId, userId)) return { error: 'banned' };
     if (await this.moderation.isMuted(data.context, data.contextId, userId)) return { error: 'muted' };
 
-    const [message, sender] = await Promise.all([
+    const [message, sender, senderBadge] = await Promise.all([
       this.prisma.chatMessage.create({
         data: { context: data.context, contextId: data.contextId, senderId: userId, content: data.content },
       }),
       this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true } }),
+      topBadgeFor(this.prisma, userId).catch(() => null), // a badge lookup failure must never block sending a message
     ]);
 
     // Same shape as GET /live/:id/chat and GET /rooms/:id/chat history rows.
@@ -173,6 +175,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       id: message.id,
       senderId: message.senderId,
       senderName: publicName(sender?.displayName, userId),
+      senderBadge,
       content: message.content,
       createdAt: message.createdAt,
     });

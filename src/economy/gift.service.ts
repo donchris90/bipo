@@ -8,6 +8,7 @@ import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { WalletType, LedgerEntryType, ChatContext } from '@prisma/client';
 import { pkPointsForCoins, pkSideForRecipient } from './pk-score';
 import { HostLevelsService } from '../host-levels/host-levels.service';
+import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -137,6 +138,10 @@ export class GiftService {
     // injected. Never awaited for its result and never able to fail a gift.
     @Optional() private readonly notifications?: NotificationsService,
     @Optional() private readonly hostLevels?: HostLevelsService,
+    // Same optional pattern as hostLevels above, and the same rule: never awaited for its
+    // result, never able to fail a gift. This one grows the SENDER's Rryda Identity (the doc's
+    // "Support" dimension) — separate from hostLevels above, which grows the RECIPIENT's.
+    @Optional() private readonly rrydaLevels?: RrydaLevelsService,
   ) {}
 
   // Backing for a gift-picker UI — before this, the only way a client
@@ -277,6 +282,9 @@ export class GiftService {
 
     if (this.hostLevels) {
       try { await this.hostLevels.awardRule(params.recipientId, 'GIFT_100_COINS', Math.floor(coinAmount / 100)); } catch { /* progression must never fail a paid gift */ }
+    }
+    if (this.rrydaLevels) {
+      void this.rrydaLevels.addXp(params.senderId, Math.floor(coinAmount / 50));
     }
 
     // 4. If sent during an active PK battle, feed the score. Kept outside
