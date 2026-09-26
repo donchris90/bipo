@@ -139,7 +139,7 @@ async function main() {
       code: 'LUDO',
       name: 'Ludo',
       status: 'DISABLED',
-      rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 20, reconnectSeconds: 120, prizeFirstPercent: 70, prizeSecondPercent: 30 },
+      rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 20, reconnectSeconds: 120, prizeFirstPercent: 66.67, prizeSecondPercent: 33.33, prizeFirstPercent2p: 100 },
     },
   });
 

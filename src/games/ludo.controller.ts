@@ -21,6 +21,9 @@ export class LudoController {
   @Post('quick-match/:ticket/bots') quickBots(@Req() req: AuthedRequest, @Param('ticket') ticket: string) { return this.ludo.startBotMatch(req.user.userId, ticket, true); }
   @Post('quick-match/:ticket/cancel') quickCancel(@Req() req: AuthedRequest, @Param('ticket') ticket: string) { return this.ludo.cancelQuickMatch(req.user.userId, ticket); }
   @Post('rooms') create(@Req() req: AuthedRequest, @Body() body: { entryFee: number; playerCount?: 2 | 4; displayName?: string }) { return this.ludo.createRoom(req.user.userId, body.displayName?.trim() || 'Player', body.entryFee, body.playerCount ?? 4, req.user.countryCode || 'NG'); }
+  @Post('party/:roomId') createParty(@Req() req: AuthedRequest, @Param('roomId') roomId: string, @Body() body: { entryFee: number; playerCount?: 2 | 4 }) { return this.ludo.createPartyRoom(req.user.userId, roomId, body.entryFee, body.playerCount ?? 4, req.user.countryCode || 'NG'); }
+  @Get('party/:roomId/status') partyStatus(@Req() req: AuthedRequest, @Param('roomId') roomId: string) { return this.ludo.partyRoomStatus(req.user.userId, roomId); }
+  @Post('party/:roomId/join') joinParty(@Req() req: AuthedRequest, @Param('roomId') roomId: string, @Body() body: { displayName?: string }) { return this.ludo.joinPartyRoom(req.user.userId, roomId, body.displayName?.trim() || 'Player', req.user.countryCode || 'NG'); }
   @Get('rooms/:roomCode/status') roomStatus(@Req() req: AuthedRequest, @Param('roomCode') roomCode: string) { return this.ludo.roomStatus(req.user.userId, roomCode); }
   @Post('rooms/:roomCode/join') join(@Req() req: AuthedRequest, @Param('roomCode') roomCode: string, @Body() body: { displayName?: string }) { return this.ludo.joinRoom(req.user.userId, body.displayName?.trim() || 'Player', roomCode, req.user.countryCode || 'NG'); }
   @Get('candidates/:category')

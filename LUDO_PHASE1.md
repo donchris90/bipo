@@ -10,7 +10,8 @@ Implemented in the current project:
 - Server-authoritative dice, movement, captures, turns and settlement.
 - Six gives an extra turn.
 - Three consecutive sixes cancel the third six and pass the turn.
-- First and second place receive configurable shares of the prize pool (default 70/30).
+- 2-player matches pay only 1st place (100% of the player pool).
+- 4-player matches pay 1st and 2nd place (default 66.67% / 33.33%).
 - Wallet debit and prize credit use the existing idempotent wallet ledger.
 - Reconnection returns the same player to the same match.
 - A disconnected player's turn is temporarily controlled by the server-side bot after the normal turn timer expires.

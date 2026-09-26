@@ -4,8 +4,9 @@ import { Server, Socket } from 'socket.io';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import { LudoService } from './ludo.service';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 
-interface LudoSocket extends Socket { data: { userId?: string; matchId?: string } }
+interface LudoSocket extends Socket { data: { userId?: string; matchId?: string; spectator?: boolean } }
 
 // Game errors ("Not your turn", ...) reach the app as a readable message instead of "Internal server error".
 async function guard<T>(fn: () => Promise<T>): Promise<T> {
@@ -17,7 +18,7 @@ export class LudoGateway implements OnGatewayConnection, OnGatewayDisconnect, On
   @WebSocketServer() server: Server;
   private botTimer: NodeJS.Timeout;
   private ticking = false;
-  constructor(private readonly jwt: JwtService, private readonly config: ConfigService, private readonly ludo: LudoService) {
+  constructor(private readonly jwt: JwtService, private readonly config: ConfigService, private readonly ludo: LudoService, private readonly realtime: RealtimeGateway) {
     // The AI's heartbeat: every second it checks whose turn has run out and plays for bots and absent players.
     this.botTimer = setInterval(async () => {
       if (this.ticking) return; // never let slow ticks pile up
@@ -42,7 +43,7 @@ export class LudoGateway implements OnGatewayConnection, OnGatewayDisconnect, On
 
   async handleDisconnect(client: LudoSocket) {
     const { userId, matchId } = client.data;
-    if (!userId || !matchId) return;
+    if (!userId || !matchId || client.data.spectator) return;
     // A phone that reconnects opens the new socket before the old one is reported dead. Only a player with
     // NO socket left in the match counts as away.
     const room = `LUDO:${matchId}`;
@@ -52,12 +53,26 @@ export class LudoGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     if (state) this.server.to(room).emit('ludo:state', state);
   }
 
+  /** A Party Room viewer can subscribe to the live board without becoming a Ludo player. */
+  @SubscribeMessage('ludo:watch')
+  async watch(@MessageBody() data: { matchId: string }, @ConnectedSocket() client: LudoSocket) {
+    if (!client.data.userId) return { error: 'unauthenticated' };
+    return guard(async () => {
+      const state = await this.ludo.getState(data.matchId);
+      client.data.matchId = data.matchId;
+      client.data.spectator = true;
+      client.join(`LUDO:${data.matchId}`);
+      return state;
+    });
+  }
+
   @SubscribeMessage('ludo:join')
   async join(@MessageBody() data: { matchId: string }, @ConnectedSocket() client: LudoSocket) {
     if (!client.data.userId) return { error: 'unauthenticated' };
     return guard(async () => {
       const state = await this.ludo.reconnect(client.data.userId!, data.matchId); // also checks the player belongs to the match
       client.data.matchId = data.matchId;
+      client.data.spectator = false;
       client.join(`LUDO:${data.matchId}`);
       this.server.to(`LUDO:${data.matchId}`).emit('ludo:state', state);
       return state;

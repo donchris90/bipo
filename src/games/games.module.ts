@@ -12,13 +12,14 @@ import { EconomyModule } from '../economy/economy.module';
 import { RegionalConfigModule } from '../config/regional-config.module';
 import { FeatureFlagsModule } from '../feature-flags/feature-flags.module';
 import { JwtModule } from '@nestjs/jwt';
+import { RealtimeModule } from '../realtime/realtime.module';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { LudoService } from './ludo.service';
 import { LudoController } from './ludo.controller';
 import { LudoGateway } from './ludo.gateway';
 
 @Module({
-  imports: [EconomyModule, RegionalConfigModule, FeatureFlagsModule, ConfigModule, JwtModule.registerAsync({ imports: [ConfigModule], inject: [ConfigService], useFactory: (config: ConfigService) => ({ secret: config.get<string>('JWT_ACCESS_SECRET') }) })],
+  imports: [EconomyModule, RealtimeModule, RegionalConfigModule, FeatureFlagsModule, ConfigModule, JwtModule.registerAsync({ imports: [ConfigModule], inject: [ConfigService], useFactory: (config: ConfigService) => ({ secret: config.get<string>('JWT_ACCESS_SECRET') }) })],
   providers: [RngService, RoundService, EntryService, SettlementService, CrashService, GameAdminService, RoundSchedulerService, GamesReadinessService, LudoService, LudoGateway],
   controllers: [GamesController, GameOperatorController, LudoController],
   exports: [RoundService, SettlementService, CrashService, LudoService],
