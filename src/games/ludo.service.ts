@@ -374,11 +374,11 @@ export class LudoService implements OnModuleDestroy {
       throw new BadRequestException('Join this Party Room before viewing its Ludo game');
     }
     const code = await this.redis.get(`ludo:party:${roomId}`).catch(() => null);
-    if (!code) return { status: 'NONE', partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat };
+    if (!code) return { status: 'NONE', partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat || party.privacy === 'PUBLIC' };
     const room = await this.readRoom(code);
     if (!room) {
       await this.redis.del(`ludo:party:${roomId}`).catch(() => undefined);
-      return { status: 'NONE', partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat };
+      return { status: 'NONE', partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat || party.privacy === 'PUBLIC' };
     }
     if (room.started) {
       const state = await this.getState(room.matchId);
@@ -386,16 +386,23 @@ export class LudoService implements OnModuleDestroy {
       // The match result remains available from the normal Ludo history/state endpoint.
       if (state.status === 'FINISHED' || state.status === 'CANCELLED') {
         await this.redis.del(`ludo:party:${roomId}`).catch(() => undefined);
-        return { status: 'NONE', partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat };
+        return { status: 'NONE', partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat || party.privacy === 'PUBLIC' };
       }
-      return { status: 'STARTED', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount, partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat, state };
+      return { status: 'STARTED', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount, partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat || party.privacy === 'PUBLIC', state };
     }
-    return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount, partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat };
+    return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount, partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat || party.privacy === 'PUBLIC' };
   }
 
   async joinPartyRoom(userId: string, roomId: string, displayName: string, countryCode = 'NG') {
+    const party = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { id: true, hostId: true, status: true, privacy: true } });
+    if (!party) throw new NotFoundException('Party room not found');
+    if (party.status !== 'OPEN') throw new BadRequestException('Party room is closed');
     const seat = await this.prisma.roomSeat.findFirst({ where: { roomId, userId }, select: { id: true } });
-    if (!seat) throw new BadRequestException('You must be seated in the Party Room to join its Ludo game');
+    // Public-room viewers can join the Party Ludo directly from the room.
+    // Private rooms still require an actual Party seat (or host access).
+    if (party.hostId !== userId && !seat && party.privacy !== 'PUBLIC') {
+      throw new BadRequestException('Join the Party Room before joining its Ludo game');
+    }
     const code = await this.redis.get(`ludo:party:${roomId}`).catch(() => null);
     if (!code) throw new NotFoundException('The Party Room has not started Ludo');
     return this.joinRoom(userId, displayName, code, countryCode);
