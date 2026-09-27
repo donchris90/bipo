@@ -3,12 +3,13 @@ import { RoomCommunityService } from './room-community.service';
 import { RoomCommunityController, AdminRoomLevelsController, AdminRoomMemberLevelsController } from './room-community.controller';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { HostLevelsModule } from '../host-levels/host-levels.module';
+import { SeasonsModule } from '../seasons/seasons.module';
 
 // Deliberately its own module rather than folded into RoomsModule: EconomyModule needs
 // RoomCommunityService too (GiftService.awardGiftXp hook), and RoomCommunityModule importing
 // neither RoomsModule nor EconomyModule keeps that a plain import on both sides — no forwardRef.
 @Module({
-  imports: [NotificationsModule, HostLevelsModule],
+  imports: [NotificationsModule, HostLevelsModule, SeasonsModule],
   controllers: [RoomCommunityController, AdminRoomLevelsController, AdminRoomMemberLevelsController],
   providers: [RoomCommunityService],
   exports: [RoomCommunityService],
