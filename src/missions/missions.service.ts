@@ -39,6 +39,7 @@ export class MissionsService {
     private readonly rrydaLevels: RrydaLevelsService,
     private readonly badges: BadgesService,
     private readonly audit: AuditService,
+    private readonly teams: TeamsService,
   ) {}
 
   // The admin-editable halfway/all chest rewards, falling back to the constants above if no
@@ -176,6 +177,7 @@ export class MissionsService {
 
     const bonus = await this.wallet.getBalance(userId, WalletType.BONUS);
     void this.rrydaLevels.addXp(userId, mission.rewardCoins); // Rryda Identity: every mission counts, not only creator ones
+    void this.teams.contributeXp(userId, mission.rewardCoins); // Rryda Teams: your missions help your team too
     return { claimed: true, rewardCoins: mission.rewardCoins, bonusBalance: bonus.toString() };
   }
 
@@ -235,6 +237,7 @@ export class MissionsService {
 
     const bonus = await this.wallet.getBalance(userId, WalletType.BONUS);
     void this.rrydaLevels.addXp(userId, target.rewardCoins);
+    void this.teams.contributeXp(userId, target.rewardCoins);
     return {
       claimed: true,
       tier,

@@ -3,6 +3,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
+import { TeamsService } from '../teams/teams.service';
 
 @Injectable()
 export class SocialService {
@@ -11,6 +12,7 @@ export class SocialService {
     private readonly audit: AuditService,
     private readonly notifications: NotificationsService,
     private readonly rrydaLevels: RrydaLevelsService,
+    private readonly teams: TeamsService,
   ) {}
 
   private async assertUserExists(userId: string) {
@@ -44,6 +46,7 @@ export class SocialService {
 
     await this.notifications.create(followingId, 'FOLLOW', { followerId });
     void this.rrydaLevels.addXp(followerId, 5); // Rryda Identity: "meeting someone new" grows YOUR identity too
+    void this.teams.contributeXp(followerId, 5); // Rryda Teams: meeting people helps your team too
 
     return { following: true };
   }

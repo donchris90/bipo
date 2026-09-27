@@ -9,6 +9,7 @@ import { WalletType, LedgerEntryType, ChatContext } from '@prisma/client';
 import { pkPointsForCoins, pkSideForRecipient } from './pk-score';
 import { HostLevelsService } from '../host-levels/host-levels.service';
 import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
+import { TeamsService } from '../teams/teams.service';
 import { SupporterLevelsService } from '../supporters/supporter-levels.service';
 import { RoomCommunityService } from '../rooms/room-community.service';
 
@@ -149,6 +150,10 @@ export class GiftService {
     // ROOM-context gifts (see the hook below) — awardGiftXp itself resolves the session's
     // contextId to the persistent Room.
     @Optional() private readonly roomCommunity?: RoomCommunityService,
+    // Same optional pattern again — grows the SENDER's team (if they're on one), same full
+    // coinAmount as rrydaLevels above, not the /50 conversion (Rryda Teams contribution is meant
+    // to feel 1:1, see TeamsService.contributeXp).
+    @Optional() private readonly teams?: TeamsService,
   ) {}
 
   // Backing for a gift-picker UI — before this, the only way a client
@@ -306,6 +311,9 @@ export class GiftService {
     // persistent Room itself.
     if (this.roomCommunity && params.context === 'ROOM' && params.contextId) {
       void this.roomCommunity.awardGiftXp(params.contextId, params.senderId, coinAmount);
+    }
+    if (this.teams) {
+      void this.teams.contributeXp(params.senderId, coinAmount);
     }
 
     // 4. If sent during an active PK battle, feed the score. Kept outside

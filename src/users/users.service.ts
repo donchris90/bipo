@@ -4,6 +4,7 @@ import { AuditService } from '../audit/audit.service';
 import { WalletService } from '../economy/wallet.service';
 import { HostLevelsService } from '../host-levels/host-levels.service';
 import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
+import { TeamsService } from '../teams/teams.service';
 import { UserStatus, RoleName, WalletType, LedgerEntryType } from '@prisma/client';
 import { CHECK_IN_REWARD_SCHEDULE, computeCheckInReward, resolveCheckIn, toUtcDateKey } from './check-in-rules';
 
@@ -17,6 +18,7 @@ export class UsersService {
     private readonly wallet: WalletService,
     private readonly hostLevels: HostLevelsService,
     private readonly rrydaLevels: RrydaLevelsService,
+    private readonly teams: TeamsService,
   ) {}
 
   async findMe(userId: string) {
@@ -87,6 +89,7 @@ export class UsersService {
     });
 
     void this.rrydaLevels.addXp(userId, 10); // Rryda Identity: showing up counts, every day
+    void this.teams.contributeXp(userId, 10); // Rryda Teams: showing up helps your team too
     return { streak: newStreak, rewardCoins: Number(reward) };
   }
 

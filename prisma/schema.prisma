@@ -384,6 +384,66 @@ model RoomMemberAchievement {
   @@index([roomId, userId])
 }
 
+// Rryda Teams: a cross-platform tribe a user can join — not the same thing as Agency, which is a
+// creator payout/commission structure (see AgencyMembership). A user belongs to at most ONE team
+// at a time (a "tribe", not a set of overlapping subscriptions); both creators and supporters can
+// join. Architecture mirrors Room/RoomLevel/RoomMember on purpose — same admin-configurable level
+// curve, same addXp/level-up-notify shape — scoped to a team instead of a room.
+//
+// This is the structural core only: identity, membership, roles, XP/level, and ranking. Team
+// missions, team-specific events, and a team rewards/achievement catalog are deliberately NOT
+// part of this pass — they would all sit on top of this foundation (the way Room's achievements
+// sit on top of Room/RoomMember), and building them before the foundation exists would mean
+// redoing them once it does.
+model Team {
+  id          String       @id @default(uuid())
+  name        String       @unique
+  description String?
+  themeColor  String?
+  category    String?
+  countryCode String
+  leaderId    String       @unique
+  teamXp      Int          @default(0)
+  teamLevel   Int          @default(1)
+  createdAt   DateTime     @default(now())
+  members     TeamMember[]
+
+  @@index([countryCode])
+  @@index([teamXp])
+}
+
+enum TeamRole {
+  LEADER
+  MODERATOR
+  MEMBER
+}
+
+// One row per (team, user) — a member's own contribution to the one team they belong to. No
+// per-member level curve in this pass (unlike RoomMember, which has one) — an individual's own
+// growth is already tracked by Rryda Level; this table is about standing WITHIN the team
+// (contribution and role), not a second personal progression system.
+model TeamMember {
+  id       String   @id @default(uuid())
+  teamId   String
+  userId   String   @unique // enforces "at most one team at a time" at the database level
+  role     TeamRole @default(MEMBER)
+  xp       Int      @default(0)
+  joinedAt DateTime @default(now())
+  team     Team     @relation(fields: [teamId], references: [id])
+
+  @@index([teamId])
+}
+
+// The team's own level curve — same shape as RoomLevel/RoomMemberLevel/RrydaLevel/HostLevel.
+model TeamLevel {
+  level      Int      @id
+  name       String
+  xpRequired Int
+  badgeUrl   String?
+  active     Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+}
+
 model RoomSeat {
   id         String   @id @default(uuid())
   roomId     String
@@ -961,6 +1021,9 @@ enum NotificationType {
   // A visitor just crossed the "regular" threshold in one of the rooms they attend.
   ROOM_REGULAR
   ROOM_ACHIEVEMENT
+  // Rryda Teams: the team's own level curve, sent to the team's leader (same reasoning as
+  // ROOM_LEVEL_UP going to the room's host, not every visitor).
+  TEAM_LEVEL_UP
 }
 
 enum LiveStatus {

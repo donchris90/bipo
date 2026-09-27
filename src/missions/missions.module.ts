@@ -5,9 +5,10 @@ import { MissionsController, AdminMissionsController } from './missions.controll
 import { EconomyModule } from '../economy/economy.module';
 import { RrydaLevelsModule } from '../rryda-levels/rryda-levels.module';
 import { BadgesModule } from '../badges/badges.module';
+import { TeamsModule } from '../teams/teams.module';
 
 @Module({
-  imports: [ConfigModule, EconomyModule, RrydaLevelsModule, BadgesModule],
+  imports: [ConfigModule, EconomyModule, RrydaLevelsModule, BadgesModule, TeamsModule],
   providers: [MissionsService],
   controllers: [MissionsController, AdminMissionsController],
 })

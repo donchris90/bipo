@@ -3,9 +3,10 @@ import { SocialService } from './social.service';
 import { SocialController } from './social.controller';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { RrydaLevelsModule } from '../rryda-levels/rryda-levels.module';
+import { TeamsModule } from '../teams/teams.module';
 
 @Module({
-  imports: [NotificationsModule, RrydaLevelsModule],
+  imports: [NotificationsModule, RrydaLevelsModule, TeamsModule],
   providers: [SocialService],
   controllers: [SocialController],
   exports: [SocialService],
