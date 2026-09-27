@@ -24,7 +24,7 @@ function build() {
         rows.sort((a, b) => (orderBy.startsAt === 'asc' ? a.startsAt.getTime() - b.startsAt.getTime() : b.startsAt.getTime() - a.startsAt.getTime()));
         return rows[0] ?? null;
       },
-      findMany: async ({ where, orderBy }: any) => {
+      findMany: async ({ where, orderBy, cursor, skip, take }: any) => {
         let rows = [...seasons.values()];
         if (where?.startsAt?.lte && where?.endsAt?.gte) {
           rows = rows.filter((s) => s.startsAt <= where.startsAt.lte && s.endsAt >= where.endsAt.gte);
@@ -32,8 +32,14 @@ function build() {
         if (where?.startsAt?.lt && where?.endsAt?.gt) {
           rows = rows.filter((s) => s.startsAt < where.startsAt.lt && s.endsAt > where.endsAt.gt);
         }
+        if (where?.settledAt?.not === null) rows = rows.filter((s) => s.settledAt !== null);
         if (orderBy?.startsAt === 'desc') rows.sort((a, b) => b.startsAt.getTime() - a.startsAt.getTime());
-        return rows;
+        if (orderBy?.endsAt === 'desc') rows.sort((a, b) => b.endsAt.getTime() - a.endsAt.getTime());
+        if (cursor?.id) {
+          const idx = rows.findIndex((r) => r.id === cursor.id);
+          rows = idx === -1 ? [] : rows.slice(idx + (skip ?? 0));
+        }
+        return take ? rows.slice(0, take) : rows;
       },
       create: async ({ data }: any) => { const s = { id: `season-${++idCounter}`, settledAt: null, createdAt: new Date(), ...data }; seasons.set(s.id, s); return s; },
       update: async ({ where, data }: any) => { const s = seasons.get(where.id); Object.assign(s, data); return { ...s }; },
@@ -272,5 +278,58 @@ describe('SeasonsService.settleSeason', () => {
     seasons.get(s.id).endsAt = day(-1);
     await svc.settleSeason(s.id, 'admin', ['SUPER_ADMIN'] as any);
     expect(wallet.credit).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('SeasonsService.seasonHistory', () => {
+  it('only ever returns settled seasons, never SCHEDULED/ACTIVE/ENDED ones', async () => {
+    const { svc, seasons } = build();
+    const settled = await svc.createSeason('admin', ['SUPER_ADMIN'] as any, { name: 'Settled', startsAt: day(-10), endsAt: day(-5) });
+    seasons.get(settled.id).endsAt = day(-5);
+    await svc.settleSeason(settled.id, 'admin', ['SUPER_ADMIN'] as any);
+    await svc.createSeason('admin', ['SUPER_ADMIN'] as any, { name: 'Active', startsAt: day(-1), endsAt: day(1) });
+    await svc.createSeason('admin', ['SUPER_ADMIN'] as any, { name: 'Future', startsAt: day(5), endsAt: day(10) });
+
+    const { seasons: result } = await svc.seasonHistory('anyone');
+    expect(result.map((s) => s.name)).toEqual(['Settled']);
+  });
+
+  it("carries the viewer's own rank, points, and reward — never another participant's", async () => {
+    const { svc, seasons } = build();
+    // Same shape as the settleSeason tests above: created currently ACTIVE so contributePoints
+    // actually credits it, then pushed into the past to simulate the season having ended.
+    const s = await svc.createSeason('admin', ['SUPER_ADMIN'] as any, { name: 'S', startsAt: day(-1), endsAt: day(1) });
+    await svc.setRewardTiers(s.id, 'admin', ['SUPER_ADMIN'] as any, [{ minRank: 1, maxRank: 1, rewardCoins: 5000 }]);
+    await svc.contributePoints('winner', 300);
+    await svc.contributePoints('runner-up', 100);
+    seasons.get(s.id).endsAt = day(-1);
+    await svc.settleSeason(s.id, 'admin', ['SUPER_ADMIN'] as any);
+
+    const { seasons: forWinner } = await svc.seasonHistory('winner');
+    expect(forWinner[0].viewer).toEqual({ points: 300, rank: 1, rewardCoins: 5000 });
+
+    const { seasons: forRunnerUp } = await svc.seasonHistory('runner-up');
+    expect(forRunnerUp[0].viewer).toEqual({ points: 100, rank: 2, rewardCoins: 0 }); // rank 2, outside the rewardCoins tier
+
+    const { seasons: forStranger } = await svc.seasonHistory('never-participated');
+    expect(forStranger[0].viewer).toEqual({ points: 0, rank: null, rewardCoins: 0 });
+  });
+
+  it('paginates with a cursor, most recently ended first', async () => {
+    const { svc, seasons } = build();
+    const older = await svc.createSeason('admin', ['SUPER_ADMIN'] as any, { name: 'Older', startsAt: day(-1), endsAt: day(1) });
+    seasons.get(older.id).endsAt = day(-15);
+    await svc.settleSeason(older.id, 'admin', ['SUPER_ADMIN'] as any);
+    const newer = await svc.createSeason('admin', ['SUPER_ADMIN'] as any, { name: 'Newer', startsAt: day(-1), endsAt: day(1) });
+    seasons.get(newer.id).endsAt = day(-5);
+    await svc.settleSeason(newer.id, 'admin', ['SUPER_ADMIN'] as any);
+
+    const firstPage = await svc.seasonHistory('u1', undefined, 1);
+    expect(firstPage.seasons.map((s) => s.name)).toEqual(['Newer']);
+    expect(firstPage.nextCursor).toBe(newer.id);
+
+    const secondPage = await svc.seasonHistory('u1', firstPage.nextCursor!, 1);
+    expect(secondPage.seasons.map((s) => s.name)).toEqual(['Older']);
+    expect(secondPage.nextCursor).toBeNull();
   });
 });

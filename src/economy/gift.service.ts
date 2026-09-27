@@ -12,6 +12,7 @@ import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
 import { TeamsService } from '../teams/teams.service';
 import { SupporterLevelsService } from '../supporters/supporter-levels.service';
 import { RoomCommunityService } from '../rooms/room-community.service';
+import { SeasonsService } from '../seasons/seasons.service';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -154,6 +155,9 @@ export class GiftService {
     // coinAmount as rrydaLevels above, not the /50 conversion (Rryda Teams contribution is meant
     // to feel 1:1, see TeamsService.contributeXp).
     @Optional() private readonly teams?: TeamsService,
+    // Same optional pattern again — full coinAmount, same as teams above, into whichever
+    // season(s) are currently running (contributePoints itself is a no-op if none are).
+    @Optional() private readonly seasons?: SeasonsService,
   ) {}
 
   // Backing for a gift-picker UI — before this, the only way a client
@@ -314,6 +318,9 @@ export class GiftService {
     }
     if (this.teams) {
       void this.teams.contributeXp(params.senderId, coinAmount);
+    }
+    if (this.seasons) {
+      void this.seasons.contributePoints(params.senderId, coinAmount);
     }
 
     // 4. If sent during an active PK battle, feed the score. Kept outside

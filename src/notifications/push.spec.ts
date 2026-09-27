@@ -81,6 +81,60 @@ describe('PushService', () => {
   });
 });
 
+describe('PushService.broadcastToAll', () => {
+  // A standalone builder (rather than the describe('PushService') one above, whose
+  // pushToken.findMany is a plain two-row mock) since broadcastToAll pages via cursor and needs
+  // findMany to actually respect take/cursor/skip.
+  const buildBroadcast = (tokens: string[], send = jest.fn().mockResolvedValue({ invalidTokens: [] })) => {
+    const rows = tokens.map((token, i) => ({ id: `id-${i}`, token }));
+    const deleteMany = jest.fn().mockResolvedValue({ count: 0 });
+    const prisma: any = {
+      pushToken: {
+        findMany: jest.fn(async ({ take, cursor }: any) => {
+          const start = cursor ? rows.findIndex((r) => r.id === cursor.id) + 1 : 0;
+          return rows.slice(start, start + take);
+        }),
+        deleteMany,
+      },
+    };
+    return { svc: new PushService(prisma, { send }), prisma, send, deleteMany };
+  };
+
+  it('sends to every device across multiple pages', async () => {
+    const tokens = Array.from({ length: 5 }, (_, i) => `ExponentPushToken[${i}]`);
+    const { svc, send, prisma } = buildBroadcast(tokens);
+    const result = await svc.broadcastToAll({ title: 'New season', body: 'Season 2 has started!' }, 2);
+    expect(result.sent).toBe(5);
+    expect(send.mock.calls.flatMap((c) => c[0]).map((m: any) => m.to)).toEqual(tokens);
+    expect(prisma.pushToken.findMany).toHaveBeenCalledTimes(3); // 2 + 2 + 1
+  });
+
+  it('prunes tokens the provider reports dead and excludes them from the sent count', async () => {
+    const tokens = ['ExponentPushToken[a]', 'ExponentPushToken[b]'];
+    const { svc, deleteMany } = buildBroadcast(tokens, jest.fn().mockResolvedValue({ invalidTokens: ['ExponentPushToken[b]'] }));
+    const result = await svc.broadcastToAll({ title: 't', body: 'b' });
+    expect(result.sent).toBe(1);
+    expect(deleteMany).toHaveBeenCalledWith({ where: { token: { in: ['ExponentPushToken[b]'] } } });
+  });
+
+  it('returns zero sent, never throws, when there are no registered devices', async () => {
+    const { svc } = buildBroadcast([]);
+    await expect(svc.broadcastToAll({ title: 't', body: 'b' })).resolves.toEqual({ sent: 0 });
+  });
+
+  it('never throws when a page fails to send, and does not get stuck retrying it', async () => {
+    const tokens = ['ExponentPushToken[a]', 'ExponentPushToken[b]'];
+    const { svc } = buildBroadcast(tokens, jest.fn().mockRejectedValue(new Error('provider down')));
+    await expect(svc.broadcastToAll({ title: 't', body: 'b' })).resolves.toEqual({ sent: 0 });
+  });
+
+  it('never throws when the database is unreachable', async () => {
+    const prisma: any = { pushToken: { findMany: jest.fn().mockRejectedValue(new Error('db down')) } };
+    const svc = new PushService(prisma, { send: jest.fn() });
+    await expect(svc.broadcastToAll({ title: 't', body: 'b' })).resolves.toEqual({ sent: 0 });
+  });
+});
+
 describe('ExpoPushProvider', () => {
   const realFetch = global.fetch;
   afterEach(() => {

@@ -461,6 +461,10 @@ model Season {
   startsAt    DateTime
   endsAt      DateTime
   settledAt   DateTime?
+  // Set once SeasonAutoStartService has broadcast the "new season started" push for this
+  // season — the same once-only guard settledAt is for settlement, so a sweep that runs twice
+  // (or two instances racing) never double-sends the announcement.
+  startNotifiedAt DateTime?
   createdAt   DateTime             @default(now())
   participants SeasonParticipant[]
   rewardTiers  SeasonRewardTier[]

@@ -104,6 +104,54 @@ export class SeasonsService {
     };
   }
 
+  // Public "browse past seasons" list — the AdminSeasonsController.listSeasons() above returns
+  // every season (including SCHEDULED/ACTIVE ones an admin is still configuring) and is gated to
+  // SUPER_ADMIN, so it can't double as this. This only ever returns settled seasons, ordered most
+  // recently ended first, each carrying the *viewer's own* result (points/rank/rewardCoins) —
+  // never other players' standings, which stays behind the per-season leaderboard endpoint. Reward
+  // tiers and points are re-derived the same way settleSeason() computed them rather than stored
+  // on the participant row, so this stays correct even for seasons settled before this endpoint
+  // existed.
+  async seasonHistory(viewerId: string, cursor?: string, limit = 20) {
+    const safeLimit = Math.min(50, Math.max(1, Math.floor(Number(limit)) || 20));
+    const page = await this.prisma.season.findMany({
+      where: { settledAt: { not: null } },
+      orderBy: { endsAt: 'desc' },
+      take: safeLimit + 1,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    const hasMore = page.length > safeLimit;
+    const rows = hasMore ? page.slice(0, safeLimit) : page;
+
+    const seasons = await Promise.all(
+      rows.map(async (season) => {
+        const [participantCount, viewerRow, tiers] = await Promise.all([
+          this.prisma.seasonParticipant.count({ where: { seasonId: season.id } }),
+          this.prisma.seasonParticipant.findUnique({ where: { seasonId_userId: { seasonId: season.id, userId: viewerId } } }),
+          this.prisma.seasonRewardTier.findMany({ where: { seasonId: season.id }, orderBy: { minRank: 'asc' } }),
+        ]);
+        let viewer: { points: number; rank: number | null; rewardCoins: number } = { points: 0, rank: null, rewardCoins: 0 };
+        if (viewerRow) {
+          const rank = await this.rankOf(season.id, viewerRow.points);
+          const tier = tiers.find((t) => rank >= t.minRank && rank <= t.maxRank);
+          viewer = { points: viewerRow.points, rank, rewardCoins: tier?.rewardCoins ?? 0 };
+        }
+        return {
+          id: season.id,
+          name: season.name,
+          description: season.description,
+          startsAt: season.startsAt,
+          endsAt: season.endsAt,
+          settledAt: season.settledAt,
+          participantCount,
+          viewer,
+        };
+      }),
+    );
+
+    return { seasons, nextCursor: hasMore ? rows[rows.length - 1].id : null };
+  }
+
   async listLeaderboard(seasonId: string, limit = 20) {
     const safeLimit = Math.min(100, Math.max(1, Math.floor(Number(limit)) || 20));
     const rows = await this.prisma.seasonParticipant.findMany({ where: { seasonId }, orderBy: { points: 'desc' }, take: safeLimit });

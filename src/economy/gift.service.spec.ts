@@ -136,3 +136,40 @@ describe('gifts do not create notifications', () => {
     expect(await wallet.getBalance('recipient', WalletType.CREATOR_EARNINGS)).toBe(70n);
   });
 });
+
+describe('gifts contribute to the sender\'s season points', () => {
+  it("feeds the sender's full coin amount to SeasonsService, same as the team XP hook", async () => {
+    const prisma = new FakePrisma();
+    const wallet = new WalletService(prisma as any);
+    const seasons: any = { contributePoints: jest.fn().mockResolvedValue(undefined) };
+    const gifts = new GiftService(
+      prisma as any,
+      wallet,
+      new RevenueSplitService(prisma as any),
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      seasons,
+    );
+    prisma.users.set('sender', { id: 'sender', countryCode: 'NG' });
+    prisma.users.set('recipient', { id: 'recipient', countryCode: 'NG' });
+    prisma.gifts.set('rose', { id: 'rose', coinPrice: 100, active: true });
+    await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+
+    await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'g-1' });
+
+    expect(seasons.contributePoints).toHaveBeenCalledWith('sender', 100);
+  });
+
+  it('never fails a gift when SeasonsService is absent (constructible without it, like every other optional hook)', async () => {
+    const prisma = new FakePrisma();
+    const wallet = new WalletService(prisma as any);
+    const gifts = new GiftService(prisma as any, wallet, new RevenueSplitService(prisma as any));
+    prisma.users.set('sender', { id: 'sender', countryCode: 'NG' });
+    prisma.users.set('recipient', { id: 'recipient', countryCode: 'NG' });
+    prisma.gifts.set('rose', { id: 'rose', coinPrice: 100, active: true });
+    await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+
+    await expect(
+      gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'g-2' }),
+    ).resolves.toBeDefined();
+  });
+});

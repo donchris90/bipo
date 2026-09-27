@@ -27,6 +27,9 @@ const logger = new Logger('NotificationsModule');
     },
   ],
   controllers: [NotificationsController],
-  exports: [NotificationsService],
+  // PushService too, not just NotificationsService — SeasonAutoStartService needs it directly
+  // for the platform-wide "new season started" broadcast, which has no single recipient and so
+  // doesn't go through NotificationsService's per-user create()/notify() path at all.
+  exports: [NotificationsService, PushService],
 })
 export class NotificationsModule {}

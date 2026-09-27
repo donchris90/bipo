@@ -66,12 +66,13 @@
   },
   "jest": {
     "testEnvironment": "node",
-    "roots": [
-      "<rootDir>/src"
+    "testMatch": [
+      "<rootDir>/src/**/*.spec.ts",
+      "<rootDir>/tests/**/*.test.ts"
     ],
-    "testRegex": ".*\\.spec\\.ts$",
     "transform": {
       "^.+\\.ts$": "ts-jest"
-    }
+    },
+    "testTimeout": 60000
   }
 }

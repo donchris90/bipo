@@ -7,6 +7,7 @@ import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
 import { BadgesService } from '../badges/badges.service';
 import { AuditService } from '../audit/audit.service';
 import { TeamsService } from '../teams/teams.service';
+import { SeasonsService } from '../seasons/seasons.service';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { overlapSeconds } from '../creators/creator-analytics.service';
 
@@ -41,6 +42,7 @@ export class MissionsService {
     private readonly badges: BadgesService,
     private readonly audit: AuditService,
     private readonly teams: TeamsService,
+    private readonly seasons: SeasonsService,
   ) {}
 
   // The admin-editable halfway/all chest rewards, falling back to the constants above if no
@@ -179,6 +181,7 @@ export class MissionsService {
     const bonus = await this.wallet.getBalance(userId, WalletType.BONUS);
     void this.rrydaLevels.addXp(userId, mission.rewardCoins); // Rryda Identity: every mission counts, not only creator ones
     void this.teams.contributeXp(userId, mission.rewardCoins); // Rryda Teams: your missions help your team too
+    void this.seasons.contributePoints(userId, mission.rewardCoins); // Rryda Seasons: your missions count toward the current season too
     return { claimed: true, rewardCoins: mission.rewardCoins, bonusBalance: bonus.toString() };
   }
 
@@ -239,6 +242,7 @@ export class MissionsService {
     const bonus = await this.wallet.getBalance(userId, WalletType.BONUS);
     void this.rrydaLevels.addXp(userId, target.rewardCoins);
     void this.teams.contributeXp(userId, target.rewardCoins);
+    void this.seasons.contributePoints(userId, target.rewardCoins); // Rryda Seasons: Journey chests count toward the current season too
     return {
       claimed: true,
       tier,
