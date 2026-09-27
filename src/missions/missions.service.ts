@@ -6,6 +6,7 @@ import { WalletService } from '../economy/wallet.service';
 import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
 import { BadgesService } from '../badges/badges.service';
 import { AuditService } from '../audit/audit.service';
+import { TeamsService } from '../teams/teams.service';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { overlapSeconds } from '../creators/creator-analytics.service';
 
