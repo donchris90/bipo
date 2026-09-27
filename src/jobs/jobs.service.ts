@@ -32,12 +32,12 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     private readonly reconciliation: ReconciliationService,
     private readonly c2c: C2CService,
     @Inject(RECONCILIATION_QUEUE) private readonly reconciliationQueue: Queue,
-    @Inject(DEAD_LETTER_QUEUE) deadLetterQueue: Queue,
+    @Inject(DEAD_LETTER_QUEUE) private readonly deadLetterQueue: Queue,
     @Inject(C2C_QUEUE) private readonly c2cQueue: Queue,
   ) {}
 
   onModuleInit() {
-    this.deadLetter = deadLetterQueue;
+    this.deadLetter = this.deadLetterQueue;
 
     this.pkWorker = new Worker(
       PK_QUEUE_NAME,
