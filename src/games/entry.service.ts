@@ -132,10 +132,10 @@ export class EntryService {
         },
       });
     }, EXTENDED_TX_OPTIONS);
-  }
 
     void this.seasons.contributePoints(params.userId, 5); // one Season signal per successful game entry
     return entry;
+  }
 
   private validateSelection(round: { numberRange: number | null; selectionCount: number | null }, selection: unknown) {
     // Dispatch by shape rather than gameCode string — selectionCount set
