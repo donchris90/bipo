@@ -44,6 +44,21 @@ export class UsersService {
     });
   }
 
+
+  async updateNearbyPreferences(userId: string, enabled: boolean, latitude?: number, longitude?: number) {
+    if (typeof enabled !== 'boolean') throw new BadRequestException('enabled must be a boolean');
+    if (!enabled) {
+      return this.prisma.user.update({ where: { id: userId }, data: { nearbyEnabled: false, nearbyLat: null, nearbyLon: null, nearbyUpdatedAt: null }, select: { nearbyEnabled: true } });
+    }
+    if (!Number.isFinite(latitude) || latitude! < -90 || latitude! > 90 || !Number.isFinite(longitude) || longitude! < -180 || longitude! > 180) {
+      throw new BadRequestException('A valid latitude and longitude are required');
+    }
+    // Store only a coarse location (~1km latitude buckets), never the exact GPS point.
+    const lat = Math.round(latitude! * 100) / 100;
+    const lon = Math.round(longitude! * 100) / 100;
+    return this.prisma.user.update({ where: { id: userId }, data: { nearbyEnabled: true, nearbyLat: lat, nearbyLon: lon, nearbyUpdatedAt: new Date() }, select: { nearbyEnabled: true, nearbyUpdatedAt: true } });
+  }
+
   async getCheckInStatus(userId: string) {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },

@@ -53,7 +53,7 @@ export class CoinPurchaseController {
     const has = (id: string) => configured.includes(id);
     return [
       { id: 'PAYSTACK', name: 'Paystack', description: 'Card, bank transfer or USSD', available: has('PAYSTACK') && !(this.paymentProvider instanceof UnavailablePaymentProvider), comingSoon: false },
-      { id: 'CRYPTO', name: 'Crypto', description: 'Pay with supported cryptocurrency', available: false, comingSoon: has('CRYPTO') },
+      { id: 'CRYPTO', name: 'Crypto', description: 'Pay with supported cryptocurrency', available: has('CRYPTO') && !!(this.paymentProvider as any).cryptoConfigured, comingSoon: has('CRYPTO') && !(this.paymentProvider as any).cryptoConfigured },
       { id: 'C2C', name: 'C2C', description: 'Peer-to-peer coin purchase', available: false, comingSoon: has('C2C') },
     ];
   }
@@ -90,9 +90,10 @@ export class CoinPurchaseController {
   purchase(
     @Body('packageId') packageId: string,
     @Body('idempotencyKey') idempotencyKey: string,
+    @Body('method') method: string | undefined,
     @Req() req: AuthedRequest,
   ) {
-    return this.coinPurchase.initiate(req.user.userId, packageId, idempotencyKey ?? uuid());
+    return this.coinPurchase.initiate(req.user.userId, packageId, idempotencyKey ?? uuid(), method ?? 'PAYSTACK');
   }
 }
 

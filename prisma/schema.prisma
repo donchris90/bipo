@@ -35,6 +35,12 @@ model User {
   rrydaXp       Int            @default(0)
   rrydaLevel    Int            @default(1)
   oneOnOneEnabled Boolean       @default(true)
+  // Nearby discovery is opt-in. Coordinates are intentionally stored rounded by the service
+  // before persistence, so the platform does not retain a user's exact GPS position.
+  nearbyEnabled Boolean         @default(false)
+  nearbyLat     Float?
+  nearbyLon     Float?
+  nearbyUpdatedAt DateTime?
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   avatarUrl     String?
@@ -85,6 +91,8 @@ model RegionalConfig {
   // Country-level economy controls.
   creatorEarningMinorPer100Coins Int?
   coinUsdCentsPer100 Int?
+  // Fiat value used to quote C2C coin orders, in minor currency units per 100 coins.
+  c2cFiatMinorPer100Coins Int?
   paymentMethods Json?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
@@ -167,6 +175,19 @@ model AuditLog {
   @@index([actorId])
   @@index([action])
   @@index([createdAt])
+}
+
+model RrydaMoment {
+  id          String   @id @default(uuid())
+  userId      String
+  type        String
+  title       String
+  description String?
+  payload     Json?
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([type, createdAt])
 }
 
 model LiveSession {
@@ -637,6 +658,51 @@ model CoinPackage {
   @@index([countryCode, active])
 }
 
+
+
+model C2COrder {
+  id               String         @id @default(uuid())
+  buyerId          String
+  sellerId         String
+  coinAmount       Int
+  fiatAmountMinor  Int
+  currencyCode     String
+  status           C2COrderStatus  @default(OPEN)
+  paymentReference String?
+  paymentProofUrl  String?
+  paymentProofNote String?
+  disputeReason    String?
+  adminNote        String?
+  expiresAt        DateTime
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  acceptedAt       DateTime?
+  paidAt           DateTime?
+  releasedAt       DateTime?
+  cancelledAt      DateTime?
+  disputedAt       DateTime?
+  resolvedAt       DateTime?
+
+  @@index([buyerId, status])
+  @@index([sellerId, status])
+  @@index([status, expiresAt])
+}
+
+model PaymentWebhookEvent {
+  id          String   @id @default(uuid())
+  provider    String
+  eventKey    String   @unique
+  eventType   String?
+  providerRef String?
+  status      String   @default("PROCESSING")
+  error       String?
+  receivedAt  DateTime @default(now())
+  processedAt DateTime?
+
+  @@index([provider, receivedAt])
+  @@index([providerRef])
+}
+
 model CoinPurchase {
   id             String         @id @default(uuid())
   userId         String
@@ -685,11 +751,13 @@ model Chargeback {
 model LoginEvent {
   id        String   @id @default(uuid())
   userId    String
-  ipAddress String?
-  createdAt DateTime @default(now())
+  ipAddress     String?
+  deviceIdHash  String?
+  createdAt     DateTime @default(now())
 
   @@index([userId])
   @@index([ipAddress])
+  @@index([deviceIdHash])
 }
 
 model GiftTransaction {
@@ -948,6 +1016,7 @@ model PKBattle {
   mode            String    @default("NORMAL")
   challengerTeamId String?
   opponentTeamId   String?
+  objectiveConfig  Json?
   createdAt       DateTime  @default(now())
   settledAt       DateTime?
 
@@ -1151,6 +1220,17 @@ enum WalletType {
   BONUS
 }
 
+enum C2COrderStatus {
+  OPEN
+  ACCEPTED
+  PAYMENT_SUBMITTED
+  RELEASED
+  CANCELLED
+  DISPUTED
+  REFUNDED
+  EXPIRED
+}
+
 enum LedgerEntryType {
   COIN_PURCHASE
   GIFT_SENT
@@ -1166,6 +1246,9 @@ enum LedgerEntryType {
   AGENCY_COMMISSION
   PK_SCORE
   PRIVATE_LIVE_PAYMENT
+  C2C_ESCROW
+  C2C_RELEASE
+  C2C_REFUND
 }
 
 enum PurchaseStatus {
@@ -1478,6 +1561,7 @@ model SupporterLevel {
   badgeUrl   String?
   active     Boolean  @default(true)
   updatedAt  DateTime @updatedAt
+  fanClubJoinedAt DateTime?
 }
 
 // The per-relationship record itself: one row per (supporter, creator) pair, holding that pair's
@@ -1495,6 +1579,7 @@ model CreatorSupporter {
   firstGiftAt    DateTime @default(now())
   lastGiftAt     DateTime @default(now())
   updatedAt      DateTime @updatedAt
+  fanClubJoinedAt DateTime?
 
   @@unique([supporterId, creatorId])
   // Powers a creator's "top supporters" leaderboard (lifetime, unlike live.service.ts's

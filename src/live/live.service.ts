@@ -22,6 +22,7 @@ import { GifterService } from '../economy/gifter.service';
 import { LedgerEntryType, WalletType } from '@prisma/client';
 import { HostLevelsService } from '../host-levels/host-levels.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { SeasonsService } from '../seasons/seasons.service';
 import { announceToFollowersAndAgency } from '../common/friend-announce';
 
 export const RTC_PROVIDER = 'RTC_PROVIDER';
@@ -42,6 +43,7 @@ export class LiveService {
     @Optional() private readonly media?: LiveMediaService,
     @Optional() private readonly hostLevels?: HostLevelsService,
     @Optional() private readonly notifications?: NotificationsService,
+    @Optional() private readonly seasons?: SeasonsService,
   ) {}
 
   // Per-user like throttle: recent (timestamp, count) entries within the
@@ -545,6 +547,12 @@ export class LiveService {
       where: { id: session.id },
       data: { status: 'ENDED', endedAt, durationSeconds },
     });
+
+    if (this.seasons) {
+      // Hosting is a core Rryda activity. Award a bounded Season signal at session end;
+      // the season layer is best-effort and must never block ending the live.
+      void this.seasons.contributePoints(session.hostId, Math.min(70, 10 + Math.floor(durationSeconds / 300)));
+    }
 
     if (this.hostLevels && durationSeconds >= 60) {
       try { await this.hostLevels.awardRule(session.hostId, 'LIVE_MINUTE', Math.floor(durationSeconds / 60)); } catch { /* progression must never block ending a live */ }

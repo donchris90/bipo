@@ -13,6 +13,7 @@ import { v4 as uuid } from 'uuid';
 import { PrismaService } from '../prisma/prisma.service';
 import { assertNotBlocked } from '../common/blocks';
 import { STORAGE_PROVIDER, type StorageProvider } from './providers/storage-provider.interface';
+import { SeasonsService } from '../seasons/seasons.service';
 import {
   DEFAULT_MAX_VIDEO_BYTES,
   cleanOptionalText,
@@ -52,6 +53,7 @@ export class VideosService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     @Inject(STORAGE_PROVIDER) private readonly storage: StorageProvider,
+    private readonly seasons: SeasonsService,
   ) {}
 
   private get maxBytes(): number {
@@ -122,6 +124,7 @@ export class VideosService {
           countryCode,
         },
       });
+      void this.seasons.contributePoints(userId, 10); // publishing is a Season-worthy creator activity
       return this.toOwnerView(video);
     } catch (e) {
       if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {

@@ -25,6 +25,16 @@ export class UsersController {
     return this.usersService.findMyReferrals(req.user.userId);
   }
 
+  @Patch('me/nearby')
+  nearby(
+    @Body('enabled') enabled: boolean,
+    @Body('latitude') latitude: number | undefined,
+    @Body('longitude') longitude: number | undefined,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.usersService.updateNearbyPreferences(req.user.userId, enabled, latitude, longitude);
+  }
+
   @Get('me/check-in')
   checkInStatus(@Req() req: AuthedRequest) {
     return this.usersService.getCheckInStatus(req.user.userId);

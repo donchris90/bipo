@@ -13,6 +13,7 @@ import { TeamsService } from '../teams/teams.service';
 import { SupporterLevelsService } from '../supporters/supporter-levels.service';
 import { RoomCommunityService } from '../rooms/room-community.service';
 import { SeasonsService } from '../seasons/seasons.service';
+import { createMoment } from '../experience/experience.moments';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -295,6 +296,18 @@ export class GiftService {
         },
       });
     }, EXTENDED_TX_OPTIONS);
+
+    // Large gifts become Rryda Moments so the social layer has memorable events to surface.
+    // The threshold is intentionally conservative to avoid filling the feed with every small gift.
+    if (coinAmount >= 1000) {
+      void createMoment(this.prisma, {
+        userId: params.recipientId,
+        type: 'GIFT_MILESTONE',
+        title: `A ${coinAmount.toLocaleString()}-coin gift arrived`,
+        description: 'A standout gift moment from your community.',
+        payload: { senderId: params.senderId, coinAmount, context: params.context ?? null, contextId: params.contextId ?? null },
+      }).catch(() => undefined);
+    }
 
     if (this.hostLevels) {
       try { await this.hostLevels.awardRule(params.recipientId, 'GIFT_100_COINS', Math.floor(coinAmount / 100)); } catch { /* progression must never fail a paid gift */ }

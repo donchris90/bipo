@@ -23,6 +23,11 @@ export class SeasonsController {
 
   // Registered before ':id' below — Nest matches routes in declaration order, and 'history'
   // would otherwise be swallowed as a literal :id value.
+  @Get('current/hub')
+  hub(@Req() req: AuthedRequest) {
+    return this.seasons.seasonHub(req.user.userId);
+  }
+
   @Get('history')
   history(@Query('cursor') cursor: string | undefined, @Query('limit') limit: string | undefined, @Req() req: AuthedRequest) {
     return this.seasons.seasonHistory(req.user.userId, cursor, limit ? Number(limit) : undefined);

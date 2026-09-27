@@ -1,11 +1,15 @@
 import { WebhookRouterService } from '../common/webhook-router.service';
 import { Body, Controller, ForbiddenException, Inject, Post, Req, RawBodyRequest } from '@nestjs/common';
+import { createHash } from 'crypto';
+import { Prisma } from '@prisma/client';
 import { Request } from 'express';
 import { CoinPurchaseService } from './coin-purchase.service';
 import { ChargebackService } from './chargeback.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { PAYMENT_PROVIDER } from './coin-purchase.service';
 import type { PaymentProvider } from './providers/payment-provider.interface';
+
+const WEBHOOK_PROCESSING_TIMEOUT_MS = 10 * 60_000;
 
 // No auth guard — this is called by the payment provider, not a logged-in
 // user. Signature verification is what stands in for auth here: a request
@@ -42,10 +46,41 @@ export class PaymentWebhookController {
       throw new ForbiddenException('Invalid webhook signature');
     }
 
+    // Persist a deterministic hash of the verified raw event before processing.
+    // Providers retry webhooks; identical retries must never run settlement twice.
+    // A failed event remains retryable, while an event already marked PROCESSING/PROCESSED
+    // is treated as an acknowledged replay.
+    const eventKey = createHash('sha256').update(req.rawBody).digest('hex');
+    const provider = this.paymentProvider.constructor.name;
+    let webhookEvent = await this.prisma.paymentWebhookEvent.findUnique({ where: { eventKey } });
+    if (webhookEvent && webhookEvent.status !== 'FAILED') {
+      const ageMs = Date.now() - new Date(webhookEvent.receivedAt).getTime();
+      if (webhookEvent.status !== 'PROCESSING' || ageMs < WEBHOOK_PROCESSING_TIMEOUT_MS) return { received: true };
+      // A worker may have died after marking the event PROCESSING. A stale
+      // PROCESSING record is safe to retry because coin settlement itself is
+      // idempotent and the webhook hash remains the same.
+    }
+    if (!webhookEvent) {
+      try {
+        webhookEvent = await this.prisma.paymentWebhookEvent.create({
+          data: { provider, eventKey, eventType: payload?.event ?? null, providerRef: payload?.data?.reference ?? payload?.data?.transfer_code ?? payload?.data?.payment_id ?? null },
+        });
+      } catch (e: any) {
+        if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') return { received: true };
+        throw e;
+      }
+    } else {
+      webhookEvent = await this.prisma.paymentWebhookEvent.update({ where: { id: webhookEvent.id }, data: { status: 'PROCESSING', error: null } });
+    }
+
+    try {
     // Paystack has one webhook URL for the whole account. Events that belong to
     // another part of the app (payout transfers) are handed to it here, after
     // the signature above has been verified.
-    if (await this.router.dispatch(payload?.event, payload)) return { received: true };
+    if (await this.router.dispatch(payload?.event, payload)) {
+      await this.prisma.paymentWebhookEvent.update({ where: { id: webhookEvent.id }, data: { status: 'PROCESSED', processedAt: new Date() } });
+      return { received: true };
+    }
 
     // Dispute detection stays Paystack-shape-specific (payload.event) for
     // now — a harmless no-op against the mock's simpler shape, which never
@@ -60,6 +95,7 @@ export class PaymentWebhookController {
       if (purchase) {
         await this.chargeback.record(purchase.id, payload?.data?.reason, reference);
       }
+      await this.prisma.paymentWebhookEvent.update({ where: { id: webhookEvent.id }, data: { status: 'PROCESSED', processedAt: new Date() } });
       return { received: true };
     }
 
@@ -74,6 +110,9 @@ export class PaymentWebhookController {
     const result = await this.paymentProvider.handleWebhook(payload);
     if (result.status === 'confirmed') {
       await this.coinPurchase.confirm(result.providerRef);
+    } else if (result.status === 'refunded' && result.providerRef) {
+      const purchase = await this.prisma.coinPurchase.findFirst({ where: { providerRef: result.providerRef } });
+      if (purchase?.status === 'CONFIRMED') await this.chargeback.record(purchase.id, 'Provider reported payment refund', result.providerRef);
     } else if (result.status === 'failed' && result.providerRef) {
       // A provider-reported payment failure is terminal for the pending
       // purchase, but only after the provider itself has normalized the event.
@@ -84,6 +123,11 @@ export class PaymentWebhookController {
         await this.prisma.coinPurchase.update({ where: { id: purchase.id }, data: { status: 'FAILED' } });
       }
     }
+    await this.prisma.paymentWebhookEvent.update({ where: { id: webhookEvent.id }, data: { status: 'PROCESSED', processedAt: new Date() } });
     return { received: true };
+    } catch (error: any) {
+      await this.prisma.paymentWebhookEvent.update({ where: { id: webhookEvent.id }, data: { status: 'FAILED', error: String(error?.message ?? error).slice(0, 1000) } }).catch(() => undefined);
+      throw error;
+    }
   }
 }

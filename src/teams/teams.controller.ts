@@ -21,6 +21,11 @@ export class TeamsController {
     return this.teams.myTeam(req.user.userId);
   }
 
+  @Get('mine/tribe-board')
+  tribeBoard(@Req() req: AuthedRequest) {
+    return this.teams.myTeam(req.user.userId).then(team => team ? this.teams.tribeBoard(team.id, req.user.userId) : null);
+  }
+
   @Get('top')
   top(@Query('limit') limit?: string, @Query('countryCode') countryCode?: string) {
     return this.teams.listTopTeams(limit ? Number(limit) : undefined, countryCode);

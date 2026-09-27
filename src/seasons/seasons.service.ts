@@ -81,6 +81,33 @@ export class SeasonsService {
     return { id: season.id, name: season.name, description: season.description, startsAt: season.startsAt, endsAt: season.endsAt, status: this.deriveStatus(season, now) };
   }
 
+  async seasonHub(viewerId: string) {
+    const now = new Date();
+    const season = await this.prisma.season.findFirst({ where: { startsAt: { lte: now }, endsAt: { gte: now } }, orderBy: { startsAt: 'asc' } });
+    if (!season) return null;
+    const [participant, teamMember, supporters, recentMoments, missionDefs, missionClaims, user] = await Promise.all([
+      this.prisma.seasonParticipant.findUnique({ where: { seasonId_userId: { seasonId: season.id, userId: viewerId } } }),
+      this.prisma.teamMember.findUnique({ where: { userId: viewerId }, include: { team: { select: { id: true, name: true, teamXp: true, teamLevel: true } } } }),
+      this.prisma.creatorSupporter.findMany({ where: { supporterId: viewerId }, orderBy: { totalGiftCoins: 'desc' }, take: 3, select: { creatorId: true, level: true, totalGiftCoins: true } }),
+      this.prisma.rrydaMoment.findMany({ where: { userId: viewerId }, orderBy: { createdAt: 'desc' }, take: 3, select: { id: true, type: true, title: true, createdAt: true } }),
+      this.prisma.missionDefinition.findMany({ where: { active: true, creatorOnly: false }, orderBy: { sortOrder: 'asc' }, take: 8, select: { id: true, title: true, target: true, metric: true } }),
+      this.prisma.missionClaim.findMany({ where: { userId: viewerId }, orderBy: { createdAt: 'desc' }, take: 50, select: { missionId: true, periodKey: true } }),
+      this.prisma.user.findUnique({ where: { id: viewerId }, select: { hostLevel: true, hostXp: true } }),
+    ]);
+    const rank = participant ? await this.rankOf(season.id, participant.points) : null;
+    const currentPeriod = new Date().toISOString().slice(0, 10);
+    const claimedToday = new Set(missionClaims.filter((c) => c.periodKey === currentPeriod).map((c) => c.missionId));
+    return {
+      season: { id: season.id, name: season.name, status: this.deriveStatus(season, now), endsAt: season.endsAt },
+      viewer: { points: participant?.points ?? 0, rank },
+      team: teamMember ? { id: teamMember.team.id, name: teamMember.team.name, level: teamMember.team.teamLevel, teamXp: teamMember.team.teamXp, contributionXp: teamMember.xp } : null,
+      supporter: { creatorsSupported: supporters.length, topRelationships: supporters },
+      creator: user && (user.hostLevel > 1 || user.hostXp > 0) ? { level: user.hostLevel, xp: user.hostXp } : null,
+      missions: missionDefs.map((m) => ({ id: m.id, title: m.title, target: m.target, metric: m.metric, claimedToday: claimedToday.has(m.id) })),
+      recentMoments,
+    };
+  }
+
   async seasonSnapshot(seasonId: string, viewerId: string) {
     const season = await this.prisma.season.findUnique({ where: { id: seasonId } });
     if (!season) return null;

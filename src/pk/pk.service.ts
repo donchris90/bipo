@@ -9,6 +9,8 @@ import { loadPkSupporters } from '../economy/pk-score';
 import { ConfigService } from '@nestjs/config';
 import IORedis from 'ioredis';
 import { randomInt } from 'node:crypto';
+import { createMoment } from '../experience/experience.moments';
+import { SeasonsService } from '../seasons/seasons.service';
 
 const COUNTDOWN_MS = 10_000;
 const DEFAULT_BATTLE_DURATION_MS = 3 * 60_000;
@@ -41,6 +43,7 @@ export class PkService implements OnModuleDestroy {
     private readonly realtime: RealtimeGateway,
     private readonly notifications: NotificationsService,
     @Optional() private readonly config?: ConfigService,
+    @Optional() private readonly seasons?: SeasonsService,
   ) {
     this.redis = new IORedis(this.config?.get<string>('REDIS_URL') ?? 'redis://localhost:6379', { maxRetriesPerRequest: 1, enableOfflineQueue: false, lazyConnect: true });
     this.redis.on('error', () => undefined);
@@ -49,6 +52,15 @@ export class PkService implements OnModuleDestroy {
   private readonly redis: IORedis;
 
   async onModuleDestroy() { await this.redis.quit().catch(() => undefined); }
+
+  private buildObjectives() {
+    const pool = [
+      { key: 'COIN_TARGET', label: 'Reach 5,000 PK points', target: 5000 },
+      { key: 'GIFT_COUNT', label: 'Receive 5 gifts during PK', target: 5 },
+      { key: 'COIN_TARGET', label: 'Reach 10,000 PK points', target: 10000 },
+    ];
+    return [pool[Math.floor(Math.random() * pool.length)]];
+  }
 
   async challenge(challengerId: string, opponentId: string) {
     if (challengerId === opponentId) throw new BadRequestException('Cannot challenge yourself');
@@ -84,7 +96,7 @@ export class PkService implements OnModuleDestroy {
     await this.closeChallenges({ challengerId, status: 'CHALLENGED' }, 'SUPERSEDED');
 
     const battle = await this.prisma.pKBattle.create({
-      data: { challengerId, opponentId, status: 'CHALLENGED' },
+      data: { challengerId, opponentId, status: 'CHALLENGED', objectiveConfig: this.buildObjectives() },
     });
 
     // A challenged user otherwise only finds out by polling the incoming
@@ -203,7 +215,7 @@ export class PkService implements OnModuleDestroy {
     const startedAt = new Date(now.getTime() + COUNTDOWN_MS);
     const endsAt = new Date(now.getTime() + COUNTDOWN_MS + DEFAULT_BATTLE_DURATION_MS);
     const battle = await this.prisma.pKBattle.create({
-      data: { challengerId, opponentId, status: 'COUNTDOWN', mode: 'RANDOM', startedAt, endsAt },
+      data: { challengerId, opponentId, status: 'COUNTDOWN', mode: 'RANDOM', startedAt, endsAt, objectiveConfig: this.buildObjectives() },
     });
     void this.scheduleTransitionsBestEffort(battle.id, startedAt, endsAt);
     await this.emitLifecycle('pk:countdown_start', battle);
@@ -234,7 +246,7 @@ export class PkService implements OnModuleDestroy {
     await assertNotBlocked(this.prisma, userId, opponentTeam.leaderId, "You can't challenge this team");
     if (!(await this.isHostLive(userId)) || !(await this.isHostLive(opponentTeam.leaderId))) throw new BadRequestException('Both team leaders must be live');
     if (await this.isPkBusy(userId) || await this.isPkBusy(opponentTeam.leaderId)) throw new BadRequestException('One of the team leaders is already in a PK');
-    const battle = await this.prisma.pKBattle.create({ data: { challengerId: userId, opponentId: opponentTeam.leaderId, challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id, mode: 'TEAM', status: 'CHALLENGED' } });
+    const battle = await this.prisma.pKBattle.create({ data: { challengerId: userId, opponentId: opponentTeam.leaderId, challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id, mode: 'TEAM', status: 'CHALLENGED', objectiveConfig: this.buildObjectives() } });
     const challenger = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true, avatarUrl: true } });
     this.realtime.emitToUser(opponentTeam.leaderId, 'pk:challenge', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, challengerAvatarUrl: challenger?.avatarUrl ?? null, mode: 'TEAM', teamName: opponentTeam.name });
     await this.notifications.notify(opponentTeam.leaderId, 'PK_CHALLENGE', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, mode: 'TEAM', challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id });
@@ -596,6 +608,21 @@ export class PkService implements OnModuleDestroy {
         const settled = await this.prisma.pKBattle.findUniqueOrThrow({ where: { id: battleId } });
         await this.emitLifecycle('pk:settled', settled);
         await this.notifyResult(settled);
+        const winner = settled.winnerId ?? settled.challengerId;
+        if (this.seasons) {
+          const participants = [settled.challengerId, settled.opponentId];
+          for (const participant of participants) {
+            const points = settled.winnerId ? (participant === settled.winnerId ? 25 : 10) : 15;
+            void this.seasons.contributePoints(participant, points);
+          }
+        }
+        void createMoment(this.prisma, {
+          userId: winner,
+          type: 'PK_MOMENT',
+          title: settled.winnerId ? 'PK victory moment' : 'PK battle completed',
+          description: 'A Rryda PK battle just reached its final result.',
+          payload: { battleId: settled.id, mode: settled.mode, scoreChallenger: settled.scoreChallenger.toString(), scoreOpponent: settled.scoreOpponent.toString(), objectives: settled.objectiveConfig ?? [] },
+        }).catch(() => undefined);
         return settled;
       }
     }

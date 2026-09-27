@@ -6,6 +6,7 @@ import { HostLevelsService } from '../host-levels/host-levels.service';
 import { RoleName } from '@prisma/client';
 import { BadRequestException } from '@nestjs/common';
 import { resolveCheckIn, toUtcDateKey } from '../users/check-in-rules';
+import { SeasonsService } from '../seasons/seasons.service';
 
 // Room Community: everything that makes a Party Room a persistent COMMUNITY instead of
 // just a live session. Architecture mirrors the rest of the *-levels services on purpose
@@ -25,6 +26,7 @@ export class RoomCommunityService {
     private readonly notifications: NotificationsService,
     private readonly audit: AuditService,
     private readonly hostLevels: HostLevelsService,
+    private readonly seasons: SeasonsService,
   ) {}
 
   // Flat per-unique-day rewards. Disclosed constants, not hidden numbers — same spirit as
@@ -118,6 +120,8 @@ export class RoomCommunityService {
       const existing = await this.prisma.roomMember.findUnique({ where: { roomId_userId: { roomId, userId } } });
       const state = resolveCheckIn(existing?.lastVisitAt ?? null, existing?.visitStreak ?? 0, now);
       if (state.checkedInToday) return; // already credited today
+
+      void this.seasons.contributePoints(userId, 5); // a daily Party community visit counts toward the Season loop
 
       const wasRegular = existing?.isRegular ?? false;
       const visitCount = (existing?.visitCount ?? 0) + 1;

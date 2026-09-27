@@ -17,9 +17,10 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { LudoService } from './ludo.service';
 import { LudoController } from './ludo.controller';
 import { LudoGateway } from './ludo.gateway';
+import { SeasonsModule } from '../seasons/seasons.module';
 
 @Module({
-  imports: [EconomyModule, RealtimeModule, RegionalConfigModule, FeatureFlagsModule, ConfigModule, JwtModule.registerAsync({ imports: [ConfigModule], inject: [ConfigService], useFactory: (config: ConfigService) => ({ secret: config.get<string>('JWT_ACCESS_SECRET') }) })],
+  imports: [EconomyModule, SeasonsModule, RealtimeModule, RegionalConfigModule, FeatureFlagsModule, ConfigModule, JwtModule.registerAsync({ imports: [ConfigModule], inject: [ConfigService], useFactory: (config: ConfigService) => ({ secret: config.get<string>('JWT_ACCESS_SECRET') }) })],
   providers: [RngService, RoundService, EntryService, SettlementService, CrashService, GameAdminService, RoundSchedulerService, GamesReadinessService, LudoService, LudoGateway],
   controllers: [GamesController, GameOperatorController, LudoController],
   exports: [RoundService, SettlementService, CrashService, LudoService],

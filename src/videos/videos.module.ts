@@ -8,11 +8,12 @@ import { StorageController } from './storage.controller';
 import { MockStorageProvider, STORAGE_PROVIDER, UnavailableStorageProvider } from './providers/storage-provider.interface';
 import { isProduction } from '../common/provider-mode';
 import { S3StorageProvider } from './providers/s3-storage-provider';
+import { SeasonsModule } from '../seasons/seasons.module';
 
 const logger = new Logger('VideosModule');
 
 @Module({
-  imports: [ConfigModule, NotificationsModule],
+  imports: [ConfigModule, NotificationsModule, SeasonsModule],
   providers: [
     VideosService,
     VideoEditService,

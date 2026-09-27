@@ -4,6 +4,9 @@ import IORedis from 'ioredis';
 
 export const PK_QUEUE_NAME = 'pk-transitions';
 export const GAME_QUEUE_NAME = 'game-round-transitions';
+export const RECONCILIATION_QUEUE_NAME = 'wallet-reconciliation';
+export const DEAD_LETTER_QUEUE_NAME = 'platform-dead-letter';
+export const C2C_QUEUE_NAME = 'c2c-expiry';
 
 const logger = new Logger('RedisConnection');
 

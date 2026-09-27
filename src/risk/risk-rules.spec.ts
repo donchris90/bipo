@@ -15,12 +15,16 @@ describe('evaluateWithdrawalRisk', () => {
     const result = evaluateWithdrawalRisk(BASELINE);
     expect(result.needsReview).toBe(false);
     expect(result.reasons).toEqual([]);
+    expect(result.score).toBe(0);
+    expect(result.level).toBe('LOW');
   });
 
   it('flags a new account regardless of other factors', () => {
     const result = evaluateWithdrawalRisk({ ...BASELINE, accountAgeDays: 2 });
     expect(result.needsReview).toBe(true);
     expect(result.reasons).toContain('new_account');
+    expect(result.score).toBeGreaterThanOrEqual(30);
+    expect(result.level).toBe('MEDIUM');
   });
 
   it('flags an unverified account withdrawing above the free limit, but not below it', () => {
@@ -91,5 +95,54 @@ describe('evaluateWithdrawalRisk', () => {
 
     const atThreshold = evaluateWithdrawalRisk({ ...BASELINE, sharedIpAccountCount: 3 });
     expect(atThreshold.reasons).toContain('shared_ip_multiple_accounts');
+  });
+});
+
+
+describe('risk severity scoring', () => {
+  it('raises critical risk when several independent high-risk signals combine', () => {
+    const result = evaluateWithdrawalRisk({
+      ...BASELINE,
+      accountAgeDays: 1,
+      kycVerified: false,
+      withdrawalsLast24h: 5,
+      amountCoins: 500_000,
+      lifetimeEarnedCoins: 500_000,
+      chargebackCount: 1,
+      sharedIpAccountCount: 3,
+      selfGiftCountLast30d: 2,
+    });
+    expect(result.level).toBe('CRITICAL');
+    expect(result.score).toBeGreaterThanOrEqual(80);
+    expect(result.reasons).toEqual(expect.arrayContaining([
+      'new_account',
+      'chargeback_history',
+      'self_gifting_history',
+    ]));
+  });
+
+  it('flags self-gifting without requiring IP overlap', () => {
+    const result = evaluateWithdrawalRisk({ ...BASELINE, selfGiftCountLast30d: 1 });
+    expect(result.needsReview).toBe(true);
+    expect(result.reasons).toContain('self_gifting_history');
+    expect(result.level).toBe('MEDIUM');
+  });
+});
+
+describe('device/account overlap', () => {
+  it('raises risk when the same device is associated with multiple accounts', () => {
+    const result = evaluateWithdrawalRisk({
+      accountAgeDays: 100,
+      kycVerified: true,
+      withdrawalsLast24h: 0,
+      amountCoins: 1000,
+      lifetimeEarnedCoins: 10000,
+      chargebackCount: 0,
+      sharedIpAccountCount: 0,
+      sharedDeviceAccountCount: 2,
+    });
+    expect(result.reasons).toContain('shared_device_multiple_accounts');
+    expect(result.score).toBeGreaterThanOrEqual(25);
+    expect(result.level).toBe('MEDIUM');
   });
 });

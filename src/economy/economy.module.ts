@@ -15,6 +15,8 @@ import { PaymentWebhookController } from './payment-webhook.controller';
 import { MockPaymentProvider, UnavailablePaymentProvider } from './providers/payment-provider.interface';
 import { isProduction } from '../common/provider-mode';
 import { PaystackPaymentProvider } from './providers/paystack-payment-provider';
+import { NowPaymentsPaymentProvider } from './providers/nowpayments-payment-provider';
+import { PaymentProviderRouter } from './providers/payment-provider-router';
 import { PrismaService } from '../prisma/prisma.service';
 import { RealtimeModule } from '../realtime/realtime.module';
 import { NotificationsModule } from '../notifications/notifications.module';
@@ -24,6 +26,7 @@ import { SupporterLevelsModule } from '../supporters/supporter-levels.module';
 import { RoomCommunityModule } from '../rooms/room-community.module';
 import { TeamsModule } from '../teams/teams.module';
 import { SeasonsModule } from '../seasons/seasons.module';
+import { RrydaExperienceModule } from '../experience/experience.module';
 
 const logger = new Logger('EconomyModule');
 
@@ -43,6 +46,7 @@ const logger = new Logger('EconomyModule');
     TeamsModule,
     WalletModule,
     SeasonsModule,
+    RrydaExperienceModule,
   ],
   providers: [CoinPackageAdminService, GiftAdminService,
     RevenueSplitService,
@@ -54,21 +58,16 @@ const logger = new Logger('EconomyModule');
       provide: PAYMENT_PROVIDER,
       inject: [ConfigService, PrismaService],
       useFactory: (config: ConfigService, prisma: PrismaService) => {
-        if (config.get<string>('PAYSTACK_SECRET_KEY')) {
-          return new PaystackPaymentProvider(config, prisma);
-        }
-        // In production a missing key must never fall back to a provider that
-        // reports every payment as successful — every payment call fails with
-        // a 503 instead.
+        const paystack = new PaystackPaymentProvider(config, prisma);
+        const crypto = new NowPaymentsPaymentProvider(config);
+        const hasPaystack = Boolean(config.get<string>('PAYSTACK_SECRET_KEY'));
+        const hasCrypto = Boolean(config.get<string>('NOWPAYMENTS_API_KEY') && config.get<string>('NOWPAYMENTS_IPN_SECRET'));
+        if (hasPaystack || hasCrypto) return new PaymentProviderRouter(paystack, crypto);
         if (isProduction(config.get<string>('NODE_ENV'))) {
-          logger.error('PAYSTACK_SECRET_KEY is not set — coin purchases are DISABLED (503) until it is configured.');
+          logger.error('No real payment provider is configured — coin purchases are DISABLED (503) until PAYSTACK or NOWPAYMENTS is configured.');
           return new UnavailablePaymentProvider();
         }
-        // Development only. Loudly logged, not silent.
-        logger.warn(
-          'PAYSTACK_SECRET_KEY not set — falling back to MockPaymentProvider. ' +
-            'Real payments will NOT work until this is configured.',
-        );
+        logger.warn('No real payment provider configured — falling back to MockPaymentProvider for development only.');
         return new MockPaymentProvider();
       },
     },

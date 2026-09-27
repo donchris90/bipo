@@ -16,7 +16,7 @@ export class RiskService {
     amountCoins: number,
     walletType: 'CREATOR_EARNINGS' | 'AGENCY_EARNINGS' = 'CREATOR_EARNINGS',
   ): Promise<RiskResult> {
-    const [user, withdrawalsLast24h, lifetimeEarned, chargebackCount, sharedIpAccountCount] = await Promise.all([
+    const [user, withdrawalsLast24h, lifetimeEarned, chargebackCount, sharedIpAccountCount, sharedDeviceAccountCount, selfGiftCountLast30d] = await Promise.all([
       this.prisma.user.findUniqueOrThrow({ where: { id: userId } }),
       this.prisma.withdrawalRequest.count({
         where: { creatorId: userId, requestedAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
@@ -24,6 +24,8 @@ export class RiskService {
       this.lifetimeEarnedCoins(userId, walletType),
       this.prisma.chargeback.count({ where: { userId } }),
       this.sharedIpAccountCount(userId),
+      this.sharedDeviceAccountCount(userId),
+      this.selfGiftCountLast30d(userId),
     ]);
 
     const accountAgeDays = (Date.now() - user.createdAt.getTime()) / (24 * 60 * 60 * 1000);
@@ -36,6 +38,8 @@ export class RiskService {
       lifetimeEarnedCoins: lifetimeEarned,
       chargebackCount,
       sharedIpAccountCount,
+      sharedDeviceAccountCount,
+      selfGiftCountLast30d,
     });
   }
 
@@ -58,6 +62,32 @@ export class RiskService {
   // not a real device fingerprint, just IP overlap, so it's a fairly weak
   // signal on its own (shared networks, NAT, mobile carriers all produce
   // false positives) and is only one of several inputs, not a sole trigger.
+  private async selfGiftCountLast30d(userId: string): Promise<number> {
+    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    return this.prisma.giftTransaction.count({
+      where: {
+        senderId: userId,
+        recipientId: userId,
+        createdAt: { gte: since },
+      },
+    });
+  }
+
+  private async sharedDeviceAccountCount(userId: string): Promise<number> {
+    const lastLogin = await this.prisma.loginEvent.findFirst({
+      where: { userId, deviceIdHash: { not: null } },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!lastLogin?.deviceIdHash) return 0;
+    const since = new Date(Date.now() - SHARED_IP_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+    const others = await this.prisma.loginEvent.findMany({
+      where: { deviceIdHash: lastLogin.deviceIdHash, userId: { not: userId }, createdAt: { gte: since } },
+      select: { userId: true },
+      distinct: ['userId'],
+    });
+    return others.length;
+  }
+
   private async sharedIpAccountCount(userId: string): Promise<number> {
     const lastLogin = await this.prisma.loginEvent.findFirst({
       where: { userId, ipAddress: { not: null } },

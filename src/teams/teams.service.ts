@@ -215,6 +215,22 @@ export class TeamsService {
 
   // Roster with the "N hosts, N supporters" breakdown from the product brief — "host"/"creator"
   // here means the CREATOR role, same distinction the rest of the app already uses.
+  async tribeBoard(teamId: string, viewerId: string) {
+    const team = await this.prisma.team.findUnique({ where: { id: teamId }, select: { id: true, name: true, teamXp: true, teamLevel: true, countryCode: true } });
+    if (!team) throw new NotFoundException('Team not found');
+    const [top, season] = await Promise.all([
+      this.prisma.team.findMany({ orderBy: { teamXp: 'desc' }, take: 5, select: { id: true, name: true, teamXp: true, teamLevel: true, countryCode: true } }),
+      this.prisma.season.findFirst({ where: { startsAt: { lte: new Date() }, endsAt: { gt: new Date() } }, orderBy: { startsAt: 'desc' }, select: { id: true, name: true } }),
+    ]);
+    return {
+      team,
+      challenge: { title: 'Tribe War', description: 'Every contribution makes your tribe stronger. Rankings refresh from real team XP.', metric: 'TEAM_XP' },
+      leaderboard: top.map((t, i) => ({ rank: i + 1, ...t, isMine: t.id === teamId })),
+      season: season ? { id: season.id, name: season.name } : null,
+      viewerId,
+    };
+  }
+
   async listRoster(teamId: string) {
     const rows = await this.prisma.teamMember.findMany({ where: { teamId }, orderBy: { xp: 'desc' } });
     if (rows.length === 0) return { members: [], creatorCount: 0, supporterCount: 0 };

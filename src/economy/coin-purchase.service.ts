@@ -17,7 +17,7 @@ export class CoinPurchaseService {
     private readonly notifications: NotificationsService,
   ) {}
 
-  async initiate(userId: string, packageId: string, idempotencyKey: string) {
+  async initiate(userId: string, packageId: string, idempotencyKey: string, method = 'PAYSTACK') {
     const [pkg, user] = await Promise.all([
       this.prisma.coinPackage.findUnique({ where: { id: packageId } }),
       this.prisma.user.findUnique({ where: { id: userId }, select: { countryCode: true } }),
@@ -27,9 +27,10 @@ export class CoinPurchaseService {
     const countryCode = user.countryCode.toUpperCase();
     if (pkg.countryCode !== countryCode) throw new BadRequestException('That coin package is not available in your country');
     const region = await this.prisma.regionalConfig.findUnique({ where: { countryCode } });
-    const methods = Array.isArray(region?.paymentMethods) ? region.paymentMethods.map(String) : [];
-    if (!region?.active || !region.paymentsEnabled || !methods.includes('PAYSTACK')) {
-      throw new BadRequestException('Automatic coin purchases are not available in your country yet');
+    const selectedMethod = String(method).toUpperCase();
+    const methods = Array.isArray(region?.paymentMethods) ? region.paymentMethods.map(String).map(v => v.toUpperCase()) : [];
+    if (!['PAYSTACK', 'CRYPTO'].includes(selectedMethod) || !region?.active || !region.paymentsEnabled || !methods.includes(selectedMethod)) {
+      throw new BadRequestException(`${selectedMethod} payments are not available in your country`);
     }
 
     const existing = await this.prisma.coinPurchase.findUnique({ where: { idempotencyKey } });
@@ -40,6 +41,7 @@ export class CoinPurchaseService {
       currencyCode: pkg.currencyCode,
       userId,
       idempotencyKey,
+      method: selectedMethod,
     });
 
     // The provider's payment page. This used to be thrown away, so there was no
@@ -49,7 +51,7 @@ export class CoinPurchaseService {
       data: {
         userId,
         packageId,
-        provider: this.paymentProvider.constructor.name.toLowerCase().includes('paystack') ? 'paystack' : 'mock',
+        provider: selectedMethod.toLowerCase(),
         providerRef: payment.providerRef,
         checkoutUrl: payment.redirectUrl ?? null,
         amountMinor: pkg.priceMinor,
