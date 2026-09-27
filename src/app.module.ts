@@ -38,6 +38,7 @@ import { RrydaLevelsModule } from './rryda-levels/rryda-levels.module';
 import { SupporterLevelsModule } from './supporters/supporter-levels.module';
 import { BadgesModule } from './badges/badges.module';
 import { TeamsModule } from './teams/teams.module';
+import { SeasonsModule } from './seasons/seasons.module';
 import { ModerationModule } from './moderation/moderation.module';
 import { HealthModule } from './health/health.module';
 
@@ -82,6 +83,7 @@ import { HealthModule } from './health/health.module';
     SupporterLevelsModule,
     BadgesModule,
     TeamsModule,
+    SeasonsModule,
     ModerationModule,
     HealthModule,
   ],

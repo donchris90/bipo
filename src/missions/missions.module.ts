@@ -6,9 +6,10 @@ import { EconomyModule } from '../economy/economy.module';
 import { RrydaLevelsModule } from '../rryda-levels/rryda-levels.module';
 import { BadgesModule } from '../badges/badges.module';
 import { TeamsModule } from '../teams/teams.module';
+import { SeasonsModule } from '../seasons/seasons.module';
 
 @Module({
-  imports: [ConfigModule, EconomyModule, RrydaLevelsModule, BadgesModule, TeamsModule],
+  imports: [ConfigModule, EconomyModule, RrydaLevelsModule, BadgesModule, TeamsModule, SeasonsModule],
   providers: [MissionsService],
   controllers: [MissionsController, AdminMissionsController],
 })

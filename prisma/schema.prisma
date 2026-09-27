@@ -444,6 +444,57 @@ model TeamLevel {
   updatedAt  DateTime @updatedAt
 }
 
+// Rryda Seasons: a time-boxed competitive period ("Rryda Season 1", or a short one like "Friday
+// Night PK"). No separate "join" step — everyone already using the app during the window competes
+// automatically (see SeasonsService.contributePoints, wired at the same everyday-activity call
+// sites as RrydaLevelsService.addXp/TeamsService.contributeXp: missions, chests, check-in,
+// following someone new, sending a gift). Deliberately the structural core — a season's own
+// event-specific objectives ("event missions") and a dedicated event-badge catalog are NOT part
+// of this pass; they would sit on top of this foundation, same reasoning as Teams/Rooms before.
+//
+// Status is never stored — it's derived from now vs startsAt/endsAt/settledAt (see
+// SeasonsService.deriveStatus), so nothing needs a background job just to flip a flag.
+model Season {
+  id          String               @id @default(uuid())
+  name        String
+  description String?
+  startsAt    DateTime
+  endsAt      DateTime
+  settledAt   DateTime?
+  createdAt   DateTime             @default(now())
+  participants SeasonParticipant[]
+  rewardTiers  SeasonRewardTier[]
+
+  @@index([startsAt, endsAt])
+}
+
+// One row per (season, user) who has contributed at least once — there is no separate "join",
+// so this row is created lazily on a user's first contribution during the season's window.
+model SeasonParticipant {
+  id        String   @id @default(uuid())
+  seasonId  String
+  userId    String
+  points    Int      @default(0)
+  joinedAt  DateTime @default(now())
+  season    Season   @relation(fields: [seasonId], references: [id])
+
+  @@unique([seasonId, userId])
+  @@index([seasonId, points])
+}
+
+// Admin-configured payout bands, e.g. rank 1 -> 5000 coins, ranks 2-10 -> 1000 coins each, ranks
+// 11-50 -> 200 coins each. Applied once, by SeasonsService.settleSeason, after the season ends.
+model SeasonRewardTier {
+  id          String @id @default(uuid())
+  seasonId    String
+  minRank     Int
+  maxRank     Int
+  rewardCoins Int
+  season      Season @relation(fields: [seasonId], references: [id])
+
+  @@index([seasonId])
+}
+
 model RoomSeat {
   id         String   @id @default(uuid())
   roomId     String
@@ -1024,6 +1075,8 @@ enum NotificationType {
   // Rryda Teams: the team's own level curve, sent to the team's leader (same reasoning as
   // ROOM_LEVEL_UP going to the room's host, not every visitor).
   TEAM_LEVEL_UP
+  // A season ended and this user was in a reward tier — see SeasonsService.settleSeason.
+  SEASON_REWARD
 }
 
 enum LiveStatus {
