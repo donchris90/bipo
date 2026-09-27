@@ -44,6 +44,36 @@ export class PkController {
     return this.pk.candidates(req.user.userId, cat);
   }
 
+  // Real matchmaking queue: join without selecting an opponent.
+  @Post('random-match')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  async randomMatch(@Req() req: AuthedRequest) {
+    return this.pk.randomMatch(req.user.userId);
+  }
+
+  @Get('random-match/status')
+  async randomMatchStatus(@Req() req: AuthedRequest) {
+    return this.pk.randomMatchStatus(req.user.userId);
+  }
+
+  @Post('random-match/cancel')
+  async cancelRandomMatch(@Req() req: AuthedRequest) {
+    return this.pk.cancelRandomMatch(req.user.userId);
+  }
+
+  @Get('team/candidates')
+  async teamCandidates(@Req() req: AuthedRequest) {
+    return this.pk.teamCandidates(req.user.userId);
+  }
+
+  @Post('team/challenge/:opponentTeamId')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  async teamChallenge(@Param('opponentTeamId') opponentTeamId: string, @Req() req: AuthedRequest) {
+    return toResponse(await this.pk.teamChallenge(req.user.userId, opponentTeamId));
+  }
+
   // "Random match": challenge one online creator picked for you.
   @Post('random')
   async random(@Req() req: AuthedRequest) {

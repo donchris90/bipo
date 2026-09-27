@@ -943,6 +943,11 @@ model PKBattle {
   startedAt       DateTime?
   endsAt          DateTime?
   winnerId        String?
+  // Advanced PK metadata. NORMAL keeps the original 1-v-1 behavior; TEAM stores the
+  // participating team ids while the battle still uses the existing authoritative scores.
+  mode            String    @default("NORMAL")
+  challengerTeamId String?
+  opponentTeamId   String?
   createdAt       DateTime  @default(now())
   settledAt       DateTime?
 

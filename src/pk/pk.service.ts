@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException, Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Inject, Injectable, NotFoundException, OnModuleDestroy, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import type { Queue } from 'bullmq';
 import { PK_QUEUE } from '../queue/queue.module';
@@ -6,6 +6,9 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { NotificationsService } from '../notifications/notifications.service';
 import { assertNotBlocked } from '../common/blocks';
 import { loadPkSupporters } from '../economy/pk-score';
+import { ConfigService } from '@nestjs/config';
+import IORedis from 'ioredis';
+import { randomInt } from 'node:crypto';
 
 const COUNTDOWN_MS = 10_000;
 const DEFAULT_BATTLE_DURATION_MS = 3 * 60_000;
@@ -31,13 +34,21 @@ function shuffle<T>(items: T[]): T[] {
 }
 
 @Injectable()
-export class PkService {
+export class PkService implements OnModuleDestroy {
   constructor(
     private readonly prisma: PrismaService,
     @Inject(PK_QUEUE) private readonly pkQueue: Queue,
     private readonly realtime: RealtimeGateway,
     private readonly notifications: NotificationsService,
-  ) {}
+    @Optional() private readonly config?: ConfigService,
+  ) {
+    this.redis = new IORedis(this.config?.get<string>('REDIS_URL') ?? 'redis://localhost:6379', { maxRetriesPerRequest: 1, enableOfflineQueue: false, lazyConnect: true });
+    this.redis.on('error', () => undefined);
+  }
+
+  private readonly redis: IORedis;
+
+  async onModuleDestroy() { await this.redis.quit().catch(() => undefined); }
 
   async challenge(challengerId: string, opponentId: string) {
     if (challengerId === opponentId) throw new BadRequestException('Cannot challenge yourself');
@@ -97,6 +108,136 @@ export class PkService {
       challengerAvatarUrl: challenger?.avatarUrl ?? null,
     });
 
+    return battle;
+  }
+
+  // ── Random PK matchmaking ────────────────────────────────────────
+  // Unlike the old /random shortcut, this is a real opt-in queue. Two live hosts
+  // are paired without either side manually selecting the other; the match enters
+  // the same COUNTDOWN -> ACTIVE -> SETTLED lifecycle as normal PK.
+  private randomQueueKey = 'pk:random:queue';
+  private randomLockKey = 'pk:random:lock';
+  private randomTicketPrefix = 'pk:random:ticket:';
+  private randomTicketTtl = 90;
+
+  private async isHostLive(userId: string) {
+    return !!(await this.prisma.liveSession.findFirst({ where: { hostId: userId, status: 'LIVE' }, select: { id: true } }));
+  }
+
+  private async isPkBusy(userId: string) {
+    return !!(await this.prisma.pKBattle.findFirst({
+      where: { status: { in: ['CHALLENGED', 'ACCEPTED', 'COUNTDOWN', 'ACTIVE'] }, OR: [{ challengerId: userId }, { opponentId: userId }] },
+      select: { id: true },
+    }));
+  }
+
+  private async withRandomLock<T>(fn: () => Promise<T>): Promise<T> {
+    const token = `${Date.now()}-${Math.random()}`;
+    try {
+      const locked = await this.redis.set(this.randomLockKey, token, 'PX', 5000, 'NX');
+      if (!locked) throw new BadRequestException('Random PK matchmaking is busy. Please try again.');
+      return await fn();
+    } finally {
+      const current = await this.redis.get(this.randomLockKey).catch(() => null);
+      if (current === token) await this.redis.del(this.randomLockKey).catch(() => undefined);
+    }
+  }
+
+  async randomMatch(userId: string) {
+    if (!(await this.isHostLive(userId))) throw new BadRequestException('You must be live before joining Random PK');
+    if (await this.isPkBusy(userId)) throw new BadRequestException('Finish your current PK first');
+
+    const ticketKey = `${this.randomTicketPrefix}${userId}`;
+    const existingRaw = await this.redis.get(ticketKey).catch(() => null);
+    if (existingRaw) return JSON.parse(existingRaw);
+
+    return this.withRandomLock(async () => {
+      const again = await this.redis.get(ticketKey).catch(() => null);
+      if (again) return JSON.parse(again);
+
+      let ids = await this.redis.lrange(this.randomQueueKey, 0, 199).catch(() => [] as string[]);
+      const unique = [...new Set(ids)].filter((id) => id !== userId);
+      const valid: string[] = [];
+      for (const id of unique) {
+        const ticketExists = await this.redis.exists(`${this.randomTicketPrefix}${id}`).catch(() => 0);
+        if (ticketExists && await this.isHostLive(id) && !(await this.isPkBusy(id))) valid.push(id);
+      }
+      if (valid.length) {
+        const opponentId = valid[randomInt(valid.length)];
+        await this.redis.lrem(this.randomQueueKey, 0, opponentId).catch(() => undefined);
+        await this.redis.del(`${this.randomTicketPrefix}${opponentId}`).catch(() => undefined);
+        const battle = await this.createRandomBattle(opponentId, userId);
+        const opponentTicket = { status: 'MATCHED', battleId: battle.id, opponentId: userId };
+        const myTicket = { status: 'MATCHED', battleId: battle.id, opponentId };
+        await this.redis.set(`${this.randomTicketPrefix}${opponentId}`, JSON.stringify(opponentTicket), 'EX', this.randomTicketTtl);
+        await this.redis.set(ticketKey, JSON.stringify(myTicket), 'EX', this.randomTicketTtl);
+        return myTicket;
+      }
+
+      await this.redis.rpush(this.randomQueueKey, userId);
+      const ticket = { status: 'WAITING', queuePosition: await this.redis.llen(this.randomQueueKey) };
+      await this.redis.set(ticketKey, JSON.stringify(ticket), 'EX', this.randomTicketTtl);
+      return ticket;
+    });
+  }
+
+  async randomMatchStatus(userId: string) {
+    const raw = await this.redis.get(`${this.randomTicketPrefix}${userId}`).catch(() => null);
+    if (!raw) return { status: 'NOT_IN_QUEUE' as const };
+    const ticket = JSON.parse(raw);
+    if (ticket.status === 'WAITING') {
+      const position = await this.redis.lpos(this.randomQueueKey, userId).catch(() => null);
+      return { ...ticket, queuePosition: position == null ? 1 : position + 1 };
+    }
+    return ticket;
+  }
+
+  async cancelRandomMatch(userId: string) {
+    await this.redis.lrem(this.randomQueueKey, 0, userId).catch(() => undefined);
+    await this.redis.del(`${this.randomTicketPrefix}${userId}`).catch(() => undefined);
+    return { status: 'CANCELLED' as const };
+  }
+
+  private async createRandomBattle(challengerId: string, opponentId: string) {
+    const now = new Date();
+    const startedAt = new Date(now.getTime() + COUNTDOWN_MS);
+    const endsAt = new Date(now.getTime() + COUNTDOWN_MS + DEFAULT_BATTLE_DURATION_MS);
+    const battle = await this.prisma.pKBattle.create({
+      data: { challengerId, opponentId, status: 'COUNTDOWN', mode: 'RANDOM', startedAt, endsAt },
+    });
+    void this.scheduleTransitionsBestEffort(battle.id, startedAt, endsAt);
+    await this.emitLifecycle('pk:countdown_start', battle);
+    this.realtime.emitToUser(challengerId, 'pk:random_match', { battleId: battle.id, opponentId });
+    this.realtime.emitToUser(opponentId, 'pk:random_match', { battleId: battle.id, opponentId: challengerId });
+    return battle;
+  }
+
+  // ── Team PK ─────────────────────────────────────────────────────
+  // A Team PK uses the existing two-video battle and authoritative settlement,
+  // while associating each side with a Rryda Team. Gifts received by any member
+  // of the participating team can contribute to that team's PK score.
+  async teamCandidates(userId: string) {
+    const membership = await this.prisma.teamMember.findUnique({ where: { userId }, select: { teamId: true, role: true } });
+    if (!membership || membership.role !== 'LEADER') throw new BadRequestException('Only a team leader can start a Team PK');
+    const teams = await this.prisma.team.findMany({ where: { id: { not: membership.teamId } }, orderBy: { teamXp: 'desc' }, take: 100, select: { id: true, name: true, themeColor: true, leaderId: true, teamLevel: true, teamXp: true } });
+    const liveLeaders = await this.prisma.liveSession.findMany({ where: { hostId: { in: teams.map((t) => t.leaderId) }, status: 'LIVE' }, select: { hostId: true } });
+    const live = new Set(liveLeaders.map((x) => x.hostId));
+    return teams.filter((t) => live.has(t.leaderId)).map((t) => ({ ...t, live: true }));
+  }
+
+  async teamChallenge(userId: string, opponentTeamId: string) {
+    const mine = await this.prisma.teamMember.findUnique({ where: { userId }, select: { teamId: true, role: true } });
+    if (!mine || mine.role !== 'LEADER') throw new BadRequestException('Only a team leader can start a Team PK');
+    const opponentTeam = await this.prisma.team.findUnique({ where: { id: opponentTeamId }, select: { id: true, name: true, leaderId: true, themeColor: true } });
+    if (!opponentTeam) throw new NotFoundException('Opponent team not found');
+    if (opponentTeam.id === mine.teamId) throw new BadRequestException('Cannot challenge your own team');
+    await assertNotBlocked(this.prisma, userId, opponentTeam.leaderId, "You can't challenge this team");
+    if (!(await this.isHostLive(userId)) || !(await this.isHostLive(opponentTeam.leaderId))) throw new BadRequestException('Both team leaders must be live');
+    if (await this.isPkBusy(userId) || await this.isPkBusy(opponentTeam.leaderId)) throw new BadRequestException('One of the team leaders is already in a PK');
+    const battle = await this.prisma.pKBattle.create({ data: { challengerId: userId, opponentId: opponentTeam.leaderId, challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id, mode: 'TEAM', status: 'CHALLENGED' } });
+    const challenger = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true, avatarUrl: true } });
+    this.realtime.emitToUser(opponentTeam.leaderId, 'pk:challenge', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, challengerAvatarUrl: challenger?.avatarUrl ?? null, mode: 'TEAM', teamName: opponentTeam.name });
+    await this.notifications.notify(opponentTeam.leaderId, 'PK_CHALLENGE', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, mode: 'TEAM', challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id });
     return battle;
   }
 
@@ -308,6 +449,9 @@ export class PkService {
       // opponent isn't currently broadcasting. The client shows only the
       // local host's video in that case, not an error.
       opponentSession,
+      mode: battle.mode,
+      challengerTeamId: battle.challengerTeamId,
+      opponentTeamId: battle.opponentTeamId,
       supporters,
       resultEndsAt: phase === 'RESULT' && battle.settledAt ? new Date(battle.settledAt.getTime() + RESULT_MS) : null,
       serverTime: new Date(),

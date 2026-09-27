@@ -355,12 +355,28 @@ export class GiftService {
   // never count.
   private async resolvePkBattleId(params: SendGiftParams): Promise<string | null> {
     if (params.context && params.context !== 'LIVE') return null;
-    const battle = await this.prisma.pKBattle.findFirst({
+    const direct = await this.prisma.pKBattle.findFirst({
       where: { status: 'ACTIVE', OR: [{ challengerId: params.recipientId }, { opponentId: params.recipientId }] },
       select: { id: true },
       orderBy: { startedAt: 'desc' },
     });
-    return battle?.id ?? null;
+    if (direct) return direct.id;
+
+    // Team PK: a gift to a team member counts only when that member is the
+    // host receiving the gift in the same live session. This prevents a gift
+    // sent to a team member in an unrelated live from leaking into Team PK.
+    if (!params.contextId) return null;
+    const [membership, liveSession] = await Promise.all([
+      this.prisma.teamMember.findUnique({ where: { userId: params.recipientId }, select: { teamId: true } }),
+      this.prisma.liveSession.findFirst({ where: { id: params.contextId, hostId: params.recipientId, status: 'LIVE' }, select: { id: true } }),
+    ]);
+    if (!membership || !liveSession) return null;
+    const teamBattle = await this.prisma.pKBattle.findFirst({
+      where: { status: 'ACTIVE', mode: 'TEAM', OR: [{ challengerTeamId: membership.teamId }, { opponentTeamId: membership.teamId }] },
+      select: { id: true },
+      orderBy: { startedAt: 'desc' },
+    });
+    return teamBattle?.id ?? null;
   }
 
   private async applyPkScore(pkBattleId: string, recipientId: string, coinAmount: number) {
@@ -368,7 +384,12 @@ export class GiftService {
     if (!battle || battle.status !== 'ACTIVE') return; // gift still counts financially even if PK isn't live
     if (battle.endsAt && battle.endsAt.getTime() <= Date.now()) return; // buzzer has sounded
 
-    const side = pkSideForRecipient(battle, recipientId);
+    let side = pkSideForRecipient(battle, recipientId);
+    if (!side && battle.mode === 'TEAM') {
+      const membership = await this.prisma.teamMember.findUnique({ where: { userId: recipientId }, select: { teamId: true } });
+      if (membership?.teamId === battle.challengerTeamId) side = 'CHALLENGER';
+      else if (membership?.teamId === battle.opponentTeamId) side = 'OPPONENT';
+    }
     if (!side) return;
 
     const scoreConfig = await this.prisma.pKScoreConfig.findFirst({ where: { active: true }, orderBy: { id: 'desc' } });

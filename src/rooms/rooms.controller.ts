@@ -36,7 +36,7 @@ export class RoomsController {
 
   @Get(':id/chat')
   chat(@Param('id') id: string, @Query('limit') limit?: string, @Query('before') before?: string) {
-    return this.rooms.chatHistory(id, limit ? Number(limit) : undefined, before);
+    return this.rooms.chatHistory(id, req.user.userId, limit ? Number(limit) : undefined, before);
   }
 
   @Patch(':id/theme')

@@ -8,6 +8,7 @@ import { WalletModule } from './wallet.module';
 import { RevenueSplitService } from './revenue-split.service';
 import { CoinPurchaseService, PAYMENT_PROVIDER } from './coin-purchase.service';
 import { GiftService } from './gift.service';
+import { GifterService } from './gifter.service';
 import { ChargebackService } from './chargeback.service';
 import { WalletController, CoinPurchaseController, GiftController } from './economy.controller';
 import { PaymentWebhookController } from './payment-webhook.controller';
@@ -47,6 +48,7 @@ const logger = new Logger('EconomyModule');
     RevenueSplitService,
     CoinPurchaseService,
     GiftService,
+    GifterService,
     ChargebackService,
     {
       provide: PAYMENT_PROVIDER,
@@ -74,6 +76,6 @@ const logger = new Logger('EconomyModule');
   controllers: [WalletController, CoinPurchaseController, GiftController, GiftAdminController, CoinPackageAdminController, PaymentWebhookController],
   // WalletModule re-exported (not just its own WalletService) so every existing consumer that
   // imports EconomyModule to get WalletService keeps working unchanged.
-  exports: [WalletModule, RevenueSplitService, GiftService, ChargebackService],
+  exports: [WalletModule, RevenueSplitService, GiftService, GifterService, ChargebackService],
 })
 export class EconomyModule {}

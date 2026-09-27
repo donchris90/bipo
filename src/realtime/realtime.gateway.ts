@@ -108,6 +108,9 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     ) {
       return { error: 'banned' };
     }
+    if (data.context === 'ROOM' && !(await this.hasRoomAccess(data.contextId, userId))) {
+      return { error: 'invite_only' };
+    }
     client.join(`${data.context}:${data.contextId}`);
 
     // Let everyone already watching know someone new just arrived — a
@@ -160,6 +163,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     if (!this.checkRateLimit(userId)) return { error: 'rate_limited' };
     if (!data.content || data.content.length > 500) return { error: 'invalid_message' };
     if (await this.moderation.isBanned(data.context, data.contextId, userId)) return { error: 'banned' };
+    if (data.context === 'ROOM' && !(await this.hasRoomAccess(data.contextId, userId))) return { error: 'invite_only' };
     if (await this.moderation.isMuted(data.context, data.contextId, userId)) return { error: 'muted' };
 
     const [message, sender, senderBadge] = await Promise.all([
@@ -227,6 +231,22 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(`LIVE:${sessionId}`).emit('live:like', payload);
   }
 
+  // VIP entrance banner. Ephemeral by design: only people currently watching this live
+  // should see it; it is not persisted as chat history.
+  broadcastLiveEntrance(sessionId: string, payload: { userId: string; displayName: string | null; avatarUrl: string | null; tier: string; level: number; message: string }) {
+    this.server.to(`LIVE:${sessionId}`).emit('live:vip_entrance', payload);
+    this.server.to(`LIVE:${sessionId}`).emit('chat:message', {
+      id: `vip:${payload.userId}:${Date.now()}`,
+      senderId: 'system',
+      senderName: null,
+      content: payload.message,
+      createdAt: new Date().toISOString(),
+      system: true,
+      vipEntrance: true,
+      userId: payload.userId,
+    });
+  }
+
   // The host's shared video changed (loaded, played, paused, moved, stopped).
   broadcastLiveMedia(sessionId: string, payload: unknown) {
     this.server.to(`LIVE:${sessionId}`).emit('live:media', payload);
@@ -241,6 +261,24 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   broadcastLiveEnded(sessionId: string, payload: { sessionId: string; hostId: string }) {
     this.server.to(`LIVE:${sessionId}`).emit('live:ended', payload);
     this.server.in(`LIVE:${sessionId}`).socketsLeave(`LIVE:${sessionId}`);
+  }
+
+  private async hasRoomAccess(roomId: string, userId: string): Promise<boolean> {
+    const room = await this.prisma.partyRoom.findUnique({
+      where: { id: roomId },
+      select: { hostId: true, privacy: true },
+    });
+    if (!room) return false;
+    if (room.privacy !== 'INVITE_ONLY' || room.hostId === userId) return true;
+
+    const [seat, acceptedInvite] = await Promise.all([
+      this.prisma.roomSeat.findFirst({ where: { roomId, userId }, select: { id: true } }),
+      this.prisma.seatRequest.findFirst({
+        where: { roomId, userId, status: 'ACCEPTED', invitedByHost: true },
+        select: { id: true },
+      }),
+    ]);
+    return !!seat || !!acceptedInvite;
   }
 
   // Live moderation is broadcast to the current audience and directly to the target.

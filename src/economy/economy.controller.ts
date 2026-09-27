@@ -8,6 +8,7 @@ import { v4 as uuid } from 'uuid';
 import { WalletService } from './wallet.service';
 import { CoinPurchaseService, PAYMENT_PROVIDER } from './coin-purchase.service';
 import { GiftService } from './gift.service';
+import { GifterService, type GifterPeriod } from './gifter.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { WalletType, RoleName, ChatContext } from '@prisma/client';
@@ -100,6 +101,7 @@ export class CoinPurchaseController {
 export class GiftController {
   constructor(
     private readonly gifts: GiftService,
+    private readonly gifters: GifterService,
     private readonly realtime: RealtimeGateway,
     private readonly prisma: PrismaService,
   ) {}
@@ -122,6 +124,30 @@ export class GiftController {
       throw new BadRequestException("period must be 'today' or 'week'");
     }
     return this.gifts.ranking(period ?? 'today');
+  }
+
+  @Get('gifters/ranking')
+  gifterRanking(@Query('period') period: string | undefined, @Query('limit') limit: string | undefined) {
+    const selected = period ?? 'today';
+    if (!['today', 'week', 'month', 'all'].includes(selected)) {
+      throw new BadRequestException("period must be 'today', 'week', 'month' or 'all'");
+    }
+    return this.gifters.ranking(selected as GifterPeriod, limit ? Number(limit) : 50);
+  }
+
+  @Get('gifters/status')
+  gifterStatus(@Req() req: AuthedRequest) {
+    return this.gifters.status(req.user.userId);
+  }
+
+  @Get('gifters/tiers')
+  gifterTiers() {
+    return this.gifters.tiers();
+  }
+
+  @Get('gifters/entrance/:userId')
+  gifterEntrance(@Param('userId') userId: string) {
+    return this.gifters.entrance(userId);
   }
 
   @Get('received')
