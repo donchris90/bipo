@@ -66,7 +66,8 @@ function build() {
     },
     seasonRewardTier: {
       findMany: async ({ where, orderBy }: any) => {
-        const rows = tiers.get(where.seasonId) ?? [];
+        // Supports both shapes the service issues: one season id, or { in: [ids] } (listSeasons).
+        const rows = where.seasonId?.in ? where.seasonId.in.flatMap((id: string) => tiers.get(id) ?? []) : (tiers.get(where.seasonId) ?? []);
         if (orderBy?.minRank === 'asc') rows.sort((a, b) => a.minRank - b.minRank);
         return rows;
       },
@@ -184,6 +185,38 @@ describe('SeasonsService reads', () => {
     const board = await svc.listLeaderboard(s.id, 2);
     expect(board.map((r) => r.userId)).toEqual(['u2', 'u3']);
     expect(board[0].rank).toBe(1);
+  });
+});
+
+describe('SeasonsService.listSeasons', () => {
+  it("includes each season's own reward tiers in rank order, so the admin page can edit them", async () => {
+    const { svc } = build();
+    const a = await svc.createSeason('admin', ['SUPER_ADMIN'] as any, { name: 'A', startsAt: day(-1), endsAt: day(1) });
+    const b = await svc.createSeason('admin', ['SUPER_ADMIN'] as any, { name: 'B', startsAt: day(5), endsAt: day(10) });
+    await svc.setRewardTiers(a.id, 'admin', ['SUPER_ADMIN'] as any, [
+      { minRank: 2, maxRank: 5, rewardCoins: 200 },
+      { minRank: 1, maxRank: 1, rewardCoins: 5000 },
+    ]);
+    const list = await svc.listSeasons();
+    expect(list.find((s) => s.id === a.id)!.rewardTiers).toEqual([
+      { minRank: 1, maxRank: 1, rewardCoins: 5000 },
+      { minRank: 2, maxRank: 5, rewardCoins: 200 },
+    ]);
+    expect(list.find((s) => s.id === b.id)!.rewardTiers).toEqual([]);
+  });
+
+  it('returns an empty list, without querying tiers, when there are no seasons', async () => {
+    const { svc } = build();
+    expect(await svc.listSeasons()).toEqual([]);
+  });
+
+  it('still reports the derived status for each season', async () => {
+    const { svc } = build();
+    await svc.createSeason('admin', ['SUPER_ADMIN'] as any, { name: 'Live now', startsAt: day(-1), endsAt: day(1) });
+    await svc.createSeason('admin', ['SUPER_ADMIN'] as any, { name: 'Later', startsAt: day(5), endsAt: day(10) });
+    const byName = Object.fromEntries((await svc.listSeasons()).map((s) => [s.name, s.status]));
+    expect(byName['Live now']).toBe('ACTIVE');
+    expect(byName.Later).toBe('SCHEDULED');
   });
 });
 

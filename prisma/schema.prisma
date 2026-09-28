@@ -35,6 +35,10 @@ model User {
   rrydaXp       Int            @default(0)
   rrydaLevel    Int            @default(1)
   oneOnOneEnabled Boolean       @default(true)
+  // First-run flow (pick interests, follow a few people). null = not completed yet. Existing
+  // users are backfilled to their createdAt in the migration so only NEW sign-ups see it.
+  onboardedAt   DateTime?
+  interests     UserInterest[]
   // Nearby discovery is opt-in. Coordinates are intentionally stored rounded by the service
   // before persistence, so the platform does not retain a user's exact GPS position.
   nearbyEnabled Boolean         @default(false)
@@ -1612,4 +1616,68 @@ model HostDailyTaskProgress {
   task        HostDailyTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
   @@unique([userId, taskId, day])
   @@index([userId, day])
+}
+
+
+// ---- Onboarding ------------------------------------------------------------------------------
+// A small curated catalog of interests a new user picks from on first run (same shape as Badge).
+model Interest {
+  key    String         @id
+  label  String
+  emoji  String
+  active Boolean        @default(true)
+  users  UserInterest[]
+}
+
+model UserInterest {
+  id          String   @id @default(uuid())
+  userId      String
+  interestKey String
+  user        User     @relation(fields: [userId], references: [id])
+  interest    Interest @relation(fields: [interestKey], references: [key])
+
+  @@unique([userId, interestKey])
+  @@index([userId])
+}
+
+// ---- Random 1-on-1 video match ---------------------------------------------------------------
+// One row per user currently looking for a match. Pairing is claim-based (see MatchingService),
+// so it stays correct with several backend instances and needs no Redis.
+enum MatchTicketStatus {
+  WAITING
+  MATCHED
+}
+
+model MatchTicket {
+  id              String            @id @default(uuid())
+  userId          String            @unique
+  status          MatchTicketStatus @default(WAITING)
+  countryCode     String
+  sameCountryOnly Boolean           @default(false)
+  sessionId       String?
+  createdAt       DateTime          @default(now())
+  lastSeenAt      DateTime          @default(now())
+
+  @@index([status, createdAt])
+}
+
+enum MatchSessionStatus {
+  ACTIVE
+  ENDED
+}
+
+model MatchSession {
+  id              String             @id @default(uuid())
+  userAId         String
+  userBId         String
+  providerChannel String             @unique
+  status          MatchSessionStatus @default(ACTIVE)
+  aLiked          Boolean            @default(false)
+  bLiked          Boolean            @default(false)
+  endedById       String?
+  createdAt       DateTime           @default(now())
+  endedAt         DateTime?
+
+  @@index([userAId, status])
+  @@index([userBId, status])
 }

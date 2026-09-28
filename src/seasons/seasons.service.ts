@@ -203,10 +203,19 @@ export class SeasonsService {
     return trimmed;
   }
 
+  // Includes each season's reward tiers so the admin page can show and edit them in one call.
   async listSeasons() {
     const now = new Date();
     const rows = await this.prisma.season.findMany({ orderBy: { startsAt: 'desc' } });
-    return rows.map((s) => ({ id: s.id, name: s.name, description: s.description, startsAt: s.startsAt, endsAt: s.endsAt, status: this.deriveStatus(s, now) }));
+    if (rows.length === 0) return [];
+    const allTiers = await this.prisma.seasonRewardTier.findMany({ where: { seasonId: { in: rows.map((s) => s.id) } }, orderBy: { minRank: 'asc' } });
+    const tiersBySeason = new Map<string, typeof allTiers>();
+    for (const t of allTiers) tiersBySeason.set(t.seasonId, [...(tiersBySeason.get(t.seasonId) ?? []), t]);
+    return rows.map((s) => ({
+      id: s.id, name: s.name, description: s.description, startsAt: s.startsAt, endsAt: s.endsAt,
+      status: this.deriveStatus(s, now),
+      rewardTiers: (tiersBySeason.get(s.id) ?? []).map((t) => ({ minRank: t.minRank, maxRank: t.maxRank, rewardCoins: t.rewardCoins })),
+    }));
   }
 
   async createSeason(actorId: string, roles: RoleName[], input: { name: string; description?: string; startsAt: string | Date; endsAt: string | Date }) {

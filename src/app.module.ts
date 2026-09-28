@@ -40,6 +40,8 @@ import { FanClubsModule } from './fan-clubs/fan-clubs.module';
 import { BadgesModule } from './badges/badges.module';
 import { TeamsModule } from './teams/teams.module';
 import { SeasonsModule } from './seasons/seasons.module';
+import { OnboardingModule } from './onboarding/onboarding.module';
+import { MatchingModule } from './matching/matching.module';
 import { ModerationModule } from './moderation/moderation.module';
 import { HealthModule } from './health/health.module';
 import { C2CModule } from './c2c/c2c.module';
@@ -88,6 +90,8 @@ import { RrydaExperienceModule } from './experience/experience.module';
     BadgesModule,
     TeamsModule,
     SeasonsModule,
+    OnboardingModule,
+    MatchingModule,
     ModerationModule,
     HealthModule,
     C2CModule,
