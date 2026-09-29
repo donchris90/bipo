@@ -22,7 +22,7 @@ describe('GiftService', () => {
   }
 
   it('debits the sender, credits the recipient their share, and records the platform share (default 70/30 fallback)', async () => {
-    const { wallet, gifts } = makeService();
+    const { prisma, wallet, gifts } = makeService();
     await wallet.credit({
       userId: 'sender',
       walletType: WalletType.COIN,
@@ -171,5 +171,71 @@ describe('gifts contribute to the sender\'s season points', () => {
     await expect(
       gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'g-2' }),
     ).resolves.toBeDefined();
+  });
+
+  // Regression coverage for a real production bug: RoomSeat had no `giftCoins` column, so this
+  // exact call — issued from inside the same $transaction as the wallet debit/credit and the
+  // GiftTransaction record — threw a Prisma validation error and rolled back the WHOLE gift, not
+  // just a display number. Fixed by adding the column (see the matching migration). FakePrisma
+  // had no roomSeat model at all before this, which is exactly how this path went untested.
+  describe('ROOM-context gifts and the seat gift total', () => {
+    function seatedService() {
+      const prisma = new FakePrisma();
+      const wallet = new WalletService(prisma as any);
+      const gifts = new GiftService(prisma as any, wallet, new RevenueSplitService(prisma as any));
+      prisma.users.set('sender', { id: 'sender', countryCode: 'NG' });
+      prisma.users.set('recipient', { id: 'recipient', countryCode: 'NG' });
+      prisma.gifts.set('rose', { id: 'rose', coinPrice: 100, active: true });
+      prisma.roomSeats.set('room-1:recipient', { roomId: 'room-1', userId: 'recipient', seatNumber: 3, giftCoins: 0 });
+      return { prisma, wallet, gifts };
+    }
+
+    function unseatedService() {
+      const prisma = new FakePrisma();
+      const wallet = new WalletService(prisma as any);
+      const gifts = new GiftService(prisma as any, wallet, new RevenueSplitService(prisma as any));
+      prisma.users.set('sender', { id: 'sender', countryCode: 'NG' });
+      prisma.users.set('recipient', { id: 'recipient', countryCode: 'NG' });
+      prisma.gifts.set('rose', { id: 'rose', coinPrice: 100, active: true });
+      return { prisma, wallet, gifts }; // no seat set up at all
+    }
+
+    it('increments the recipient seat\'s running total by the gift\'s coin price', async () => {
+      const { prisma, wallet, gifts } = seatedService();
+      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+
+      await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', context: 'ROOM' as any, contextId: 'room-1', idempotencyKey: 'g-room-1' });
+
+      expect(prisma.roomSeats.get('room-1:recipient').giftCoins).toBe(100);
+    });
+
+    it('accumulates across repeated gifts in the same sitting', async () => {
+      const { prisma, wallet, gifts } = seatedService();
+      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 300n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+
+      await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', context: 'ROOM' as any, contextId: 'room-1', idempotencyKey: 'g-room-a' });
+      await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', context: 'ROOM' as any, contextId: 'room-1', idempotencyKey: 'g-room-b' });
+
+      expect(prisma.roomSeats.get('room-1:recipient').giftCoins).toBe(200);
+    });
+
+    it('still completes the gift — and does not touch any seat — when the recipient is not actually seated in that room', async () => {
+      const { prisma, wallet, gifts } = unseatedService();
+      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+
+      const tx = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', context: 'ROOM' as any, contextId: 'room-1', idempotencyKey: 'g-room-c' });
+
+      expect(tx).toBeDefined();
+      expect(prisma.roomSeats.size).toBe(0);
+    });
+
+    it('never touches a seat total for a non-ROOM gift, even to the same recipient', async () => {
+      const { prisma, wallet, gifts } = seatedService();
+      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+
+      await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'g-no-context' });
+
+      expect(prisma.roomSeats.get('room-1:recipient').giftCoins).toBe(0);
+    });
   });
 });

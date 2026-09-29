@@ -76,6 +76,7 @@ export class FakePrisma {
 
   pKBattle = {
     findUnique: async () => null, // no PK tests exercise this path here
+    findFirst: async () => null, // same — GiftService.resolvePkBattleId checks this to see if the recipient is in an active PK; no test here puts them in one
   };
 
   agencyMemberships = new Map<string, any>(); // key: creatorId (only one ACTIVE membership per creator, matches the real uniqueness rule)
@@ -96,6 +97,35 @@ export class FakePrisma {
     findFirst: async ({ where }: any) =>
       this.revenueSplitConfigs.find((c) => c.scope === where.scope && (!where.scopeKey || c.scopeKey === where.scopeKey)) ??
       null,
+  };
+
+  // key: `${roomId}:${userId}` — matches the real @@unique([roomId, userId]) on RoomSeat.
+  roomSeats = new Map<string, any>();
+
+  roomSeat = {
+    // Only updateMany is used by the code under test (GiftService.send, for the ROOM-context
+    // per-seat gift total). At most one row can ever match, since (roomId, userId) is unique —
+    // matching zero rows (the recipient isn't actually seated) is a normal no-op, not an error.
+    updateMany: async ({ where, data }: any) => {
+      const key = `${where.roomId}:${where.userId}`;
+      const seat = this.roomSeats.get(key);
+      if (!seat) return { count: 0 };
+      if (data.giftCoins?.increment !== undefined) seat.giftCoins = (seat.giftCoins ?? 0) + data.giftCoins.increment;
+      return { count: 1 };
+    },
+  };
+
+  // Row-locking read used by WalletService.applyMovement (`SELECT ... FOR UPDATE`) before it
+  // debits/credits a balance. There is no concurrency to simulate here — these tests run
+  // sequentially — so this only needs to hand back the wallet's current row. Recognizes the
+  // query by shape (the id is the tagged template's first interpolated value) rather than by
+  // parsing SQL text, since that's all Prisma.sql actually gives us to go on. If a second raw
+  // query is ever added elsewhere, this will need a real dispatch — it deliberately doesn't try
+  // to guess that in advance.
+  $queryRaw = async (query: any) => {
+    const walletId = query?.values?.[0];
+    const wallet = walletId ? [...this.wallets.values()].find((w) => w.id === walletId) : undefined;
+    return wallet ? [{ id: wallet.id, balance: wallet.balance }] : [];
   };
 
   $transaction = async (cb: (tx: any) => Promise<any>) => cb(this);
