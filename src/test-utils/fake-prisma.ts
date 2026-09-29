@@ -85,10 +85,16 @@ export class FakePrisma {
     findFirst: async ({ where, orderBy }: any) => {
       let rows = [...this.pkBattles.values()].filter((b) => {
         if (where.status && b.status !== where.status) return false;
-        if (where.mode && b.mode !== where.mode) return false;
+        if (where.mode) {
+          if (where.mode.in ? !where.mode.in.includes(b.mode) : b.mode !== where.mode) return false;
+        }
         if (where.OR) {
-          const matches = where.OR.some((cond: any) => Object.entries(cond).every(([k, v]) => b[k] === v));
-          if (!matches) return false;
+          const condMatches = (cond: any) =>
+            Object.entries(cond).every(([k, v]: [string, any]) => {
+              if (v && typeof v === 'object' && 'has' in v) return Array.isArray(b[k]) && b[k].includes(v.has);
+              return b[k] === v;
+            });
+          if (!where.OR.some(condMatches)) return false;
         }
         return true;
       });
@@ -96,15 +102,23 @@ export class FakePrisma {
       return rows[0] ?? null;
     },
     create: async ({ data }: any) => {
-      const battle = { id: `battle_${this.pkBattleSeq++}`, scoreChallenger: 0n, scoreOpponent: 0n, status: 'CHALLENGED', createdAt: new Date(), ...data };
+      const battle = { id: `battle_${this.pkBattleSeq++}`, scoreChallenger: 0n, scoreOpponent: 0n, status: 'CHALLENGED', rewardCoinsPaid: false, challengerParticipantIds: [], opponentParticipantIds: [], createdAt: new Date(), ...data };
       this.pkBattles.set(battle.id, battle);
       return battle;
     },
     updateMany: async ({ where, data }: any) => {
-      const rows = [...this.pkBattles.values()].filter((b) => b.id === where.id && (!where.status || b.status === where.status));
+      const rows = [...this.pkBattles.values()].filter((b) => {
+        if (where.id && b.id !== where.id) return false;
+        if (where.status && b.status !== where.status) return false;
+        if (where.rewardCoinsPaid !== undefined && b.rewardCoinsPaid !== where.rewardCoinsPaid) return false;
+        return true;
+      });
       for (const b of rows) {
         if (data.scoreChallenger?.increment !== undefined) b.scoreChallenger = (b.scoreChallenger ?? 0n) + data.scoreChallenger.increment;
         if (data.scoreOpponent?.increment !== undefined) b.scoreOpponent = (b.scoreOpponent ?? 0n) + data.scoreOpponent.increment;
+        if (data.rewardCoinsPaid !== undefined) b.rewardCoinsPaid = data.rewardCoinsPaid;
+        if (data.status !== undefined) b.status = data.status;
+        if (data.winnerId !== undefined) b.winnerId = data.winnerId;
       }
       return { count: rows.length };
     },

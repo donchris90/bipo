@@ -1080,6 +1080,16 @@ model PKBattle {
   // GiftService.resolvePkBattleId / applyPkScore).
   challengerAgencyId String?
   opponentAgencyId   String?
+  // Late-joiner fix: every Team/Agency member's id, captured ONCE when the challenge is created —
+  // never re-derived from live membership. Without this, someone could join a team or agency
+  // mid-battle specifically to add more gifting surface to its score. A gift only pools into this
+  // battle if the recipient's id was ALREADY here at challenge time (see GiftService). Empty for
+  // NORMAL/RANDOM battles, which only ever have their fixed two participants anyway.
+  challengerParticipantIds String[] @default([])
+  opponentParticipantIds   String[] @default([])
+  // Winner reward, paid once at settlement — see PkService.payWinnerReward. Tracks whether it's
+  // been paid so a retried/duplicate settle can never pay twice.
+  rewardCoinsPaid  Boolean   @default(false)
   objectiveConfig  Json?
   durationSec     Int       @default(180)
   createdAt       DateTime  @default(now())
