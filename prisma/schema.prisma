@@ -1081,6 +1081,25 @@ model GameRegionConfig {
   @@unique([gameCode, countryCode])
 }
 
+
+model LudoSpectatorBet {
+  id              String   @id @default(uuid())
+  matchId         String
+  userId          String
+  playerUserId    String
+  coinAmount      Int
+  rewardAmount    Int      @default(0)
+  status          GameEntryStatus @default(PLACED)
+  idempotencyKey  String   @unique
+  createdAt       DateTime @default(now())
+  settledAt       DateTime?
+
+  @@unique([matchId, userId])
+  @@index([matchId])
+  @@index([matchId, playerUserId])
+  @@index([userId])
+}
+
 model GameRound {
   id             String      @id @default(uuid())
   gameCode       String

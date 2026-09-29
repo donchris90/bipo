@@ -62,7 +62,30 @@ export class LudoGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       client.data.matchId = data.matchId;
       client.data.spectator = true;
       client.join(`LUDO:${data.matchId}`);
+      const betStatus = await this.ludo.spectatorBetStatus(client.data.userId!, data.matchId);
+      client.emit('ludo:bet-state', betStatus);
       return state;
+    });
+  }
+
+  @SubscribeMessage('ludo:spectator-bet-status')
+  async spectatorBetStatus(@ConnectedSocket() client: LudoSocket) {
+    if (!client.data.userId || !client.data.matchId || !client.data.spectator) return { error: 'not_watching' };
+    return guard(async () => {
+      const status = await this.ludo.spectatorBetStatus(client.data.userId!, client.data.matchId!);
+      client.emit('ludo:bet-state', status);
+      return status;
+    });
+  }
+
+  @SubscribeMessage('ludo:spectator-bet')
+  async spectatorBet(@MessageBody() data: { playerUserId: string; amount: number }, @ConnectedSocket() client: LudoSocket) {
+    if (!client.data.userId || !client.data.matchId || !client.data.spectator) return { error: 'not_watching' };
+    return guard(async () => {
+      const result = await this.ludo.placeSpectatorBet(client.data.userId!, client.data.matchId!, data.playerUserId, Number(data.amount));
+      const status = await this.ludo.spectatorBetStatus(client.data.userId!, client.data.matchId!);
+      this.server.to(`LUDO:${client.data.matchId}`).emit('ludo:bet-state', status);
+      return result;
     });
   }
 

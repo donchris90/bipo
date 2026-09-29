@@ -8,6 +8,7 @@ import { v4 as uuid } from 'uuid';
 import { ConfigService } from '@nestjs/config';
 import IORedis from 'ioredis';
 import { randomInt } from 'node:crypto';
+import { calculateSpectatorPoolSplit, calculateWinningSpectatorReward } from './ludo-payout';
 import { AUTOPILOT_AFTER_MISSED_TURNS, createLudoState, LudoPlayerState, LudoState, TURN_MS, advanceTurn, applyMove, giveControlBack, handToAi, isAiControlled, legalMoves, pickBotMove, recordFinish, rollForTurn, serverActsAt } from './ludo.rules';
 
 // A search whose app has not checked in for this long is treated as abandoned (the app polls every 2 s).
@@ -635,6 +636,55 @@ export class LudoService implements OnModuleDestroy {
     });
   }
 
+  async spectatorBetStatus(userId: string, matchId: string) {
+    const room = await this.findRoomByMatchId(matchId);
+    if (!room?.partyRoomId) throw new NotFoundException('This Ludo match is not in a Party Room');
+    await this.assertPartyLudoViewer(userId, room.partyRoomId);
+    const state = await this.getState(matchId);
+    const [myBet, aggregate] = await Promise.all([
+      this.prisma.ludoSpectatorBet.findUnique({ where: { matchId_userId: { matchId, userId } }, select: { id: true, playerUserId: true, coinAmount: true, rewardAmount: true, status: true } }),
+      this.prisma.ludoSpectatorBet.groupBy({ by: ['playerUserId'], where: { matchId }, _sum: { coinAmount: true } }),
+    ]);
+    const playerPool = aggregate.reduce((sum, row) => sum + (row._sum.coinAmount ?? 0), 0);
+    const playerBets = Object.fromEntries(aggregate.map(row => [row.playerUserId, row._sum.coinAmount ?? 0]));
+    return { matchId, status: state.status, playerPool, playerBets, myBet };
+  }
+
+  async placeSpectatorBet(userId: string, matchId: string, playerUserId: string, amount: number) {
+    const room = await this.findRoomByMatchId(matchId);
+    if (!room?.partyRoomId) throw new NotFoundException('This Ludo match is not in a Party Room');
+    await this.assertPartyLudoViewer(userId, room.partyRoomId);
+    const state = await this.getState(matchId);
+    if (state.status !== 'ACTIVE') throw new BadRequestException('Spectator betting is closed for this match');
+    if (!Number.isInteger(amount) || amount < 10 || amount > 500000) throw new BadRequestException('Bet must be between 10 and 500000 coins');
+    const player = state.players.find(p => p.userId === playerUserId);
+    if (!player) throw new BadRequestException('That player is not in this match');
+    if (state.players.some(p => p.userId === userId)) throw new BadRequestException('Players cannot bet on the match as spectators');
+    if (player.bot || player.synthetic) throw new BadRequestException('You can only bet on a human player');
+
+    const idempotencyKey = `ludo_spectator_bet:${matchId}:${userId}`;
+    const bet = await this.prisma.$transaction(async tx => {
+      const existing = await tx.ludoSpectatorBet.findUnique({ where: { matchId_userId: { matchId, userId } } });
+      if (existing) throw new BadRequestException('You already placed a spectator bet on this match');
+      const created = await tx.ludoSpectatorBet.create({
+        data: { matchId, userId, playerUserId, coinAmount: amount, idempotencyKey },
+      });
+      await this.wallet.debit({ userId, walletType: WalletType.COIN, amount: BigInt(amount), ledgerType: LedgerEntryType.GAME_ENTRY, reference: created.id, idempotencyKey: `ludo_spectator_debit:${created.id}` }, tx);
+      return created;
+    });
+
+    const status = await this.spectatorBetStatus(userId, matchId);
+    return { bet: { id: bet.id, playerUserId: bet.playerUserId, coinAmount: bet.coinAmount, status: bet.status }, ...status };
+  }
+
+  private async assertPartyLudoViewer(userId: string, partyRoomId: string) {
+    const party = await this.prisma.partyRoom.findUnique({ where: { id: partyRoomId }, select: { hostId: true, status: true, privacy: true } });
+    if (!party || party.status !== 'OPEN') throw new BadRequestException('Party room is closed');
+    if (party.hostId === userId || party.privacy === 'PUBLIC') return;
+    const seat = await this.prisma.roomSeat.findFirst({ where: { roomId: partyRoomId, userId }, select: { id: true } });
+    if (!seat) throw new BadRequestException('Join this Party Room before betting on its Ludo game');
+  }
+
   private async finishMatch(state: LudoState) {
     if (state.status === 'FINISHED') return;
     state.status = 'FINISHED';
@@ -656,10 +706,37 @@ export class LudoService implements OnModuleDestroy {
       await this.prisma.gameRound.update({ where: { id: state.matchId }, data: { status: 'SETTLED', result: { winnerUserId: state.winnerUserId, practice: true } as any, settledAt: new Date(), hiddenState: state as any } });
       return;
     }
+    const spectatorBets = await this.prisma.ludoSpectatorBet.findMany({ where: { matchId: state.matchId, status: 'PLACED' } });
+    const spectatorPool = spectatorBets.reduce((sum, bet) => sum + bet.coinAmount, 0);
+    const spectatorSplit = calculateSpectatorPoolSplit(spectatorPool);
+    const winningSpectatorStake = state.winnerUserId
+      ? spectatorBets.filter(bet => bet.playerUserId === state.winnerUserId).reduce((sum, bet) => sum + bet.coinAmount, 0)
+      : 0;
+
     const payouts = new Map<string, number>();
     if (state.winnerUserId) payouts.set(state.winnerUserId, state.prizeFirst);
     if (state.secondPlaceUserId) payouts.set(state.secondPlaceUserId, state.prizeSecond);
     await this.prisma.$transaction(async tx => {
+      if (state.winnerUserId && spectatorPool > 0 && spectatorBets.length > 0) {
+        if (spectatorSplit.winner > 0) {
+          const winnerEntry = await tx.gameEntry.findFirst({ where: { roundId: state.matchId, userId: state.winnerUserId, status: { in: ['PLACED', 'WON'] } }, select: { id: true } });
+          if (winnerEntry) {
+            await this.wallet.credit({ userId: state.winnerUserId, walletType: WalletType.COIN, amount: BigInt(spectatorSplit.winner), ledgerType: LedgerEntryType.GAME_REWARD, reference: winnerEntry.id, idempotencyKey: `ludo_spectator_winner:${state.matchId}` }, tx);
+          }
+        }
+        for (const bet of spectatorBets) {
+          const reward = bet.playerUserId === state.winnerUserId && winningSpectatorStake > 0
+            ? calculateWinningSpectatorReward(spectatorSplit.spectators, bet.coinAmount, winningSpectatorStake)
+            : 0;
+          if (reward > 0) {
+            await this.wallet.credit({ userId: bet.userId, walletType: WalletType.COIN, amount: BigInt(reward), ledgerType: LedgerEntryType.GAME_REWARD, reference: bet.id, idempotencyKey: `ludo_spectator_reward:${bet.id}` }, tx);
+          }
+          await tx.ludoSpectatorBet.update({ where: { id: bet.id }, data: { status: reward > 0 ? 'WON' : 'LOST', rewardAmount: reward, settledAt: new Date() } });
+        }
+      } else {
+        await tx.ludoSpectatorBet.updateMany({ where: { matchId: state.matchId, status: 'PLACED' }, data: { status: 'LOST', rewardAmount: 0, settledAt: new Date() } });
+      }
+
       for (const [userId, amount] of payouts) {
         const entry = await tx.gameEntry.findFirst({ where: { roundId: state.matchId, userId, status: 'PLACED' } });
         if (!entry) continue;
@@ -669,7 +746,7 @@ export class LudoService implements OnModuleDestroy {
         await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'WON', rewardAmount: amount } });
       }
       await tx.gameEntry.updateMany({ where: { roundId: state.matchId, status: 'PLACED' }, data: { status: 'LOST', rewardAmount: 0 } });
-      await tx.gameRound.update({ where: { id: state.matchId }, data: { status: 'SETTLED', result: { winnerUserId: state.winnerUserId, secondPlaceUserId: state.secondPlaceUserId, prizeFirst: state.prizeFirst, prizeSecond: state.prizeSecond }, settledAt: new Date(), hiddenState: state as any } });
+      await tx.gameRound.update({ where: { id: state.matchId }, data: { status: 'SETTLED', result: { winnerUserId: state.winnerUserId, secondPlaceUserId: state.secondPlaceUserId, prizeFirst: state.prizeFirst, prizeSecond: state.prizeSecond, spectatorPool, spectatorPlatformShare: spectatorSplit.platform, spectatorWinnerShare: spectatorSplit.winner, spectatorWinningPool: spectatorSplit.spectators }, settledAt: new Date(), hiddenState: state as any } });
     });
   }
 
