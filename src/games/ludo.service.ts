@@ -16,11 +16,14 @@ const STALE_TICKET_MS = 20_000;
 // How long Quick Match looks for other people before filling the seats with bots, unless the
 // game's rulesJson.botFillSeconds says otherwise (0 switches bot matches off).
 const DEFAULT_BOT_FILL_SECONDS = 20;
-const BOT_NAMES = ['Ava', 'Max', 'Zara', 'Leo', 'Nia', 'Kai'];
+const PARTY_BROADCAST_AFTER_MS = 60_000;
+const PARTY_BOT_FILL_AFTER_MS = 120_000;
+const PARTY_LOBBY_INDEX = 'ludo:party:lobbies';
+const BOT_FIRST_NAMES = ['Daniel', 'Maya', 'Chris', 'Sophia', 'Jayden', 'Amara', 'Kevin', 'Lina', 'Marcus', 'Zoe', 'Ryan', 'Nora', 'Ethan', 'Aisha', 'Noah', 'Ella'];
 
 interface QueueItem { userId: string; displayName: string; entryFee: number; playerCount: 2 | 4; ticket?: string; synthetic?: boolean; }
 interface QuickTicket { ticket: string; userId: string; entryFee: number; playerCount: 2 | 4; status: 'WAITING' | 'STARTED' | 'CANCELLED'; matchId?: string; roomCode?: string; players?: number; state?: LudoState; createdAt: string; lastSeenAt?: number; }
-interface Room { matchId: string; roomCode: string; entryFee: number; playerCount: 2 | 4; players: QueueItem[]; creatorId: string; started: boolean; partyRoomId?: string; }
+interface Room { matchId: string; roomCode: string; entryFee: number; playerCount: 2 | 4; players: QueueItem[]; creatorId: string; started: boolean; partyRoomId?: string; createdAt?: number; globalInviteSentAt?: number; }
 interface LudoInvite {
   id: string; matchId: string; roomCode: string; fromUserId: string; toUserId: string; createdAt: string; expiresAt: string;
   // So the invite can say how much is staked and by whom without the client having to look the room up separately.
@@ -248,7 +251,7 @@ export class LudoService implements OnModuleDestroy {
       if (!humans.some(h => h.userId === userId)) throw new BadRequestException('Insufficient balance');
 
       const bots: QueueItem[] = Array.from({ length: data.playerCount - humans.length }, (_, i) => ({
-        userId: `bot:${uuid()}`, displayName: `${BOT_NAMES[(i + Math.floor(Math.random() * BOT_NAMES.length)) % BOT_NAMES.length]} (AI)`,
+        userId: `bot:${uuid()}`, displayName: `${BOT_FIRST_NAMES[(i + Math.floor(Math.random() * BOT_FIRST_NAMES.length)) % BOT_FIRST_NAMES.length]}_${randomInt(10, 100)}`,
         entryFee: paid ? data.entryFee : 0, playerCount: data.playerCount, synthetic: true,
       }));
       const started = await this.startMatch([...humans, ...bots], undefined, { practice: !paid });
@@ -318,6 +321,10 @@ export class LudoService implements OnModuleDestroy {
     return { status: ticket.status, ticket: ticket.ticket, matchId: ticket.matchId, roomCode: ticket.roomCode, players: ticket.players ?? 0, playerCount: ticket.playerCount, state: ticket.state };
   }
 
+  private broadcastGlobalLudoClosed(matchId: string) {
+    this.realtime.broadcastGlobal('ludo:global-invite-closed', { matchId });
+  }
+
   private broadcastPartyLudo(room: Room | undefined, action: 'STARTED' | 'WAITING' | 'UPDATED' | 'FINISHED') {
     if (!room?.partyRoomId) return;
     this.realtime.broadcastRoomState(room.partyRoomId, {
@@ -334,6 +341,97 @@ export class LudoService implements OnModuleDestroy {
     });
   }
 
+  /**
+   * Server-side Party Ludo lobby clock. Called every second by LudoGateway so
+   * the countdown cannot be manipulated by a mobile client.
+   *
+   * At 60s, any under-filled lobby gets the Rryda-wide invitation. At 120s, any still-short lobby is completed with synthetic
+   * players. The synthetic flag remains internal; their public names look like
+   * ordinary usernames and never contain "AI" or "BOT".
+   */
+  async tickPartyLobbies() {
+    const now = Date.now();
+    let codes: string[] = [];
+    try { codes = await this.redis.zrangebyscore(PARTY_LOBBY_INDEX, 0, now); } catch { return; }
+
+    for (const code of codes) {
+      const room = await this.readRoom(code);
+      if (!room?.partyRoomId || room.started) {
+        await this.redis.zrem(PARTY_LOBBY_INDEX, code).catch(() => undefined);
+        continue;
+      }
+
+      const createdAt = room.createdAt ?? now;
+      const age = now - createdAt;
+
+      if (age >= PARTY_BROADCAST_AFTER_MS && age < PARTY_BOT_FILL_AFTER_MS && room.players.length < room.playerCount && !room.globalInviteSentAt) {
+        room.globalInviteSentAt = now;
+        await this.writeRoom(room);
+        this.realtime.broadcastGlobal('ludo:global-invite', {
+          type: 'PARTY_LUDO_OPEN',
+          partyRoomId: room.partyRoomId,
+          matchId: room.matchId,
+          roomCode: room.roomCode,
+          entryFee: room.entryFee,
+          playerCount: room.playerCount,
+          players: room.players.length,
+          expiresAt: new Date(createdAt + PARTY_BOT_FILL_AFTER_MS).toISOString(),
+        }, room.creatorId);
+      }
+
+      if (age >= PARTY_BOT_FILL_AFTER_MS && room.players.length < room.playerCount) {
+        await this.fillPartyLobbyWithBots(room);
+      }
+    }
+  }
+
+  private randomBotDisplayNames(count: number, existingNames: string[] = []): string[] {
+    const used = new Set(existingNames.map((name) => name.trim().toLowerCase()).filter(Boolean));
+    const result: string[] = [];
+    let attempts = 0;
+    while (result.length < count && attempts++ < 1000) {
+      const first = BOT_FIRST_NAMES[randomInt(BOT_FIRST_NAMES.length)];
+      const name = `${first}_${randomInt(10, 100)}`;
+      const key = name.toLowerCase();
+      if (used.has(key)) continue;
+      used.add(key);
+      result.push(name);
+    }
+    while (result.length < count) result.push(`Player_${randomInt(1000, 10000)}`);
+    return result;
+  }
+
+  private async fillPartyLobbyWithBots(room: Room) {
+    const lockKey = `ludo:party-fill:${room.matchId}`;
+    const lockToken = uuid();
+    const locked = await this.redis.set(lockKey, lockToken, 'PX', 8000, 'NX').catch(() => null);
+    if (!locked) return;
+    try {
+      const current = await this.readRoom(room.roomCode);
+      if (!current || current.started || current.players.length >= current.playerCount) {
+        if (!current || current.started || current.players.length >= current.playerCount) await this.redis.zrem(PARTY_LOBBY_INDEX, room.roomCode).catch(() => undefined);
+        return;
+      }
+      const names = this.randomBotDisplayNames(current.playerCount - current.players.length, current.players.map((p) => p.displayName));
+      const bots: QueueItem[] = names.map((displayName) => ({
+        userId: `bot:${uuid()}`,
+        displayName,
+        entryFee: current.entryFee,
+        playerCount: current.playerCount,
+        synthetic: true,
+      }));
+      current.players.push(...bots);
+      current.started = true;
+      await this.writeRoom(current);
+      this.broadcastGlobalLudoClosed(current.matchId);
+      this.broadcastPartyLudo(current, 'STARTED');
+      await this.startMatch(current.players, current);
+    } finally {
+      const currentLock = await this.redis.get(lockKey).catch(() => null);
+      if (currentLock === lockToken) await this.redis.del(lockKey).catch(() => undefined);
+    }
+  }
+
   async createRoom(userId: string, displayName: string, entryFee: number, playerCount: 2 | 4, countryCode = 'NG', partyRoomId?: string) {
     const game = await this.ensureDefinition();
     await this.rounds.assertGameAvailable('LUDO', countryCode);
@@ -343,8 +441,11 @@ export class LudoService implements OnModuleDestroy {
     await this.requireBalance(userId, entryFee);
     const matchId = uuid();
     const roomCode = this.makeRoomCode();
-    const room: Room = { matchId, roomCode, entryFee, playerCount, players: [{ userId, displayName, entryFee, playerCount }], creatorId: userId, started: false, partyRoomId };
-    if (partyRoomId) await this.redis.set(`ludo:party:${partyRoomId}`, roomCode, 'EX', 3600).catch(() => undefined);
+    const room: Room = { matchId, roomCode, entryFee, playerCount, players: [{ userId, displayName, entryFee, playerCount }], creatorId: userId, started: false, partyRoomId, createdAt: Date.now() };
+    if (partyRoomId) {
+      await this.redis.set(`ludo:party:${partyRoomId}`, roomCode, 'EX', 3600).catch(() => undefined);
+      await this.redis.zadd(PARTY_LOBBY_INDEX, room.createdAt!, roomCode).catch(() => undefined);
+    }
     this.rooms.set(roomCode, room);
     await this.writeRoom(room);
     this.broadcastPartyLudo(room, 'WAITING');
@@ -430,6 +531,7 @@ export class LudoService implements OnModuleDestroy {
     await this.requireBalance(userId, room.entryFee);
     room.players.push({ userId, displayName, entryFee: room.entryFee, playerCount: room.playerCount });
     this.rooms.set(room.roomCode, room);
+    if (room.globalInviteSentAt) this.broadcastGlobalLudoClosed(room.matchId);
     await this.writeRoom(room);
     this.broadcastPartyLudo(room, 'WAITING');
     return this.startIfReady(room);
@@ -438,6 +540,7 @@ export class LudoService implements OnModuleDestroy {
   private async startIfReady(room: Room) {
     if (room.players.length < room.playerCount) return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount };
     room.started = true;
+    this.broadcastGlobalLudoClosed(room.matchId);
     this.rooms.set(room.roomCode, room);
     await this.writeRoom(room);
     this.broadcastPartyLudo(room, 'STARTED');
@@ -695,6 +798,7 @@ export class LudoService implements OnModuleDestroy {
     if (partyRoom?.partyRoomId) {
       this.broadcastPartyLudo(partyRoom, 'FINISHED');
       await this.redis.del(`ludo:party:${partyRoom.partyRoomId}`).catch(() => undefined);
+      await this.redis.zrem(PARTY_LOBBY_INDEX, partyRoom.roomCode).catch(() => undefined);
     }
     // Keep the result around briefly for late polls, then free the memory.
     const evict = setTimeout(() => this.states.delete(state.matchId), 10 * 60_000);
@@ -777,11 +881,13 @@ export class LudoService implements OnModuleDestroy {
     if (!room.started) {
       this.rooms.delete(room.roomCode);
       await this.redis.del(this.roomKey(room.roomCode)).catch(() => undefined);
+      this.broadcastGlobalLudoClosed(room.matchId);
       this.broadcastPartyLudo(room, 'FINISHED');
       return;
     }
     // Already running with real stakes: leave the match itself untouched, just stop pointing the
     // (now-closed) Party Room at it.
+    this.broadcastGlobalLudoClosed(room.matchId);
     this.broadcastPartyLudo(room, 'FINISHED');
   }
 
@@ -793,7 +899,13 @@ export class LudoService implements OnModuleDestroy {
     this.queues.set(key, queue);
     try { if (queue.length) await this.redis.set(this.queueRedisKey(key), JSON.stringify(queue), 'EX', 600); else await this.redis.del(this.queueRedisKey(key)); } catch {}
   }
-  private async writeRoom(room: Room) { try { await this.redis.set(this.roomKey(room.roomCode), JSON.stringify(room), 'EX', 3600); } catch {} }
+  private async writeRoom(room: Room) {
+    try {
+      await this.redis.set(this.roomKey(room.roomCode), JSON.stringify(room), 'EX', 3600);
+      if (room.partyRoomId && !room.started) await this.redis.zadd(PARTY_LOBBY_INDEX, room.createdAt ?? Date.now(), room.roomCode);
+      if (room.started) await this.redis.zrem(PARTY_LOBBY_INDEX, room.roomCode);
+    } catch {}
+  }
   private async findRoomByMatchId(matchId: string): Promise<Room | undefined> {
     for (const room of this.rooms.values()) if (room.matchId === matchId) return room;
     const key = 'ludo:room:*';

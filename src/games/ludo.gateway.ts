@@ -26,6 +26,7 @@ export class LudoGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       try {
         const states = await this.ludo.tickActiveMatches();
         for (const state of states) this.server?.to(`LUDO:${state.matchId}`).emit('ludo:state', state);
+        await this.ludo.tickPartyLobbies();
       } catch { /* try again next second */ } finally { this.ticking = false; }
     }, 1000);
   }
