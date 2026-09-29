@@ -258,9 +258,8 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
 
   // App-wide ephemeral announcements. Every authenticated socket receives the
   // event, regardless of which screen or live/room context they are currently in.
-  broadcastGlobal(event: string, payload: unknown, excludeUserId?: string) {
-    const target = excludeUserId ? this.server.except(`user:${excludeUserId}`) : this.server;
-    target.emit(event, payload);
+  broadcastGlobal(event: string, payload: unknown) {
+    this.server.emit(event, payload);
   }
 
   // The host ended the live (or the reaper did). Viewers show the "live has

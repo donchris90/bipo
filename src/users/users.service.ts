@@ -163,8 +163,8 @@ export class UsersService {
   // shouldn't have to resend an unchanged displayName. avatarUrl is trusted
   // as already-uploaded rather than a file this endpoint receives itself;
   // this only ever stores the resulting URL string. A blank bio clears it.
-  async updateMe(userId: string, updates: { displayName?: string; avatarUrl?: string; bio?: string; oneOnOneEnabled?: boolean; languageCode?: string }) {
-    const data: { displayName?: string; avatarUrl?: string | null; bio?: string | null; oneOnOneEnabled?: boolean; languageCode?: string } = {};
+  async updateMe(userId: string, updates: { displayName?: string; avatarUrl?: string; coverUrl?: string; bio?: string; oneOnOneEnabled?: boolean; languageCode?: string }) {
+    const data: { displayName?: string; avatarUrl?: string | null; coverUrl?: string | null; bio?: string | null; oneOnOneEnabled?: boolean; languageCode?: string } = {};
 
     if (updates.displayName !== undefined) {
       const trimmed = updates.displayName.trim();
@@ -180,6 +180,14 @@ export class UsersService {
         throw new BadRequestException('avatarUrl must be a valid http(s) URL');
       }
       data.avatarUrl = trimmed || null;
+    }
+
+    if (updates.coverUrl !== undefined) {
+      const trimmed = updates.coverUrl.trim();
+      if (trimmed && !/^https?:\/\//.test(trimmed)) {
+        throw new BadRequestException('coverUrl must be a valid http(s) URL');
+      }
+      data.coverUrl = trimmed || null;
     }
 
     if (updates.bio !== undefined) {

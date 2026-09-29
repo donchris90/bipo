@@ -74,62 +74,9 @@ export class FakePrisma {
     },
   };
 
-  // key: battle id. Real enough to test resolvePkBattleId / applyPkScore end-to-end — direct
-  // 1v1, Team, and Agency modes all resolve through the same findFirst/create/updateMany shape
-  // the real code uses.
-  pkBattles = new Map<string, any>();
-  private pkBattleSeq = 0;
-
   pKBattle = {
-    findUnique: async ({ where: { id } }: any) => this.pkBattles.get(id) ?? null,
-    findFirst: async ({ where, orderBy }: any) => {
-      let rows = [...this.pkBattles.values()].filter((b) => {
-        if (where.status && b.status !== where.status) return false;
-        if (where.mode && b.mode !== where.mode) return false;
-        if (where.OR) {
-          const matches = where.OR.some((cond: any) => Object.entries(cond).every(([k, v]) => b[k] === v));
-          if (!matches) return false;
-        }
-        return true;
-      });
-      if (orderBy?.startedAt === 'desc') rows = rows.sort((a, b) => (b.startedAt?.getTime() ?? 0) - (a.startedAt?.getTime() ?? 0));
-      return rows[0] ?? null;
-    },
-    create: async ({ data }: any) => {
-      const battle = { id: `battle_${this.pkBattleSeq++}`, scoreChallenger: 0n, scoreOpponent: 0n, status: 'CHALLENGED', createdAt: new Date(), ...data };
-      this.pkBattles.set(battle.id, battle);
-      return battle;
-    },
-    updateMany: async ({ where, data }: any) => {
-      const rows = [...this.pkBattles.values()].filter((b) => b.id === where.id && (!where.status || b.status === where.status));
-      for (const b of rows) {
-        if (data.scoreChallenger?.increment !== undefined) b.scoreChallenger = (b.scoreChallenger ?? 0n) + data.scoreChallenger.increment;
-        if (data.scoreOpponent?.increment !== undefined) b.scoreOpponent = (b.scoreOpponent ?? 0n) + data.scoreOpponent.increment;
-      }
-      return { count: rows.length };
-    },
-  };
-
-  pKScoreConfig = {
-    findFirst: async () => null, // no test here overrides the default 1-coin-per-point rate
-  };
-
-  // key: userId — a user is on at most one team, matching the real uniqueness rule.
-  teamMembers = new Map<string, any>();
-  teamMember = {
-    findUnique: async ({ where: { userId } }: any) => this.teamMembers.get(userId) ?? null,
-  };
-
-  // key: sessionId
-  liveSessions = new Map<string, any>();
-  liveSession = {
-    findFirst: async ({ where }: any) => {
-      const s = this.liveSessions.get(where.id);
-      if (!s) return null;
-      if (where.hostId && s.hostId !== where.hostId) return null;
-      if (where.status && s.status !== where.status) return null;
-      return s;
-    },
+    findUnique: async () => null, // no PK tests exercise this path here
+    findFirst: async () => null, // same — GiftService.resolvePkBattleId checks this to see if the recipient is in an active PK; no test here puts them in one
   };
 
   agencyMemberships = new Map<string, any>(); // key: creatorId (only one ACTIVE membership per creator, matches the real uniqueness rule)
@@ -144,12 +91,6 @@ export class FakePrisma {
 
   agency = {
     findUnique: async ({ where: { id } }: any) => this.agencies.get(id) ?? null,
-    // Only ever queried by ownerId here (agency ownership check for Family PK) — not a general
-    // filter, matches exactly what GiftService/PkService actually ask for.
-    findFirst: async ({ where }: any) => {
-      const a = [...this.agencies.values()].find((a) => a.ownerId === where.ownerId);
-      return a && (!where.status || a.status === where.status) ? a : null;
-    },
   };
 
   revenueSplitConfig = {

@@ -321,10 +321,6 @@ export class LudoService implements OnModuleDestroy {
     return { status: ticket.status, ticket: ticket.ticket, matchId: ticket.matchId, roomCode: ticket.roomCode, players: ticket.players ?? 0, playerCount: ticket.playerCount, state: ticket.state };
   }
 
-  private broadcastGlobalLudoClosed(matchId: string) {
-    this.realtime.broadcastGlobal('ludo:global-invite-closed', { matchId });
-  }
-
   private broadcastPartyLudo(room: Room | undefined, action: 'STARTED' | 'WAITING' | 'UPDATED' | 'FINISHED') {
     if (!room?.partyRoomId) return;
     this.realtime.broadcastRoomState(room.partyRoomId, {
@@ -345,7 +341,8 @@ export class LudoService implements OnModuleDestroy {
    * Server-side Party Ludo lobby clock. Called every second by LudoGateway so
    * the countdown cannot be manipulated by a mobile client.
    *
-   * At 60s, any under-filled lobby gets the Rryda-wide invitation. At 120s, any still-short lobby is completed with synthetic
+   * At 60s, only a lobby that still has just its creator gets the Rryda-wide
+   * invitation. At 120s, any still-short lobby is completed with synthetic
    * players. The synthetic flag remains internal; their public names look like
    * ordinary usernames and never contain "AI" or "BOT".
    */
@@ -364,7 +361,7 @@ export class LudoService implements OnModuleDestroy {
       const createdAt = room.createdAt ?? now;
       const age = now - createdAt;
 
-      if (age >= PARTY_BROADCAST_AFTER_MS && age < PARTY_BOT_FILL_AFTER_MS && room.players.length < room.playerCount && !room.globalInviteSentAt) {
+      if (age >= PARTY_BROADCAST_AFTER_MS && age < PARTY_BOT_FILL_AFTER_MS && room.players.length === 1 && !room.globalInviteSentAt) {
         room.globalInviteSentAt = now;
         await this.writeRoom(room);
         this.realtime.broadcastGlobal('ludo:global-invite', {
@@ -376,7 +373,7 @@ export class LudoService implements OnModuleDestroy {
           playerCount: room.playerCount,
           players: room.players.length,
           expiresAt: new Date(createdAt + PARTY_BOT_FILL_AFTER_MS).toISOString(),
-        }, room.creatorId);
+        });
       }
 
       if (age >= PARTY_BOT_FILL_AFTER_MS && room.players.length < room.playerCount) {
@@ -385,20 +382,14 @@ export class LudoService implements OnModuleDestroy {
     }
   }
 
-  private randomBotDisplayNames(count: number, existingNames: string[] = []): string[] {
-    const used = new Set(existingNames.map((name) => name.trim().toLowerCase()).filter(Boolean));
-    const result: string[] = [];
-    let attempts = 0;
-    while (result.length < count && attempts++ < 1000) {
+  private randomBotDisplayNames(count: number): string[] {
+    const used = new Set<string>();
+    while (used.size < count) {
       const first = BOT_FIRST_NAMES[randomInt(BOT_FIRST_NAMES.length)];
       const name = `${first}_${randomInt(10, 100)}`;
-      const key = name.toLowerCase();
-      if (used.has(key)) continue;
-      used.add(key);
-      result.push(name);
+      if (!used.has(name)) used.add(name);
     }
-    while (result.length < count) result.push(`Player_${randomInt(1000, 10000)}`);
-    return result;
+    return [...used];
   }
 
   private async fillPartyLobbyWithBots(room: Room) {
@@ -412,7 +403,7 @@ export class LudoService implements OnModuleDestroy {
         if (!current || current.started || current.players.length >= current.playerCount) await this.redis.zrem(PARTY_LOBBY_INDEX, room.roomCode).catch(() => undefined);
         return;
       }
-      const names = this.randomBotDisplayNames(current.playerCount - current.players.length, current.players.map((p) => p.displayName));
+      const names = this.randomBotDisplayNames(current.playerCount - current.players.length);
       const bots: QueueItem[] = names.map((displayName) => ({
         userId: `bot:${uuid()}`,
         displayName,
@@ -423,7 +414,6 @@ export class LudoService implements OnModuleDestroy {
       current.players.push(...bots);
       current.started = true;
       await this.writeRoom(current);
-      this.broadcastGlobalLudoClosed(current.matchId);
       this.broadcastPartyLudo(current, 'STARTED');
       await this.startMatch(current.players, current);
     } finally {
@@ -531,7 +521,6 @@ export class LudoService implements OnModuleDestroy {
     await this.requireBalance(userId, room.entryFee);
     room.players.push({ userId, displayName, entryFee: room.entryFee, playerCount: room.playerCount });
     this.rooms.set(room.roomCode, room);
-    if (room.globalInviteSentAt) this.broadcastGlobalLudoClosed(room.matchId);
     await this.writeRoom(room);
     this.broadcastPartyLudo(room, 'WAITING');
     return this.startIfReady(room);
@@ -540,7 +529,6 @@ export class LudoService implements OnModuleDestroy {
   private async startIfReady(room: Room) {
     if (room.players.length < room.playerCount) return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount };
     room.started = true;
-    this.broadcastGlobalLudoClosed(room.matchId);
     this.rooms.set(room.roomCode, room);
     await this.writeRoom(room);
     this.broadcastPartyLudo(room, 'STARTED');
@@ -881,13 +869,11 @@ export class LudoService implements OnModuleDestroy {
     if (!room.started) {
       this.rooms.delete(room.roomCode);
       await this.redis.del(this.roomKey(room.roomCode)).catch(() => undefined);
-      this.broadcastGlobalLudoClosed(room.matchId);
       this.broadcastPartyLudo(room, 'FINISHED');
       return;
     }
     // Already running with real stakes: leave the match itself untouched, just stop pointing the
     // (now-closed) Party Room at it.
-    this.broadcastGlobalLudoClosed(room.matchId);
     this.broadcastPartyLudo(room, 'FINISHED');
   }
 
