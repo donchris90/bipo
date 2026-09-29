@@ -275,6 +275,17 @@ export class GiftService {
         );
       }
 
+      // Party seats display the gift value received during the current seat
+      // session. The RoomSeat row is deleted when the guest leaves, so the
+      // next visit starts from zero while the room-wide gift total remains
+      // cumulative in GiftTransaction.
+      if (params.context === 'ROOM' && params.contextId) {
+        await tx.roomSeat.updateMany({
+          where: { roomId: params.contextId, userId: params.recipientId },
+          data: { giftCoins: { increment: coinAmount } },
+        });
+      }
+
       return tx.giftTransaction.create({
         data: {
           senderId: params.senderId,

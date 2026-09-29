@@ -15,7 +15,6 @@ import { ModerationService } from '../moderation/moderation.service';
 import { ChatContext } from '@prisma/client';
 import { isBlockedEitherWay } from '../common/blocks';
 import { publicName } from '../common/public-name';
-import type { EntrancePayload } from '../economy/entrance';
 import { topBadgeFor } from '../badges/badge-lookup';
 
 interface AuthedSocket extends Socket {
@@ -234,45 +233,18 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
 
   // VIP entrance banner. Ephemeral by design: only people currently watching this live
   // should see it; it is not persisted as chat history.
-  broadcastLiveEntrance(sessionId: string, payload: EntrancePayload) {
-    const room = `LIVE:${sessionId}`;
-    if (!this.shouldPlayEntrance(payload.userId, room)) return;
-    this.server.to(room).emit('live:vip_entrance', payload);
-    // Only the bigger entrances also leave a line in chat; the slim WELCOME chip is enough on its own.
-    if (payload.presentation >= 2) {
-      this.server.to(room).emit('chat:message', {
-        id: `vip:${payload.userId}:${Date.now()}`,
-        senderId: 'system',
-        senderName: null,
-        content: payload.message,
-        createdAt: new Date().toISOString(),
-        system: true,
-        vipEntrance: true,
-        userId: payload.userId,
-      });
-    }
-  }
-
-  // The same entrance, for Party rooms. Reuses the 'live:vip_entrance' event name on purpose so one
-  // client handler and one overlay serve both. Rooms already post their own "X joined" chat line,
-  // so nothing extra is written to chat here.
-  broadcastRoomEntrance(roomId: string, payload: EntrancePayload) {
-    const room = `ROOM:${roomId}`;
-    if (!this.shouldPlayEntrance(payload.userId, room)) return;
-    this.server.to(room).emit('live:vip_entrance', payload);
-  }
-
-  // The join endpoints are also hit when an RTC token refreshes and when a phone reconnects; without
-  // this the same VIP would "arrive" again every few minutes. One entrance per person per room per
-  // 5 minutes.
-  private readonly lastEntrance = new Map<string, number>();
-  private shouldPlayEntrance(userId: string, room: string, now = Date.now()): boolean {
-    const key = `${userId}|${room}`;
-    const last = this.lastEntrance.get(key);
-    if (last !== undefined && now - last < 300_000) return false;
-    this.lastEntrance.set(key, now);
-    if (this.lastEntrance.size > 5000) for (const [k, t] of this.lastEntrance) if (now - t > 300_000) this.lastEntrance.delete(k);
-    return true;
+  broadcastLiveEntrance(sessionId: string, payload: { userId: string; displayName: string | null; avatarUrl: string | null; tier: string; level: number; message: string }) {
+    this.server.to(`LIVE:${sessionId}`).emit('live:vip_entrance', payload);
+    this.server.to(`LIVE:${sessionId}`).emit('chat:message', {
+      id: `vip:${payload.userId}:${Date.now()}`,
+      senderId: 'system',
+      senderName: null,
+      content: payload.message,
+      createdAt: new Date().toISOString(),
+      system: true,
+      vipEntrance: true,
+      userId: payload.userId,
+    });
   }
 
   // The host's shared video changed (loaded, played, paused, moved, stopped).

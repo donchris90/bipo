@@ -24,7 +24,6 @@ import { HostLevelsService } from '../host-levels/host-levels.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { SeasonsService } from '../seasons/seasons.service';
 import { announceToFollowersAndAgency } from '../common/friend-announce';
-import { resolveEntrance } from '../economy/entrance';
 
 export const RTC_PROVIDER = 'RTC_PROVIDER';
 
@@ -201,7 +200,7 @@ export class LiveService {
     // Everything the viewer's header needs in the same round trip: who the
     // host really is (the screen used to show the stream title and a letter
     // as the "host"), whether I already follow them, and the live count.
-    const [host, follow, viewerCount] = await Promise.all([
+    const [host, follow, viewerCount, entrance] = await Promise.all([
       this.prisma.user.findUnique({ where: { id: session.hostId }, select: { id: true, displayName: true, avatarUrl: true } }),
       session.hostId === userId
         ? Promise.resolve(null)
@@ -210,17 +209,20 @@ export class LiveService {
             select: { followerId: true },
           }),
       this.prisma.liveViewer.count({ where: { sessionId, leftAt: null } }),
+      session.hostId === userId ? Promise.resolve(null) : this.gifters.entrance(userId).catch(() => null),
     ]);
 
     // VIP entrance is an ephemeral live-room event. It is deliberately not stored in chat
     // history: reconnecting viewers should not replay old entrance banners.
-    // Resolved AFTER the viewer's own data is ready and never awaited: the entrance is a flourish
-    // for everyone else, it must not add latency to the person actually joining. Tiers now come
-    // from both lifetime gifting and standing with THIS creator (see economy/entrance.ts).
-    if (session.hostId !== userId) {
-      void resolveEntrance(this.prisma, userId, session.hostId, 'live')
-        .then((entrance) => { if (entrance) this.realtime.broadcastLiveEntrance(sessionId, entrance); })
-        .catch(() => undefined);
+    if (entrance?.vip) {
+      this.realtime.broadcastLiveEntrance(sessionId, {
+        userId,
+        displayName: entrance.displayName,
+        avatarUrl: entrance.avatarUrl,
+        tier: entrance.tier,
+        level: entrance.level,
+        message: `${entrance.displayName ?? 'A VIP'} entered the live`,
+      });
     }
 
     return {

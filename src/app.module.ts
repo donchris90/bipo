@@ -46,6 +46,7 @@ import { ModerationModule } from './moderation/moderation.module';
 import { HealthModule } from './health/health.module';
 import { C2CModule } from './c2c/c2c.module';
 import { RrydaExperienceModule } from './experience/experience.module';
+import { TranslationModule } from './translation/translation.module';
 
 @Module({
   imports: [
@@ -96,6 +97,7 @@ import { RrydaExperienceModule } from './experience/experience.module';
     HealthModule,
     C2CModule,
     RrydaExperienceModule,
+    TranslationModule,
   ],
 })
 export class AppModule {}

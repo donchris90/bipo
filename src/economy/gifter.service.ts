@@ -14,7 +14,7 @@ const TIERS = [
   { level: 5, name: 'VIP 4', minCoins: 1_000_000, vip: true },
 ];
 
-export function tierFor(coins: number) {
+function tierFor(coins: number) {
   return [...TIERS].reverse().find((tier) => coins >= tier.minCoins) ?? TIERS[0];
 }
 

@@ -10,6 +10,10 @@ import { UserStatus, RoleName, WalletType, LedgerEntryType } from '@prisma/clien
 import { CHECK_IN_REWARD_SCHEDULE, computeCheckInReward, resolveCheckIn, toUtcDateKey } from './check-in-rules';
 
 const MAX_BIO_LENGTH = 220;
+const SUPPORTED_LANGUAGE_CODES = new Set([
+  'en', 'es', 'fr', 'pt', 'ar', 'zh', 'yo', 'ha', 'ig', 'hi',
+  'id', 'tl', 'tr', 'de', 'ru', 'ja', 'ko', 'vi', 'sw',
+]);
 
 @Injectable()
 export class UsersService {
@@ -118,8 +122,8 @@ export class UsersService {
   // shouldn't have to resend an unchanged displayName. avatarUrl is trusted
   // as already-uploaded rather than a file this endpoint receives itself;
   // this only ever stores the resulting URL string. A blank bio clears it.
-  async updateMe(userId: string, updates: { displayName?: string; avatarUrl?: string; bio?: string; oneOnOneEnabled?: boolean }) {
-    const data: { displayName?: string; avatarUrl?: string | null; bio?: string | null; oneOnOneEnabled?: boolean } = {};
+  async updateMe(userId: string, updates: { displayName?: string; avatarUrl?: string; bio?: string; oneOnOneEnabled?: boolean; languageCode?: string }) {
+    const data: { displayName?: string; avatarUrl?: string | null; bio?: string | null; oneOnOneEnabled?: boolean; languageCode?: string } = {};
 
     if (updates.displayName !== undefined) {
       const trimmed = updates.displayName.trim();
@@ -144,6 +148,14 @@ export class UsersService {
         throw new BadRequestException(`Bio must be ${MAX_BIO_LENGTH} characters or fewer`);
       }
       data.bio = trimmed || null;
+    }
+
+    if (updates.languageCode !== undefined) {
+      const languageCode = updates.languageCode.trim().toLowerCase().split(/[-_]/)[0];
+      if (!SUPPORTED_LANGUAGE_CODES.has(languageCode)) {
+        throw new BadRequestException('Unsupported language');
+      }
+      data.languageCode = languageCode;
     }
 
     if (updates.oneOnOneEnabled !== undefined) {

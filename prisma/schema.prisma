@@ -290,6 +290,10 @@ model PartyRoom {
   providerChannel String      @unique
   category        String?
   themeColor      String?
+  // When a seat frees up, should the longest-waiting queued request be seated into it
+  // automatically (true — the previous, only behavior), or does every open seat wait for the
+  // host to explicitly choose who fills it (false)? See RoomsService.releaseSeat.
+  autoAssignSeats Boolean     @default(true)
   // A video party (seats show camera) or an audio lounge (voice only). Chosen by
   // the host when starting the room; the Party tab's two filters use it.
   mode            RoomMode    @default(AUDIO)
@@ -1565,6 +1569,7 @@ model SupporterLevel {
   badgeUrl   String?
   active     Boolean  @default(true)
   updatedAt  DateTime @updatedAt
+  fanClubJoinedAt DateTime?
 }
 
 // The per-relationship record itself: one row per (supporter, creator) pair, holding that pair's
