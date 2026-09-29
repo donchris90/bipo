@@ -1,6 +1,7 @@
 import { PrismaService } from '../prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import type { NotificationType } from '@prisma/client';
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 
 // A single announcement can reach a lot of people (a popular host's followers), so this is fired
 // with `void` from the caller and never awaited — going live or opening a room must never wait on
@@ -18,6 +19,7 @@ export async function announceToFollowersAndAgency(
   hostId: string,
   type: NotificationType,
   payload: Record<string, unknown>,
+  realtime?: RealtimeGateway,
 ): Promise<void> {
   try {
     const [followers, membership] = await Promise.all([
@@ -45,7 +47,20 @@ export async function announceToFollowersAndAgency(
 
     recipients.delete(hostId); // defensive: a host can't have followed or joined an agency with themself, but never notify them about their own activity either way
 
-    await Promise.all([...recipients].map((userId) => notifications.notify(userId, type, payload)));
+    await Promise.all([...recipients].map(async (userId) => {
+      await notifications.notify(userId, type, payload);
+      if (realtime && (type === 'FOLLOWED_HOST_LIVE' || type === 'FOLLOWED_HOST_ROOM')) {
+        realtime.emitToUser(userId, 'live:started', {
+          liveType: type === 'FOLLOWED_HOST_LIVE' ? 'SOLO' : 'PARTY',
+          hostId,
+          hostDisplayName: payload.hostDisplayName ?? null,
+          title: payload.title ?? null,
+          sessionId: payload.sessionId ?? null,
+          roomId: payload.roomId ?? null,
+          avatarUrl: payload.avatarUrl ?? null,
+        });
+      }
+    }));
   } catch {
     /* an announcement is a nice-to-have; it must never affect going live or opening a room */
   }

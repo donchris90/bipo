@@ -149,10 +149,10 @@ export class LiveService {
     const token = await this.rtc.generateToken(channelName, hostId, 'host');
 
     if (this.notifications) {
-      const host = await this.prisma.user.findUnique({ where: { id: hostId }, select: { displayName: true } });
+      const host = await this.prisma.user.findUnique({ where: { id: hostId }, select: { displayName: true, avatarUrl: true } });
       void announceToFollowersAndAgency(this.prisma, this.notifications, hostId, 'FOLLOWED_HOST_LIVE', {
-        hostId, hostDisplayName: host?.displayName ?? null, sessionId, title,
-      });
+        hostId, hostDisplayName: host?.displayName ?? null, avatarUrl: host?.avatarUrl ?? null, sessionId, title,
+      }, this.realtime);
     }
 
     return { session, token };
