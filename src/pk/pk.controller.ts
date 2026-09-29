@@ -74,18 +74,6 @@ export class PkController {
     return toResponse(await this.pk.teamChallenge(req.user.userId, opponentTeamId, body?.durationSec));
   }
 
-  @Get('agency/candidates')
-  async agencyCandidates(@Req() req: AuthedRequest) {
-    return this.pk.agencyCandidates(req.user.userId);
-  }
-
-  @Post('agency/challenge/:opponentAgencyId')
-  @UseGuards(UserThrottlerGuard)
-  @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  async agencyChallenge(@Param('opponentAgencyId') opponentAgencyId: string, @Body() body: { durationSec?: number } | undefined, @Req() req: AuthedRequest) {
-    return toResponse(await this.pk.agencyChallenge(req.user.userId, opponentAgencyId, body?.durationSec));
-  }
-
   // "Random match": challenge one online creator picked for you.
   @Post('random')
   async random(@Req() req: AuthedRequest) {

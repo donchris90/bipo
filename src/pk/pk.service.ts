@@ -277,42 +277,6 @@ export class PkService implements OnModuleDestroy {
     return battle;
   }
 
-  // ── Family/Guild PK ────────────────────────────────────────────
-  // Mirrors Team PK exactly, one level up: the agency OWNER plays the same role a team leader
-  // does (the only one who can start or accept the battle on behalf of the whole agency), and
-  // every approved member's gifts pool into their agency's side — see
-  // GiftService.resolvePkBattleId / applyPkScore, extended the same way the TEAM fallback works.
-  async agencyCandidates(userId: string) {
-    const owned = await this.prisma.agency.findFirst({ where: { ownerId: userId, status: 'APPROVED' }, select: { id: true } });
-    if (!owned) throw new BadRequestException('Only an approved agency owner can start a Family PK');
-    const agencies = await this.prisma.agency.findMany({ where: { id: { not: owned.id }, status: 'APPROVED' }, take: 100, select: { id: true, name: true, ownerId: true } });
-    const liveOwners = await this.prisma.liveSession.findMany({ where: { hostId: { in: agencies.map((a) => a.ownerId) }, status: 'LIVE' }, select: { hostId: true } });
-    const live = new Set(liveOwners.map((x) => x.hostId));
-    const memberCounts = await this.prisma.agencyMembership.groupBy({ by: ['agencyId'], where: { agencyId: { in: agencies.map((a) => a.id) }, status: 'ACTIVE' }, _count: { agencyId: true } });
-    const countByAgency = new Map(memberCounts.map((m) => [m.agencyId, m._count.agencyId]));
-    return agencies
-      .filter((a) => live.has(a.ownerId))
-      .map((a) => ({ id: a.id, name: a.name, memberCount: countByAgency.get(a.id) ?? 0, live: true }))
-      .sort((a, b) => b.memberCount - a.memberCount);
-  }
-
-  async agencyChallenge(userId: string, opponentAgencyId: string, durationSecInput?: number) {
-    const durationSec = normalizeDuration(durationSecInput);
-    const mine = await this.prisma.agency.findFirst({ where: { ownerId: userId, status: 'APPROVED' }, select: { id: true } });
-    if (!mine) throw new BadRequestException('Only an approved agency owner can start a Family PK');
-    const opponentAgency = await this.prisma.agency.findUnique({ where: { id: opponentAgencyId }, select: { id: true, name: true, ownerId: true, status: true } });
-    if (!opponentAgency || opponentAgency.status !== 'APPROVED') throw new NotFoundException('Opponent agency not found');
-    if (opponentAgency.id === mine.id) throw new BadRequestException('Cannot challenge your own agency');
-    await assertNotBlocked(this.prisma, userId, opponentAgency.ownerId, "You can't challenge this agency");
-    if (!(await this.isHostLive(userId)) || !(await this.isHostLive(opponentAgency.ownerId))) throw new BadRequestException('Both agency owners must be live');
-    if (await this.isPkBusy(userId) || await this.isPkBusy(opponentAgency.ownerId)) throw new BadRequestException('One of the agency owners is already in a PK');
-    const battle = await this.prisma.pKBattle.create({ data: { challengerId: userId, opponentId: opponentAgency.ownerId, challengerAgencyId: mine.id, opponentAgencyId: opponentAgency.id, mode: 'AGENCY', status: 'CHALLENGED', durationSec, objectiveConfig: this.buildObjectives() } });
-    const challenger = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true, avatarUrl: true } });
-    this.realtime.emitToUser(opponentAgency.ownerId, 'pk:challenge', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, challengerAvatarUrl: challenger?.avatarUrl ?? null, mode: 'AGENCY', agencyName: opponentAgency.name });
-    await this.notifications.notify(opponentAgency.ownerId, 'PK_CHALLENGE', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, mode: 'AGENCY', challengerAgencyId: mine.id, opponentAgencyId: opponentAgency.id });
-    return battle;
-  }
-
   // ── choosing an opponent ─────────────────────────────────────────
 
   // Who you can challenge, in one of three groups — always people who are online

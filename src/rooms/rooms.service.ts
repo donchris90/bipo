@@ -253,7 +253,67 @@ export class RoomsService {
       data: { roomId, userId, invitedByHost: false },
     });
     this.emitRoomState(roomId, 'SEAT_REQUESTED', userId, { requestId: request.id });
+    // Auto-assign: a seat may already be vacant (nobody left, so releaseSeat never ran).
+    const filled = await this.autoFillVacantSeats(roomId);
+    const me = filled.find((f) => f.userId === userId);
+    if (me) return { joined: true, seatNumber: me.seatNumber, requestId: request.id };
     return { requested: true, requestId: request.id, waitingForSeat: true };
+  }
+
+  // Seats queued guests into every vacant, unlocked guest seat, oldest request first — when the
+  // room has auto-assign on. releaseSeat only reacts to a seat being freed; this covers every
+  // other moment a seat becomes usable: someone joins the queue while a seat is already empty,
+  // the host unlocks a seat, auto-assign is switched back on, or a guest is removed.
+  // Best-effort: a failure here must never break the action that triggered it.
+  private async autoFillVacantSeats(roomId: string) {
+    const filled: { userId: string; requestId: string; seatNumber: number; roomTitle: string }[] = [];
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        const room = await tx.partyRoom.findUnique({
+          where: { id: roomId },
+          select: { autoAssignSeats: true, status: true, seatCount: true, title: true },
+        });
+        if (!room || room.status !== 'OPEN' || !room.autoAssignSeats) return;
+
+        const [seats, locks, queue] = await Promise.all([
+          tx.roomSeat.findMany({ where: { roomId }, select: { seatNumber: true, userId: true } }),
+          tx.roomSeatLock.findMany({ where: { roomId }, select: { seatNumber: true } }),
+          tx.seatRequest.findMany({
+            where: { roomId, OR: [{ status: 'PENDING', invitedByHost: false }, { status: 'ACCEPTED' }] },
+            orderBy: { createdAt: 'asc' },
+          }),
+        ]);
+        const taken = new Set<number>([...seats.map((x) => x.seatNumber), ...locks.map((x) => x.seatNumber)]);
+        const seatedUsers = new Set(seats.map((x) => x.userId));
+
+        let next = 0;
+        for (let n = 1; n < room.seatCount; n++) {
+          if (taken.has(n)) continue;
+          while (next < queue.length) {
+            const req = queue[next++];
+            if (seatedUsers.has(req.userId)) {
+              await tx.seatRequest.update({ where: { id: req.id }, data: { status: 'APPROVED', decidedAt: new Date() } });
+              continue;
+            }
+            if (await this.moderation.isBanned('ROOM', roomId, req.userId)) continue;
+            await tx.roomSeat.create({ data: { roomId, userId: req.userId, seatNumber: n } });
+            await tx.seatRequest.update({ where: { id: req.id }, data: { status: 'APPROVED', decidedAt: new Date() } });
+            seatedUsers.add(req.userId);
+            filled.push({ userId: req.userId, requestId: req.id, seatNumber: n, roomTitle: room.title });
+            break;
+          }
+        }
+      });
+    } catch {
+      return [];
+    }
+    for (const f of filled) {
+      this.emitRoomState(roomId, 'SEAT_APPROVED', f.userId, { seatNumber: f.seatNumber });
+      await this.notifications
+        .notifyOnce(f.userId, 'SEAT_APPROVED', `seat:${f.requestId}`, { roomId, roomTitle: f.roomTitle, seatNumber: f.seatNumber })
+        .catch(() => undefined);
+    }
+    return filled;
   }
 
   private async assertRoomAccess(room: { id: string; hostId: string; privacy: RoomPrivacy }, userId: string) {
@@ -416,6 +476,7 @@ export class RoomsService {
     }
     await this.logModeration(actorId, locked ? 'LOCK_SEAT' : 'UNLOCK_SEAT', roomId);
     this.emitRoomState(roomId, locked ? 'SEAT_LOCKED' : 'SEAT_UNLOCKED', actorId, { seatNumber, locked });
+    if (!locked) await this.autoFillVacantSeats(roomId);
     return { seatNumber, locked };
   }
 
@@ -673,8 +734,14 @@ export class RoomsService {
       const lock = await tx.roomSeatLock.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber: seat.seatNumber } } });
       if (lock) return { seatNumber: seat.seatNumber, filled: null };
 
+      // Only real queue entries: a normal waiting request, or a host invite the guest has
+      // ACCEPTED. A still-PENDING host invite is not in the queue yet (the guest hasn't said
+      // yes) and must never be seated automatically.
       const nextRequest = await tx.seatRequest.findFirst({
-        where: { roomId, status: { in: ['PENDING', 'ACCEPTED'] } },
+        where: {
+          roomId,
+          OR: [{ status: 'PENDING', invitedByHost: false }, { status: 'ACCEPTED' }],
+        },
         orderBy: { createdAt: 'asc' },
       });
       if (!nextRequest) return { seatNumber: seat.seatNumber, filled: null };
@@ -715,6 +782,7 @@ export class RoomsService {
       select: { autoAssignSeats: true },
     });
     this.emitRoomState(roomId, 'AUTO_ASSIGN_CHANGED', undefined, { autoAssignSeats: room.autoAssignSeats });
+    if (room.autoAssignSeats) await this.autoFillVacantSeats(roomId);
     return room;
   }
 
@@ -757,6 +825,7 @@ export class RoomsService {
     }
     await this.logModeration(actorId, 'KICK', roomId, targetUserId);
     this.emitModeration(roomId, 'KICK', actorId, targetUserId);
+    if (removed.count > 0) await this.autoFillVacantSeats(roomId);
     return { removed: removed.count > 0 };
   }
 
@@ -811,6 +880,7 @@ export class RoomsService {
     }
     const updated = await this.prisma.partyRoom.update({ where: { id: roomId }, data: { seatCount } });
     this.emitRoomState(roomId, 'SEAT_COUNT_CHANGED', undefined, { seatCount: updated.seatCount });
+    if (updated.seatCount > room.seatCount) await this.autoFillVacantSeats(roomId);
     return { seatCount: updated.seatCount };
   }
 
@@ -896,6 +966,7 @@ export class RoomsService {
     }
     await this.logModeration(actorId, 'BAN', roomId, targetUserId);
     this.emitModeration(roomId, 'BAN', actorId, targetUserId);
+    if (removed.count > 0) await this.autoFillVacantSeats(roomId);
     return { banned: true, removed: removed.count > 0 };
   }
 
