@@ -14,6 +14,7 @@ import { publicName } from '../common/public-name';
 import { LudoService } from '../games/ludo.service';
 import { announceToFollowersAndAgency } from '../common/friend-announce';
 import { RoomCommunityService } from './room-community.service';
+import { resolveEntrance } from '../economy/entrance';
 
 @Injectable()
 export class RoomsService {
@@ -203,6 +204,10 @@ export class RoomsService {
     // Best-effort, never awaited into the join path's latency: this is what turns "entered a
     // session" into "visited this community" (see RoomCommunityService.recordVisit).
     void this.roomCommunity.recordVisit(room.roomId, userId);
+    // Party rooms had no entrance at all. Best-effort and never awaited, like the visit above.
+    void resolveEntrance(this.prisma, userId, room.hostId, 'room')
+      .then((entrance) => { if (entrance) this.realtime.broadcastRoomEntrance(roomId, entrance); })
+      .catch(() => undefined);
     return { room, token, role, muted };
   }
 
