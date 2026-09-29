@@ -1045,6 +1045,7 @@ model PKBattle {
   challengerAgencyId String?
   opponentAgencyId   String?
   objectiveConfig  Json?
+  durationSec     Int       @default(180)
   createdAt       DateTime  @default(now())
   settledAt       DateTime?
 
