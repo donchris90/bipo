@@ -1,0 +1,25 @@
+--- m_orig/src/context/MiniRoomContext.tsx	2026-09-29 08:03:12.000000000 +0000
++++ m/src/context/MiniRoomContext.tsx	2026-09-29 21:09:30.565865771 +0000
+@@ -325,6 +325,22 @@
+     const me = userIdRef.current;
+     const before = getRoom(id);
+ 
++    // Multi-guest Room PK is pushed over the same room socket. Patch the scoreboard cache directly
++    // (see components/RoomPkPanel.tsx): full state on start/settle, just the scores on each gift.
++    if (typeof event.action === 'string' && event.action.startsWith('ROOM_PK_')) {
++      if (event.action === 'ROOM_PK_SCORE') {
++        const scores = new Map(((event.scores ?? []) as Array<{ userId: string; score: string }>).map((x) => [x.userId, x.score]));
++        queryClient.setQueryData(['room-pk', id], (prev: any) =>
++          prev && prev.id === event.roomPkId
++            ? { ...prev, sideTotals: event.sideTotals ?? prev.sideTotals, participants: prev.participants.map((p: any) => ({ ...p, score: scores.get(p.userId) ?? p.score })) }
++            : prev,
++        );
++      } else {
++        queryClient.setQueryData(['room-pk', id], event.action === 'ROOM_PK_CANCELLED' ? null : (event.roomPk ?? null));
++      }
++      return;
++    }
++
+     // Seat changes are physical room changes, so animate them at the state
+     // boundary. This covers normal joins/leaves, host moves and the automatic
+     // FIFO queue promotion without faking a separate animation state.

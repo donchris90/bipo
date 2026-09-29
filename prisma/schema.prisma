@@ -48,7 +48,9 @@ model User {
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   avatarUrl     String?
+  coverUrl      String?
   bio           String?
+  profilePhotos ProfilePhoto[]
   liveViews     LiveViewer[]
   privateLiveRequests PrivateLiveRequest[]
   liveModerators LiveModerator[]
@@ -59,6 +61,17 @@ model User {
   hostDailyTaskProgress HostDailyTaskProgress[]
 
   @@index([countryCode])
+}
+
+model ProfilePhoto {
+  id        String   @id @default(uuid())
+  userId    String
+  url       String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, sortOrder])
 }
 
 model UserRole {
@@ -540,6 +553,42 @@ model RoomSeat {
   @@unique([roomId, userId])
 }
 
+
+// Multi-guest / Room PK: every seated person in a party room (host = seat 0) competes on the
+// gifts they receive while the PK runs. mode INDIVIDUAL = highest personal score wins;
+// mode TEAMS = participants are split into sides "A"/"B" and each side's scores are pooled.
+// Separate from PKBattle on purpose: PKBattle is strictly two-sided and tied to two live streams.
+// status: ACTIVE | SETTLED | CANCELLED (kept as strings, like PKBattle.mode).
+model RoomPk {
+  id           String              @id @default(uuid())
+  roomId       String
+  hostId       String
+  mode         String              @default("INDIVIDUAL")
+  status       String              @default("ACTIVE")
+  durationSec  Int                 @default(180)
+  startedAt    DateTime            @default(now())
+  endsAt       DateTime
+  settledAt    DateTime?
+  winnerUserId String?
+  winnerSide   String?
+  participants RoomPkParticipant[]
+
+  @@index([roomId, status])
+  @@index([status, endsAt])
+}
+
+model RoomPkParticipant {
+  id         String @id @default(uuid())
+  roomPkId   String
+  userId     String
+  seatNumber Int
+  side       String?
+  score      BigInt @default(0)
+  roomPk     RoomPk @relation(fields: [roomPkId], references: [id], onDelete: Cascade)
+
+  @@unique([roomPkId, userId])
+  @@index([userId])
+}
 
 model RoomSeatLock {
   id         String   @id @default(uuid())
@@ -1025,9 +1074,13 @@ model PKBattle {
   mode            String    @default("NORMAL")
   challengerTeamId String?
   opponentTeamId   String?
+  // Family/Guild PK: mode "AGENCY". Mirrors the Team PK fields above exactly — the two agency
+  // OWNERS are challengerId/opponentId (same role as team leaders), while these hold which
+  // agency each side represents so any member's gift can be pooled into it (see
+  // GiftService.resolvePkBattleId / applyPkScore).
+  challengerAgencyId String?
+  opponentAgencyId   String?
   objectiveConfig  Json?
-  // Battle length in seconds, chosen by the challenger (see PK_DURATIONS_SEC in pk.service.ts).
-  // Default 180 = the previous fixed 3 minutes, so existing rows and clients behave as before.
   durationSec     Int       @default(180)
   createdAt       DateTime  @default(now())
   settledAt       DateTime?
