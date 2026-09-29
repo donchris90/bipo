@@ -394,13 +394,29 @@ export class GiftService {
       this.prisma.teamMember.findUnique({ where: { userId: params.recipientId }, select: { teamId: true } }),
       this.prisma.liveSession.findFirst({ where: { id: params.contextId, hostId: params.recipientId, status: 'LIVE' }, select: { id: true } }),
     ]);
-    if (!membership || !liveSession) return null;
-    const teamBattle = await this.prisma.pKBattle.findFirst({
-      where: { status: 'ACTIVE', mode: 'TEAM', OR: [{ challengerTeamId: membership.teamId }, { opponentTeamId: membership.teamId }] },
+    if (membership && liveSession) {
+      const teamBattle = await this.prisma.pKBattle.findFirst({
+        where: { status: 'ACTIVE', mode: 'TEAM', OR: [{ challengerTeamId: membership.teamId }, { opponentTeamId: membership.teamId }] },
+        select: { id: true },
+        orderBy: { startedAt: 'desc' },
+      });
+      if (teamBattle) return teamBattle.id;
+    }
+
+    // Family/Guild PK: the same rule as Team PK above, one level up — a gift only counts when
+    // the recipient is themself hosting the live session it was sent in, and their AGENCY (not
+    // just any member's activity anywhere) has an active AGENCY-mode battle.
+    if (!liveSession) return null;
+    const agencyMembership = await this.prisma.agencyMembership.findFirst({ where: { creatorId: params.recipientId, status: 'ACTIVE' }, select: { agencyId: true } });
+    const ownedAgency = await this.prisma.agency.findFirst({ where: { ownerId: params.recipientId, status: 'APPROVED' }, select: { id: true } });
+    const agencyId = agencyMembership?.agencyId ?? ownedAgency?.id;
+    if (!agencyId) return null;
+    const agencyBattle = await this.prisma.pKBattle.findFirst({
+      where: { status: 'ACTIVE', mode: 'AGENCY', OR: [{ challengerAgencyId: agencyId }, { opponentAgencyId: agencyId }] },
       select: { id: true },
       orderBy: { startedAt: 'desc' },
     });
-    return teamBattle?.id ?? null;
+    return agencyBattle?.id ?? null;
   }
 
   private async applyPkScore(pkBattleId: string, recipientId: string, coinAmount: number) {
@@ -413,6 +429,13 @@ export class GiftService {
       const membership = await this.prisma.teamMember.findUnique({ where: { userId: recipientId }, select: { teamId: true } });
       if (membership?.teamId === battle.challengerTeamId) side = 'CHALLENGER';
       else if (membership?.teamId === battle.opponentTeamId) side = 'OPPONENT';
+    }
+    if (!side && battle.mode === 'AGENCY') {
+      const membership = await this.prisma.agencyMembership.findFirst({ where: { creatorId: recipientId, status: 'ACTIVE' }, select: { agencyId: true } });
+      const owned = await this.prisma.agency.findFirst({ where: { ownerId: recipientId, status: 'APPROVED' }, select: { id: true } });
+      const agencyId = membership?.agencyId ?? owned?.id;
+      if (agencyId === battle.challengerAgencyId) side = 'CHALLENGER';
+      else if (agencyId === battle.opponentAgencyId) side = 'OPPONENT';
     }
     if (!side) return;
 

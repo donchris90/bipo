@@ -547,11 +547,6 @@ model RoomSeat {
   userId     String
   seatNumber Int
   joinedAt   DateTime @default(now())
-  // Coins received while sitting in THIS seat, this session — see GiftService.send: it increments
-  // this on every gift sent to whoever holds the seat. Deliberately not persisted across a seat
-  // change: the row itself is deleted when a guest leaves (see RoomsService.releaseSeat), so the
-  // next visit starts back at zero, while the room-wide total stays cumulative in GiftTransaction.
-  giftCoins  Int      @default(0)
 
   @@unique([roomId, seatNumber])
   @@unique([roomId, userId])
@@ -1042,6 +1037,12 @@ model PKBattle {
   mode            String    @default("NORMAL")
   challengerTeamId String?
   opponentTeamId   String?
+  // Family/Guild PK: mode "AGENCY". Mirrors the Team PK fields above exactly — the two agency
+  // OWNERS are challengerId/opponentId (same role as team leaders), while these hold which
+  // agency each side represents so any member's gift can be pooled into it (see
+  // GiftService.resolvePkBattleId / applyPkScore).
+  challengerAgencyId String?
+  opponentAgencyId   String?
   objectiveConfig  Json?
   createdAt       DateTime  @default(now())
   settledAt       DateTime?
