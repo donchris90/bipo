@@ -1,5 +1,6 @@
-import { BadGatewayException, Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
+import { BadGatewayException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { randomUUID } from 'crypto';
 import { decodeImage } from './image-rules';
 
@@ -11,52 +12,75 @@ const MIME_BY_TYPE: Record<string, string> = {
 };
 
 /**
- * Profile/cover images use the dedicated image provider, independently from
- * the S3 video-storage configuration. This is intentional: a missing video
- * bucket endpoint must never make avatar uploads fail.
+ * Profile/cover images are stored in the same Cloudflare R2 bucket used by
+ * the rest of Rryda's media storage. R2 is S3-compatible, so the existing
+ * S3_* environment variables are used here as well.
  */
 @Injectable()
 export class ImageUploadService {
   private readonly logger = new Logger(ImageUploadService.name);
-  private readonly imgbbKey: string;
+  private readonly s3: S3Client;
+  private readonly bucket: string;
+  private readonly publicBaseUrl: string;
+
+  private requireNonEmpty(key: string): string {
+    const value = (this.config.get<string>(key) ?? '').trim();
+    if (!value) {
+      throw new Error(`${key} is required for image uploads.`);
+    }
+    return value;
+  }
 
   constructor(private readonly config: ConfigService) {
-    this.imgbbKey = (this.config.get<string>('IMGBB_API_KEY') ?? '').trim();
+    this.bucket = this.requireNonEmpty('S3_BUCKET');
+    this.publicBaseUrl = this.requireNonEmpty('S3_PUBLIC_BASE_URL').replace(/\/+$/, '');
+
+    const endpoint = this.requireNonEmpty('S3_ENDPOINT');
+    const region = (this.config.get<string>('S3_REGION') ?? 'auto').trim() || 'auto';
+
+    this.s3 = new S3Client({
+      region,
+      endpoint,
+      forcePathStyle: true,
+      credentials: {
+        accessKeyId: this.requireNonEmpty('S3_ACCESS_KEY_ID'),
+        secretAccessKey: this.requireNonEmpty('S3_SECRET_ACCESS_KEY'),
+      },
+      // Cloudflare R2 is S3-compatible but does not need the SDK to add
+      // optional checksum headers to every request.
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      responseChecksumValidation: 'WHEN_REQUIRED',
+    });
   }
 
   async upload(input: unknown): Promise<{ url: string }> {
-    if (!this.imgbbKey) {
-      throw new ServiceUnavailableException('Image uploads are not configured on the server. Set IMGBB_API_KEY and redeploy.');
-    }
-
-    const { base64, type } = decodeImage(input);
+    const { bytes, type } = decodeImage(input);
     const mime = MIME_BY_TYPE[type];
     if (!mime) throw new BadGatewayException('Unsupported image type');
 
+    const key = `uploads/${new Date().toISOString().slice(0, 10)}/${randomUUID()}.${type === 'jpeg' ? 'jpg' : type}`;
+
     try {
-      // ImgBB accepts the raw base64 payload as form data. Keeping the key on
-      // the server prevents it from being extracted from the mobile APK.
-      const body = new URLSearchParams();
-      body.set('key', this.imgbbKey);
-      body.set('image', base64);
-      body.set('name', randomUUID());
-
-      const response = await fetch('https://api.imgbb.com/1/upload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: body.toString(),
-      });
-
-      const payload = (await response.json().catch(() => null)) as any;
-      if (!response.ok || !payload?.success || !payload?.data?.url) {
-        this.logger.warn(`Image provider rejected upload: HTTP ${response.status}`);
-        throw new Error(payload?.error?.message ?? `HTTP ${response.status}`);
-      }
-
-      return { url: String(payload.data.url) };
-    } catch (error: any) {
-      this.logger.warn(`Image upload failed: ${String(error?.message ?? error).slice(0, 300)}`);
-      throw new BadGatewayException('Image upload failed. Please retry.');
+      await this.s3.send(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+          Body: bytes,
+          ContentType: mime,
+        }),
+      );
+    } catch (err: any) {
+      const name = String(err?.name ?? err?.Code ?? 'StorageError');
+      const status = err?.$metadata?.httpStatusCode ?? '-';
+      this.logger.warn(
+        `R2 image upload failed: ${name} HTTP ${status} ${String(err?.message ?? err).slice(0, 300)}`,
+      );
+      throw new BadGatewayException('Image upload failed at the storage host. Please retry.');
     }
+
+    // S3_PUBLIC_BASE_URL may be the Rryda storage proxy
+    // (https://<api>/api/v1/storage/files) or a Cloudflare public/custom
+    // domain. Both use the same stored object key.
+    return { url: `${this.publicBaseUrl}/${key}` };
   }
 }
