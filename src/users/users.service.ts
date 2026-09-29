@@ -40,6 +40,47 @@ export class UsersService {
   // Real referral list — who signed up using this user's code. Only the
   // fields actually needed to show "you referred these people" (not a
   // full user dump) — deliberately not the same shape as findMe().
+  async findMyProfilePhotos(userId: string) {
+    return this.prisma.profilePhoto.findMany({
+      where: { userId },
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      select: { id: true, url: true, sortOrder: true, createdAt: true },
+    });
+  }
+
+  async addProfilePhoto(userId: string, url: string) {
+    const trimmed = String(url ?? '').trim();
+    if (!/^https?:\/\//.test(trimmed)) throw new BadRequestException('Photo URL must be a valid http(s) URL');
+    const count = await this.prisma.profilePhoto.count({ where: { userId } });
+    if (count >= 8) throw new BadRequestException('You can add up to 8 profile photos');
+    return this.prisma.profilePhoto.create({
+      data: { userId, url: trimmed, sortOrder: count },
+      select: { id: true, url: true, sortOrder: true, createdAt: true },
+    });
+  }
+
+  async setPrimaryProfilePhoto(userId: string, photoId: string) {
+    const photo = await this.prisma.profilePhoto.findFirst({ where: { id: photoId, userId } });
+    if (!photo) throw new NotFoundException('Profile photo not found');
+    await this.prisma.user.update({ where: { id: userId }, data: { avatarUrl: photo.url } });
+    return photo;
+  }
+
+  async deleteProfilePhoto(userId: string, photoId: string) {
+    const photo = await this.prisma.profilePhoto.findFirst({ where: { id: photoId, userId } });
+    if (!photo) throw new NotFoundException('Profile photo not found');
+    await this.prisma.profilePhoto.delete({ where: { id: photoId } });
+    const remaining = await this.prisma.profilePhoto.findMany({
+      where: { userId }, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }], take: 8,
+    });
+    if (remaining.length && photo.url === (await this.prisma.user.findUnique({ where: { id: userId }, select: { avatarUrl: true } }))?.avatarUrl) {
+      await this.prisma.user.update({ where: { id: userId }, data: { avatarUrl: remaining[0].url } });
+    } else if (!remaining.length && photo.url === (await this.prisma.user.findUnique({ where: { id: userId }, select: { avatarUrl: true } }))?.avatarUrl) {
+      await this.prisma.user.update({ where: { id: userId }, data: { avatarUrl: null } });
+    }
+    return { ok: true };
+  }
+
   async findMyReferrals(userId: string) {
     return this.prisma.user.findMany({
       where: { referredById: userId },

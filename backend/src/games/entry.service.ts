@@ -7,6 +7,7 @@ import { validateSelection as validateSumDiceSelection } from './sum-dice-rules'
 import { validateLuckySelection } from './lucky-number-rules';
 import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { WalletType, LedgerEntryType } from '@prisma/client';
+import { SeasonsService } from '../seasons/seasons.service';
 
 @Injectable()
 export class EntryService {
@@ -14,6 +15,7 @@ export class EntryService {
     private readonly prisma: PrismaService,
     private readonly wallet: WalletService,
     private readonly rounds: RoundService,
+    private readonly seasons: SeasonsService,
   ) {}
 
   async place(params: {
@@ -82,7 +84,7 @@ export class EntryService {
     // (see game-payout.ts), so bonus coins stay bonus coins.
     const funding = planStake(coinAmount, await this.wallet.getBalance(params.userId, WalletType.BONUS), params.useBonus !== false);
 
-    return this.prisma.$transaction(async (tx) => {
+    const entry = await this.prisma.$transaction(async (tx) => {
       // Deduct the stake up front — this both enforces "cannot spend more
       // than available" and gives the round a settled pool to pay rewards
       // from.
@@ -130,6 +132,9 @@ export class EntryService {
         },
       });
     }, EXTENDED_TX_OPTIONS);
+
+    void this.seasons.contributePoints(params.userId, 5); // one Season signal per successful game entry
+    return entry;
   }
 
   private validateSelection(round: { numberRange: number | null; selectionCount: number | null }, selection: unknown) {

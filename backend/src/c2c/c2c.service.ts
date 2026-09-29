@@ -63,8 +63,9 @@ export class C2CService {
 
   async accept(orderId: string, sellerId: string) {
     await this.expireStale();
-    const seller = await this.prisma.user.findUnique({ where: { id: sellerId }, select: { id: true, status: true } });
+    const seller = await this.prisma.user.findUnique({ where: { id: sellerId }, select: { id: true, status: true, kycVerified: true } });
     if (!seller || seller.status !== 'ACTIVE') throw new ForbiddenException('Account is not active');
+    if (!seller.kycVerified) throw new ForbiddenException('Seller KYC verification is required for C2C trading');
     const order = await this.prisma.c2COrder.findUnique({ where: { id: orderId } });
     if (!order) throw new NotFoundException('C2C order not found');
     if (order.buyerId === sellerId) throw new BadRequestException('Buyer cannot accept their own order');
@@ -134,6 +135,14 @@ export class C2CService {
     return this.prisma.c2COrder.update({ where: { id: orderId }, data: { status: C2COrderStatus.DISPUTED, disputeReason: reason.trim().slice(0, 2000), disputedAt: new Date() } });
   }
 
+  async adminList(status?: C2COrderStatus) {
+    return this.prisma.c2COrder.findMany({
+      where: status ? { status } : { status: { in: [C2COrderStatus.DISPUTED, C2COrderStatus.PAYMENT_SUBMITTED, C2COrderStatus.ACCEPTED] } },
+      orderBy: { updatedAt: 'desc' },
+      take: 200,
+    });
+  }
+
   async adminResolve(orderId: string, adminId: string, action: 'RELEASE' | 'REFUND', note?: string) {
     const order = await this.prisma.c2COrder.findUnique({ where: { id: orderId } });
     if (!order) throw new NotFoundException('C2C order not found');
@@ -157,6 +166,10 @@ export class C2CService {
     if (!order) throw new NotFoundException('C2C order not found');
     if (order.buyerId !== buyerId) throw new ForbiddenException('Only the buyer can update payment');
     return order;
+  }
+
+  async expireStaleOrders() {
+    return this.expireStale();
   }
 
   private async expireStale() {

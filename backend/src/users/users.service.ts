@@ -3,10 +3,17 @@ import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { WalletService } from '../economy/wallet.service';
 import { HostLevelsService } from '../host-levels/host-levels.service';
+import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
+import { TeamsService } from '../teams/teams.service';
+import { SeasonsService } from '../seasons/seasons.service';
 import { UserStatus, RoleName, WalletType, LedgerEntryType } from '@prisma/client';
 import { CHECK_IN_REWARD_SCHEDULE, computeCheckInReward, resolveCheckIn, toUtcDateKey } from './check-in-rules';
 
 const MAX_BIO_LENGTH = 220;
+const SUPPORTED_LANGUAGE_CODES = new Set([
+  'en', 'es', 'fr', 'pt', 'ar', 'zh', 'yo', 'ha', 'ig', 'hi',
+  'id', 'tl', 'tr', 'de', 'ru', 'ja', 'ko', 'vi', 'sw',
+]);
 
 @Injectable()
 export class UsersService {
@@ -15,6 +22,9 @@ export class UsersService {
     private readonly audit: AuditService,
     private readonly wallet: WalletService,
     private readonly hostLevels: HostLevelsService,
+    private readonly rrydaLevels: RrydaLevelsService,
+    private readonly teams: TeamsService,
+    private readonly seasons: SeasonsService,
   ) {}
 
   async findMe(userId: string) {
@@ -30,12 +40,68 @@ export class UsersService {
   // Real referral list — who signed up using this user's code. Only the
   // fields actually needed to show "you referred these people" (not a
   // full user dump) — deliberately not the same shape as findMe().
+  async findMyProfilePhotos(userId: string) {
+    return this.prisma.profilePhoto.findMany({
+      where: { userId },
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      select: { id: true, url: true, sortOrder: true, createdAt: true },
+    });
+  }
+
+  async addProfilePhoto(userId: string, url: string) {
+    const trimmed = String(url ?? '').trim();
+    if (!/^https?:\/\//.test(trimmed)) throw new BadRequestException('Photo URL must be a valid http(s) URL');
+    const count = await this.prisma.profilePhoto.count({ where: { userId } });
+    if (count >= 8) throw new BadRequestException('You can add up to 8 profile photos');
+    return this.prisma.profilePhoto.create({
+      data: { userId, url: trimmed, sortOrder: count },
+      select: { id: true, url: true, sortOrder: true, createdAt: true },
+    });
+  }
+
+  async setPrimaryProfilePhoto(userId: string, photoId: string) {
+    const photo = await this.prisma.profilePhoto.findFirst({ where: { id: photoId, userId } });
+    if (!photo) throw new NotFoundException('Profile photo not found');
+    await this.prisma.user.update({ where: { id: userId }, data: { avatarUrl: photo.url } });
+    return photo;
+  }
+
+  async deleteProfilePhoto(userId: string, photoId: string) {
+    const photo = await this.prisma.profilePhoto.findFirst({ where: { id: photoId, userId } });
+    if (!photo) throw new NotFoundException('Profile photo not found');
+    await this.prisma.profilePhoto.delete({ where: { id: photoId } });
+    const remaining = await this.prisma.profilePhoto.findMany({
+      where: { userId }, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }], take: 8,
+    });
+    if (remaining.length && photo.url === (await this.prisma.user.findUnique({ where: { id: userId }, select: { avatarUrl: true } }))?.avatarUrl) {
+      await this.prisma.user.update({ where: { id: userId }, data: { avatarUrl: remaining[0].url } });
+    } else if (!remaining.length && photo.url === (await this.prisma.user.findUnique({ where: { id: userId }, select: { avatarUrl: true } }))?.avatarUrl) {
+      await this.prisma.user.update({ where: { id: userId }, data: { avatarUrl: null } });
+    }
+    return { ok: true };
+  }
+
   async findMyReferrals(userId: string) {
     return this.prisma.user.findMany({
       where: { referredById: userId },
       select: { id: true, displayName: true, createdAt: true },
       orderBy: { createdAt: 'desc' },
     });
+  }
+
+
+  async updateNearbyPreferences(userId: string, enabled: boolean, latitude?: number, longitude?: number) {
+    if (typeof enabled !== 'boolean') throw new BadRequestException('enabled must be a boolean');
+    if (!enabled) {
+      return this.prisma.user.update({ where: { id: userId }, data: { nearbyEnabled: false, nearbyLat: null, nearbyLon: null, nearbyUpdatedAt: null }, select: { nearbyEnabled: true } });
+    }
+    if (!Number.isFinite(latitude) || latitude! < -90 || latitude! > 90 || !Number.isFinite(longitude) || longitude! < -180 || longitude! > 180) {
+      throw new BadRequestException('A valid latitude and longitude are required');
+    }
+    // Store only a coarse location (~1km latitude buckets), never the exact GPS point.
+    const lat = Math.round(latitude! * 100) / 100;
+    const lon = Math.round(longitude! * 100) / 100;
+    return this.prisma.user.update({ where: { id: userId }, data: { nearbyEnabled: true, nearbyLat: lat, nearbyLon: lon, nearbyUpdatedAt: new Date() }, select: { nearbyEnabled: true, nearbyUpdatedAt: true } });
   }
 
   async getCheckInStatus(userId: string) {
@@ -84,6 +150,9 @@ export class UsersService {
       idempotencyKey: `check-in-${userId}-${toUtcDateKey(now)}`,
     });
 
+    void this.rrydaLevels.addXp(userId, 10); // Rryda Identity: showing up counts, every day
+    void this.teams.contributeXp(userId, 10); // Rryda Teams: showing up helps your team too
+    void this.seasons.contributePoints(userId, 10); // Rryda Seasons: showing up counts toward the current season too
     return { streak: newStreak, rewardCoins: Number(reward) };
   }
 
@@ -94,8 +163,8 @@ export class UsersService {
   // shouldn't have to resend an unchanged displayName. avatarUrl is trusted
   // as already-uploaded rather than a file this endpoint receives itself;
   // this only ever stores the resulting URL string. A blank bio clears it.
-  async updateMe(userId: string, updates: { displayName?: string; avatarUrl?: string; bio?: string; oneOnOneEnabled?: boolean }) {
-    const data: { displayName?: string; avatarUrl?: string | null; bio?: string | null; oneOnOneEnabled?: boolean } = {};
+  async updateMe(userId: string, updates: { displayName?: string; avatarUrl?: string; coverUrl?: string; bio?: string; oneOnOneEnabled?: boolean; languageCode?: string }) {
+    const data: { displayName?: string; avatarUrl?: string | null; coverUrl?: string | null; bio?: string | null; oneOnOneEnabled?: boolean; languageCode?: string } = {};
 
     if (updates.displayName !== undefined) {
       const trimmed = updates.displayName.trim();
@@ -113,6 +182,14 @@ export class UsersService {
       data.avatarUrl = trimmed || null;
     }
 
+    if (updates.coverUrl !== undefined) {
+      const trimmed = updates.coverUrl.trim();
+      if (trimmed && !/^https?:\/\//.test(trimmed)) {
+        throw new BadRequestException('coverUrl must be a valid http(s) URL');
+      }
+      data.coverUrl = trimmed || null;
+    }
+
     if (updates.bio !== undefined) {
       if (typeof updates.bio !== 'string') throw new BadRequestException('bio must be text');
       const trimmed = updates.bio.trim();
@@ -120,6 +197,14 @@ export class UsersService {
         throw new BadRequestException(`Bio must be ${MAX_BIO_LENGTH} characters or fewer`);
       }
       data.bio = trimmed || null;
+    }
+
+    if (updates.languageCode !== undefined) {
+      const languageCode = updates.languageCode.trim().toLowerCase().split(/[-_]/)[0];
+      if (!SUPPORTED_LANGUAGE_CODES.has(languageCode)) {
+        throw new BadRequestException('Unsupported language');
+      }
+      data.languageCode = languageCode;
     }
 
     if (updates.oneOnOneEnabled !== undefined) {

@@ -128,7 +128,7 @@ export class PaystackPaymentProvider implements PaymentProvider {
     return verifyPaystackSignature(rawBody, signature, this.secretKey);
   }
 
-  async handleWebhook(payload: any): Promise<{ providerRef: string; status: 'confirmed' | 'failed' | 'ignored' }> {
+  async handleWebhook(payload: any): Promise<{ providerRef: string; status: 'confirmed' | 'failed' | 'refunded' | 'ignored' }> {
     // Paystack's event types: charge.success is the one that matters for
     // coin purchases. Others (transfer.success, refund.processed, etc.)
     // exist but aren't handled here — this method is only ever reached

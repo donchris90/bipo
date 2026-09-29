@@ -15,7 +15,8 @@ export class PaymentProviderRouter implements PaymentProvider {
   }
 
   private provider(methodOrRef?: string): PaymentProvider {
-    if (methodOrRef === 'CRYPTO' || methodOrRef?.startsWith('np_')) return this.crypto;
+    const selector = methodOrRef?.toUpperCase();
+    if (selector === 'CRYPTO' || methodOrRef?.startsWith('np_')) return this.crypto;
     return this.paystack;
   }
 

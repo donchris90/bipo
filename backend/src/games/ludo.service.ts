@@ -1,3 +1,4 @@
+import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { BadRequestException, Injectable, NotFoundException, OnModuleDestroy } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
@@ -7,6 +8,7 @@ import { v4 as uuid } from 'uuid';
 import { ConfigService } from '@nestjs/config';
 import IORedis from 'ioredis';
 import { randomInt } from 'node:crypto';
+import { calculateSpectatorPoolSplit, calculateWinningSpectatorReward } from './ludo-payout';
 import { AUTOPILOT_AFTER_MISSED_TURNS, createLudoState, LudoPlayerState, LudoState, TURN_MS, advanceTurn, applyMove, giveControlBack, handToAi, isAiControlled, legalMoves, pickBotMove, recordFinish, rollForTurn, serverActsAt } from './ludo.rules';
 
 // A search whose app has not checked in for this long is treated as abandoned (the app polls every 2 s).
@@ -14,12 +16,19 @@ const STALE_TICKET_MS = 20_000;
 // How long Quick Match looks for other people before filling the seats with bots, unless the
 // game's rulesJson.botFillSeconds says otherwise (0 switches bot matches off).
 const DEFAULT_BOT_FILL_SECONDS = 20;
-const BOT_NAMES = ['Ava', 'Max', 'Zara', 'Leo', 'Nia', 'Kai'];
+const PARTY_BROADCAST_AFTER_MS = 60_000;
+const PARTY_BOT_FILL_AFTER_MS = 120_000;
+const PARTY_LOBBY_INDEX = 'ludo:party:lobbies';
+const BOT_FIRST_NAMES = ['Daniel', 'Maya', 'Chris', 'Sophia', 'Jayden', 'Amara', 'Kevin', 'Lina', 'Marcus', 'Zoe', 'Ryan', 'Nora', 'Ethan', 'Aisha', 'Noah', 'Ella'];
 
 interface QueueItem { userId: string; displayName: string; entryFee: number; playerCount: 2 | 4; ticket?: string; synthetic?: boolean; }
 interface QuickTicket { ticket: string; userId: string; entryFee: number; playerCount: 2 | 4; status: 'WAITING' | 'STARTED' | 'CANCELLED'; matchId?: string; roomCode?: string; players?: number; state?: LudoState; createdAt: string; lastSeenAt?: number; }
-interface Room { matchId: string; roomCode: string; entryFee: number; playerCount: 2 | 4; players: QueueItem[]; creatorId: string; started: boolean; }
-interface LudoInvite { id: string; matchId: string; roomCode: string; fromUserId: string; toUserId: string; createdAt: string; expiresAt: string; }
+interface Room { matchId: string; roomCode: string; entryFee: number; playerCount: 2 | 4; players: QueueItem[]; creatorId: string; started: boolean; partyRoomId?: string; createdAt?: number; globalInviteSentAt?: number; }
+interface LudoInvite {
+  id: string; matchId: string; roomCode: string; fromUserId: string; toUserId: string; createdAt: string; expiresAt: string;
+  // So the invite can say how much is staked and by whom without the client having to look the room up separately.
+  entryFee: number; playerCount: 2 | 4; fromDisplayName: string;
+}
 
 @Injectable()
 export class LudoService implements OnModuleDestroy {
@@ -36,7 +45,8 @@ export class LudoService implements OnModuleDestroy {
   private readonly localQuickLocks = new Set<string>();
   private readonly redis: IORedis;
 
-  constructor(private readonly prisma: PrismaService, private readonly wallet: WalletService, private readonly rounds: RoundService, private readonly config: ConfigService) {
+  constructor(private readonly prisma: PrismaService, private readonly wallet: WalletService, private readonly rounds: RoundService, private readonly config: ConfigService,
+    private readonly realtime: RealtimeGateway) {
     this.redis = new IORedis(this.config.get<string>('REDIS_URL') ?? 'redis://localhost:6379', { maxRetriesPerRequest: 1, enableOfflineQueue: false });
     this.redis.on('error', () => undefined);
   }
@@ -51,7 +61,7 @@ export class LudoService implements OnModuleDestroy {
       update: {},
       create: {
         code: 'LUDO', name: 'Ludo', status: 'DISABLED', version: 1,
-        rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 20, reconnectSeconds: 120, prizeFirstPercent: 70, prizeSecondPercent: 30, botFillSeconds: DEFAULT_BOT_FILL_SECONDS },
+        rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 20, reconnectSeconds: 120, prizeFirstPercent: 66.67, prizeSecondPercent: 33.33, prizeFirstPercent2p: 100, botFillSeconds: DEFAULT_BOT_FILL_SECONDS },
       },
     });
   }
@@ -241,7 +251,7 @@ export class LudoService implements OnModuleDestroy {
       if (!humans.some(h => h.userId === userId)) throw new BadRequestException('Insufficient balance');
 
       const bots: QueueItem[] = Array.from({ length: data.playerCount - humans.length }, (_, i) => ({
-        userId: `bot:${uuid()}`, displayName: `${BOT_NAMES[(i + Math.floor(Math.random() * BOT_NAMES.length)) % BOT_NAMES.length]} (AI)`,
+        userId: `bot:${uuid()}`, displayName: `${BOT_FIRST_NAMES[(i + Math.floor(Math.random() * BOT_FIRST_NAMES.length)) % BOT_FIRST_NAMES.length]}_${randomInt(10, 100)}`,
         entryFee: paid ? data.entryFee : 0, playerCount: data.playerCount, synthetic: true,
       }));
       const started = await this.startMatch([...humans, ...bots], undefined, { practice: !paid });
@@ -262,12 +272,16 @@ export class LudoService implements OnModuleDestroy {
   async quickMatchLobby() {
     const keys = new Set<string>(this.queues.keys());
     try { for (const k of await this.redis.keys('ludo:queue:*')) keys.add(k.replace('ludo:queue:', '')); } catch { /* local queues only */ }
-    const rows: Array<{ entryFee: number; playerCount: number; waiting: number }> = [];
+    // A few real display names per queue, so the lobby can show who is actually waiting
+    // rather than a bare count. Capped well below the queue size — this is a taste of who
+    // is there, not a directory, and it keeps the payload small when a queue is long.
+    const NAMES_SHOWN = 5;
+    const rows: Array<{ entryFee: number; playerCount: number; waiting: number; players: string[] }> = [];
     for (const key of keys) {
       const [fee, count] = key.split(':').map(Number);
       if (!Number.isFinite(fee) || !Number.isFinite(count)) continue;
-      const waiting = (await this.pruneStale(await this.readQueue(key))).length;
-      if (waiting > 0) rows.push({ entryFee: fee, playerCount: count, waiting });
+      const pruned = await this.pruneStale(await this.readQueue(key));
+      if (pruned.length > 0) rows.push({ entryFee: fee, playerCount: count, waiting: pruned.length, players: pruned.slice(0, NAMES_SHOWN).map((q) => q.displayName) });
     }
     return rows;
   }
@@ -307,7 +321,118 @@ export class LudoService implements OnModuleDestroy {
     return { status: ticket.status, ticket: ticket.ticket, matchId: ticket.matchId, roomCode: ticket.roomCode, players: ticket.players ?? 0, playerCount: ticket.playerCount, state: ticket.state };
   }
 
-  async createRoom(userId: string, displayName: string, entryFee: number, playerCount: 2 | 4, countryCode = 'NG') {
+  private broadcastGlobalLudoClosed(matchId: string) {
+    this.realtime.broadcastGlobal('ludo:global-invite-closed', { matchId });
+  }
+
+  private broadcastPartyLudo(room: Room | undefined, action: 'STARTED' | 'WAITING' | 'UPDATED' | 'FINISHED') {
+    if (!room?.partyRoomId) return;
+    this.realtime.broadcastRoomState(room.partyRoomId, {
+      roomId: room.partyRoomId,
+      action: `LUDO_${action}`,
+      ludo: {
+        status: action === 'FINISHED' ? 'NONE' : (action === 'STARTED' ? 'STARTED' : 'WAITING'),
+        matchId: room.matchId,
+        roomCode: room.roomCode,
+        players: room.players.length,
+        playerCount: room.playerCount,
+        partyRoomId: room.partyRoomId,
+      },
+    });
+  }
+
+  /**
+   * Server-side Party Ludo lobby clock. Called every second by LudoGateway so
+   * the countdown cannot be manipulated by a mobile client.
+   *
+   * At 60s, any under-filled lobby gets the Rryda-wide invitation. At 120s, any still-short lobby is completed with synthetic
+   * players. The synthetic flag remains internal; their public names look like
+   * ordinary usernames and never contain "AI" or "BOT".
+   */
+  async tickPartyLobbies() {
+    const now = Date.now();
+    let codes: string[] = [];
+    try { codes = await this.redis.zrangebyscore(PARTY_LOBBY_INDEX, 0, now); } catch { return; }
+
+    for (const code of codes) {
+      const room = await this.readRoom(code);
+      if (!room?.partyRoomId || room.started) {
+        await this.redis.zrem(PARTY_LOBBY_INDEX, code).catch(() => undefined);
+        continue;
+      }
+
+      const createdAt = room.createdAt ?? now;
+      const age = now - createdAt;
+
+      if (age >= PARTY_BROADCAST_AFTER_MS && age < PARTY_BOT_FILL_AFTER_MS && room.players.length < room.playerCount && !room.globalInviteSentAt) {
+        room.globalInviteSentAt = now;
+        await this.writeRoom(room);
+        this.realtime.broadcastGlobal('ludo:global-invite', {
+          type: 'PARTY_LUDO_OPEN',
+          partyRoomId: room.partyRoomId,
+          matchId: room.matchId,
+          roomCode: room.roomCode,
+          entryFee: room.entryFee,
+          playerCount: room.playerCount,
+          players: room.players.length,
+          expiresAt: new Date(createdAt + PARTY_BOT_FILL_AFTER_MS).toISOString(),
+        }, room.creatorId);
+      }
+
+      if (age >= PARTY_BOT_FILL_AFTER_MS && room.players.length < room.playerCount) {
+        await this.fillPartyLobbyWithBots(room);
+      }
+    }
+  }
+
+  private randomBotDisplayNames(count: number, existingNames: string[] = []): string[] {
+    const used = new Set(existingNames.map((name) => name.trim().toLowerCase()).filter(Boolean));
+    const result: string[] = [];
+    let attempts = 0;
+    while (result.length < count && attempts++ < 1000) {
+      const first = BOT_FIRST_NAMES[randomInt(BOT_FIRST_NAMES.length)];
+      const name = `${first}_${randomInt(10, 100)}`;
+      const key = name.toLowerCase();
+      if (used.has(key)) continue;
+      used.add(key);
+      result.push(name);
+    }
+    while (result.length < count) result.push(`Player_${randomInt(1000, 10000)}`);
+    return result;
+  }
+
+  private async fillPartyLobbyWithBots(room: Room) {
+    const lockKey = `ludo:party-fill:${room.matchId}`;
+    const lockToken = uuid();
+    const locked = await this.redis.set(lockKey, lockToken, 'PX', 8000, 'NX').catch(() => null);
+    if (!locked) return;
+    try {
+      const current = await this.readRoom(room.roomCode);
+      if (!current || current.started || current.players.length >= current.playerCount) {
+        if (!current || current.started || current.players.length >= current.playerCount) await this.redis.zrem(PARTY_LOBBY_INDEX, room.roomCode).catch(() => undefined);
+        return;
+      }
+      const names = this.randomBotDisplayNames(current.playerCount - current.players.length, current.players.map((p) => p.displayName));
+      const bots: QueueItem[] = names.map((displayName) => ({
+        userId: `bot:${uuid()}`,
+        displayName,
+        entryFee: current.entryFee,
+        playerCount: current.playerCount,
+        synthetic: true,
+      }));
+      current.players.push(...bots);
+      current.started = true;
+      await this.writeRoom(current);
+      this.broadcastGlobalLudoClosed(current.matchId);
+      this.broadcastPartyLudo(current, 'STARTED');
+      await this.startMatch(current.players, current);
+    } finally {
+      const currentLock = await this.redis.get(lockKey).catch(() => null);
+      if (currentLock === lockToken) await this.redis.del(lockKey).catch(() => undefined);
+    }
+  }
+
+  async createRoom(userId: string, displayName: string, entryFee: number, playerCount: 2 | 4, countryCode = 'NG', partyRoomId?: string) {
     const game = await this.ensureDefinition();
     await this.rounds.assertGameAvailable('LUDO', countryCode);
     if (playerCount !== 2 && playerCount !== 4) throw new BadRequestException('Invalid Ludo player count');
@@ -316,10 +441,73 @@ export class LudoService implements OnModuleDestroy {
     await this.requireBalance(userId, entryFee);
     const matchId = uuid();
     const roomCode = this.makeRoomCode();
-    const room: Room = { matchId, roomCode, entryFee, playerCount, players: [{ userId, displayName, entryFee, playerCount }], creatorId: userId, started: false };
+    const room: Room = { matchId, roomCode, entryFee, playerCount, players: [{ userId, displayName, entryFee, playerCount }], creatorId: userId, started: false, partyRoomId, createdAt: Date.now() };
+    if (partyRoomId) {
+      await this.redis.set(`ludo:party:${partyRoomId}`, roomCode, 'EX', 3600).catch(() => undefined);
+      await this.redis.zadd(PARTY_LOBBY_INDEX, room.createdAt!, roomCode).catch(() => undefined);
+    }
     this.rooms.set(roomCode, room);
     await this.writeRoom(room);
+    this.broadcastPartyLudo(room, 'WAITING');
     return { status: 'WAITING', matchId, roomCode, players: 1, playerCount };
+  }
+
+  async createPartyRoom(userId: string, roomId: string, entryFee: number, playerCount: 2 | 4, countryCode = 'NG') {
+    const party = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { id: true, hostId: true, status: true } });
+    if (!party) throw new NotFoundException('Party room not found');
+    if (party.hostId !== userId) throw new BadRequestException('Only the Party Room host can start Ludo');
+    if (party.status !== 'OPEN') throw new BadRequestException('Party room is closed');
+    const existingCode = await this.redis.get(`ludo:party:${roomId}`).catch(() => null);
+    if (existingCode) {
+      const existing = await this.readRoom(existingCode);
+      if (existing && !existing.started) return { status: 'WAITING', matchId: existing.matchId, roomCode: existing.roomCode, players: existing.players.length, playerCount: existing.playerCount, partyRoomId: roomId };
+    }
+    const host = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true } });
+    return this.createRoom(userId, host?.displayName?.trim() || 'Host', entryFee, playerCount, countryCode, roomId);
+  }
+
+  async partyRoomStatus(userId: string, roomId: string) {
+    const seat = await this.prisma.roomSeat.findFirst({ where: { roomId, userId }, select: { id: true } });
+    const party = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { hostId: true, status: true, privacy: true } });
+    if (!party) throw new NotFoundException('Party room not found');
+    // Public Party viewers may observe an active Ludo table without occupying a seat.
+    // Private rooms still require the host or a seated member.
+    if (party.hostId !== userId && !seat && party.privacy !== 'PUBLIC') {
+      throw new BadRequestException('Join this Party Room before viewing its Ludo game');
+    }
+    const code = await this.redis.get(`ludo:party:${roomId}`).catch(() => null);
+    if (!code) return { status: 'NONE', partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat || party.privacy === 'PUBLIC' };
+    const room = await this.readRoom(code);
+    if (!room) {
+      await this.redis.del(`ludo:party:${roomId}`).catch(() => undefined);
+      return { status: 'NONE', partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat || party.privacy === 'PUBLIC' };
+    }
+    if (room.started) {
+      const state = await this.getState(room.matchId);
+      // A completed table must disappear from the Party Room immediately.
+      // The match result remains available from the normal Ludo history/state endpoint.
+      if (state.status === 'FINISHED' || state.status === 'CANCELLED') {
+        await this.redis.del(`ludo:party:${roomId}`).catch(() => undefined);
+        return { status: 'NONE', partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat || party.privacy === 'PUBLIC' };
+      }
+      return { status: 'STARTED', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount, partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat || party.privacy === 'PUBLIC', state };
+    }
+    return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount, partyRoomId: roomId, isHost: party.hostId === userId, canJoin: party.hostId === userId || !!seat || party.privacy === 'PUBLIC' };
+  }
+
+  async joinPartyRoom(userId: string, roomId: string, displayName: string, countryCode = 'NG') {
+    const party = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { id: true, hostId: true, status: true, privacy: true } });
+    if (!party) throw new NotFoundException('Party room not found');
+    if (party.status !== 'OPEN') throw new BadRequestException('Party room is closed');
+    const seat = await this.prisma.roomSeat.findFirst({ where: { roomId, userId }, select: { id: true } });
+    // Public-room viewers can join the Party Ludo directly from the room.
+    // Private rooms still require an actual Party seat (or host access).
+    if (party.hostId !== userId && !seat && party.privacy !== 'PUBLIC') {
+      throw new BadRequestException('Join the Party Room before joining its Ludo game');
+    }
+    const code = await this.redis.get(`ludo:party:${roomId}`).catch(() => null);
+    if (!code) throw new NotFoundException('The Party Room has not started Ludo');
+    return this.joinRoom(userId, displayName, code, countryCode);
   }
 
   async roomStatus(userId: string, roomCode: string) {
@@ -343,15 +531,19 @@ export class LudoService implements OnModuleDestroy {
     await this.requireBalance(userId, room.entryFee);
     room.players.push({ userId, displayName, entryFee: room.entryFee, playerCount: room.playerCount });
     this.rooms.set(room.roomCode, room);
+    if (room.globalInviteSentAt) this.broadcastGlobalLudoClosed(room.matchId);
     await this.writeRoom(room);
+    this.broadcastPartyLudo(room, 'WAITING');
     return this.startIfReady(room);
   }
 
   private async startIfReady(room: Room) {
     if (room.players.length < room.playerCount) return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount };
     room.started = true;
+    this.broadcastGlobalLudoClosed(room.matchId);
     this.rooms.set(room.roomCode, room);
     await this.writeRoom(room);
+    this.broadcastPartyLudo(room, 'STARTED');
     return this.startMatch(room.players, room);
   }
 
@@ -368,9 +560,9 @@ export class LudoService implements OnModuleDestroy {
     const aiScale = hasAi ? Math.min(100, Math.max(0, Number(rules.botPrizePercent ?? 100))) / 100 : 1;
     const totalPool = Math.floor(entryFee * playerCount * aiScale); // practice: 0
     // Two players: the winner takes the pool (there is no second place). Four players: 1st/2nd split.
-    const firstPct = playerCount === 2 ? Number(rules.prizeFirstPercent2p ?? 100) : Number(rules.prizeFirstPercent ?? 70);
-    const prizeFirst = Math.floor(totalPool * (firstPct / 100));
-    const prizeSecond = totalPool - prizeFirst;
+    const firstPct = playerCount === 2 ? 100 : (Number.isFinite(Number(rules.prizeFirstPercent)) ? Number(rules.prizeFirstPercent) : 66.67);
+    const prizeFirst = playerCount === 2 ? totalPool : Math.floor(totalPool * (firstPct / 100));
+    const prizeSecond = playerCount === 2 ? 0 : totalPool - prizeFirst;
     const now = new Date();
 
     // Debit all entries atomically with their durable GameEntry records.
@@ -387,7 +579,11 @@ export class LudoService implements OnModuleDestroy {
     const state = createLudoState({ matchId, roomCode, entryFee, playerCount, players, prizeFirst, prizeSecond, turnSeconds, practice });
     this.states.set(matchId, state);
     await this.persistState(state);
-    await this.redis.del(this.roomKey(roomCode)).catch(() => undefined);
+    // Keep the started room record available in Redis for Party Room spectators and
+    // multi-instance API nodes. Joining is still blocked by room.started; the record
+    // is only the routing/status envelope for the active match. finishMatch removes
+    // the Party Room mapping when the game ends.
+    if (room) await this.writeRoom(room);
     return { status: 'STARTED', matchId, roomCode, state };
   }
 
@@ -543,9 +739,67 @@ export class LudoService implements OnModuleDestroy {
     });
   }
 
+  async spectatorBetStatus(userId: string, matchId: string) {
+    const room = await this.findRoomByMatchId(matchId);
+    if (!room?.partyRoomId) throw new NotFoundException('This Ludo match is not in a Party Room');
+    await this.assertPartyLudoViewer(userId, room.partyRoomId);
+    const state = await this.getState(matchId);
+    const [myBet, aggregate] = await Promise.all([
+      this.prisma.ludoSpectatorBet.findUnique({ where: { matchId_userId: { matchId, userId } }, select: { id: true, playerUserId: true, coinAmount: true, rewardAmount: true, status: true } }),
+      this.prisma.ludoSpectatorBet.groupBy({ by: ['playerUserId'], where: { matchId }, _sum: { coinAmount: true } }),
+    ]);
+    const playerPool = aggregate.reduce((sum, row) => sum + (row._sum.coinAmount ?? 0), 0);
+    const playerBets = Object.fromEntries(aggregate.map(row => [row.playerUserId, row._sum.coinAmount ?? 0]));
+    return { matchId, status: state.status, playerPool, playerBets, myBet };
+  }
+
+  async placeSpectatorBet(userId: string, matchId: string, playerUserId: string, amount: number) {
+    const room = await this.findRoomByMatchId(matchId);
+    if (!room?.partyRoomId) throw new NotFoundException('This Ludo match is not in a Party Room');
+    await this.assertPartyLudoViewer(userId, room.partyRoomId);
+    const state = await this.getState(matchId);
+    if (state.status !== 'ACTIVE') throw new BadRequestException('Spectator betting is closed for this match');
+    if (!Number.isInteger(amount) || amount < 10 || amount > 500000) throw new BadRequestException('Bet must be between 10 and 500000 coins');
+    const player = state.players.find(p => p.userId === playerUserId);
+    if (!player) throw new BadRequestException('That player is not in this match');
+    if (state.players.some(p => p.userId === userId)) throw new BadRequestException('Players cannot bet on the match as spectators');
+    if (player.bot || player.synthetic) throw new BadRequestException('You can only bet on a human player');
+
+    const idempotencyKey = `ludo_spectator_bet:${matchId}:${userId}`;
+    const bet = await this.prisma.$transaction(async tx => {
+      const existing = await tx.ludoSpectatorBet.findUnique({ where: { matchId_userId: { matchId, userId } } });
+      if (existing) throw new BadRequestException('You already placed a spectator bet on this match');
+      const created = await tx.ludoSpectatorBet.create({
+        data: { matchId, userId, playerUserId, coinAmount: amount, idempotencyKey },
+      });
+      await this.wallet.debit({ userId, walletType: WalletType.COIN, amount: BigInt(amount), ledgerType: LedgerEntryType.GAME_ENTRY, reference: created.id, idempotencyKey: `ludo_spectator_debit:${created.id}` }, tx);
+      return created;
+    });
+
+    const status = await this.spectatorBetStatus(userId, matchId);
+    return { bet: { id: bet.id, playerUserId: bet.playerUserId, coinAmount: bet.coinAmount, status: bet.status }, ...status };
+  }
+
+  private async assertPartyLudoViewer(userId: string, partyRoomId: string) {
+    const party = await this.prisma.partyRoom.findUnique({ where: { id: partyRoomId }, select: { hostId: true, status: true, privacy: true } });
+    if (!party || party.status !== 'OPEN') throw new BadRequestException('Party room is closed');
+    if (party.hostId === userId || party.privacy === 'PUBLIC') return;
+    const seat = await this.prisma.roomSeat.findFirst({ where: { roomId: partyRoomId, userId }, select: { id: true } });
+    if (!seat) throw new BadRequestException('Join this Party Room before betting on its Ludo game');
+  }
+
   private async finishMatch(state: LudoState) {
     if (state.status === 'FINISHED') return;
     state.status = 'FINISHED';
+    // Remove any Party Room mapping immediately. The completed result remains available
+    // through the normal Ludo match/history endpoints, but the room must no longer advertise
+    // a live table.
+    const partyRoom = await this.findRoomByMatchId(state.matchId);
+    if (partyRoom?.partyRoomId) {
+      this.broadcastPartyLudo(partyRoom, 'FINISHED');
+      await this.redis.del(`ludo:party:${partyRoom.partyRoomId}`).catch(() => undefined);
+      await this.redis.zrem(PARTY_LOBBY_INDEX, partyRoom.roomCode).catch(() => undefined);
+    }
     // Keep the result around briefly for late polls, then free the memory.
     const evict = setTimeout(() => this.states.delete(state.matchId), 10 * 60_000);
     evict.unref?.();
@@ -556,10 +810,37 @@ export class LudoService implements OnModuleDestroy {
       await this.prisma.gameRound.update({ where: { id: state.matchId }, data: { status: 'SETTLED', result: { winnerUserId: state.winnerUserId, practice: true } as any, settledAt: new Date(), hiddenState: state as any } });
       return;
     }
+    const spectatorBets = await this.prisma.ludoSpectatorBet.findMany({ where: { matchId: state.matchId, status: 'PLACED' } });
+    const spectatorPool = spectatorBets.reduce((sum, bet) => sum + bet.coinAmount, 0);
+    const spectatorSplit = calculateSpectatorPoolSplit(spectatorPool);
+    const winningSpectatorStake = state.winnerUserId
+      ? spectatorBets.filter(bet => bet.playerUserId === state.winnerUserId).reduce((sum, bet) => sum + bet.coinAmount, 0)
+      : 0;
+
     const payouts = new Map<string, number>();
     if (state.winnerUserId) payouts.set(state.winnerUserId, state.prizeFirst);
     if (state.secondPlaceUserId) payouts.set(state.secondPlaceUserId, state.prizeSecond);
     await this.prisma.$transaction(async tx => {
+      if (state.winnerUserId && spectatorPool > 0 && spectatorBets.length > 0) {
+        if (spectatorSplit.winner > 0) {
+          const winnerEntry = await tx.gameEntry.findFirst({ where: { roundId: state.matchId, userId: state.winnerUserId, status: { in: ['PLACED', 'WON'] } }, select: { id: true } });
+          if (winnerEntry) {
+            await this.wallet.credit({ userId: state.winnerUserId, walletType: WalletType.COIN, amount: BigInt(spectatorSplit.winner), ledgerType: LedgerEntryType.GAME_REWARD, reference: winnerEntry.id, idempotencyKey: `ludo_spectator_winner:${state.matchId}` }, tx);
+          }
+        }
+        for (const bet of spectatorBets) {
+          const reward = bet.playerUserId === state.winnerUserId && winningSpectatorStake > 0
+            ? calculateWinningSpectatorReward(spectatorSplit.spectators, bet.coinAmount, winningSpectatorStake)
+            : 0;
+          if (reward > 0) {
+            await this.wallet.credit({ userId: bet.userId, walletType: WalletType.COIN, amount: BigInt(reward), ledgerType: LedgerEntryType.GAME_REWARD, reference: bet.id, idempotencyKey: `ludo_spectator_reward:${bet.id}` }, tx);
+          }
+          await tx.ludoSpectatorBet.update({ where: { id: bet.id }, data: { status: reward > 0 ? 'WON' : 'LOST', rewardAmount: reward, settledAt: new Date() } });
+        }
+      } else {
+        await tx.ludoSpectatorBet.updateMany({ where: { matchId: state.matchId, status: 'PLACED' }, data: { status: 'LOST', rewardAmount: 0, settledAt: new Date() } });
+      }
+
       for (const [userId, amount] of payouts) {
         const entry = await tx.gameEntry.findFirst({ where: { roundId: state.matchId, userId, status: 'PLACED' } });
         if (!entry) continue;
@@ -569,12 +850,47 @@ export class LudoService implements OnModuleDestroy {
         await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'WON', rewardAmount: amount } });
       }
       await tx.gameEntry.updateMany({ where: { roundId: state.matchId, status: 'PLACED' }, data: { status: 'LOST', rewardAmount: 0 } });
-      await tx.gameRound.update({ where: { id: state.matchId }, data: { status: 'SETTLED', result: { winnerUserId: state.winnerUserId, secondPlaceUserId: state.secondPlaceUserId, prizeFirst: state.prizeFirst, prizeSecond: state.prizeSecond }, settledAt: new Date(), hiddenState: state as any } });
+      await tx.gameRound.update({ where: { id: state.matchId }, data: { status: 'SETTLED', result: { winnerUserId: state.winnerUserId, secondPlaceUserId: state.secondPlaceUserId, prizeFirst: state.prizeFirst, prizeSecond: state.prizeSecond, spectatorPool, spectatorPlatformShare: spectatorSplit.platform, spectatorWinnerShare: spectatorSplit.winner, spectatorWinningPool: spectatorSplit.spectators }, settledAt: new Date(), hiddenState: state as any } });
     });
   }
 
   private queueRedisKey(key: string) { return `ludo:queue:${key}`; }
   private roomKey(code: string) { return `ludo:room:${code.toUpperCase()}`; }
+
+  /**
+   * Called by RoomsService right before a Party Room closes (host tapped Close, or the room was
+   * swept up as abandoned) — the only two ways a Party Room stops existing. This is also how a
+   * host "leaving" is handled: in this app the host cannot leave their own room without closing
+   * it (leaveSeat refuses them), so closing IS the host-leaves event described in the flow spec.
+   *
+   *  - No table, or a table that hasn't started: entries are only ever debited once the table
+   *    fills and the match starts (see startMatch), so nobody has paid anything yet — the table
+   *    is simply discarded. Nothing to refund.
+   *  - A table already in progress has real coins staked in it. It must not be deleted: deleting
+   *    it here would silently take players' entries with no winner and no payout. Instead it is
+   *    left to run to completion exactly as it would if the Party Room had never closed (the
+   *    existing reconnect / bot-takeover / settlement logic already covers a player going away);
+   *    only the Party Room's pointer to it is removed, since the room itself is gone.
+   */
+  async resolvePartyLudoOnRoomClose(roomId: string): Promise<void> {
+    const code = await this.redis.get(`ludo:party:${roomId}`).catch(() => null);
+    if (!code) return;
+    await this.redis.del(`ludo:party:${roomId}`).catch(() => undefined);
+    const room = this.rooms.get(code) ?? await this.readRoom(code);
+    if (!room) return;
+    if (!room.started) {
+      this.rooms.delete(room.roomCode);
+      await this.redis.del(this.roomKey(room.roomCode)).catch(() => undefined);
+      this.broadcastGlobalLudoClosed(room.matchId);
+      this.broadcastPartyLudo(room, 'FINISHED');
+      return;
+    }
+    // Already running with real stakes: leave the match itself untouched, just stop pointing the
+    // (now-closed) Party Room at it.
+    this.broadcastGlobalLudoClosed(room.matchId);
+    this.broadcastPartyLudo(room, 'FINISHED');
+  }
+
   private async readQueue(key: string): Promise<QueueItem[]> {
     try { const raw = await this.redis.get(this.queueRedisKey(key)); if (raw) return JSON.parse(raw); } catch {}
     return this.queues.get(key) ?? [];
@@ -583,7 +899,13 @@ export class LudoService implements OnModuleDestroy {
     this.queues.set(key, queue);
     try { if (queue.length) await this.redis.set(this.queueRedisKey(key), JSON.stringify(queue), 'EX', 600); else await this.redis.del(this.queueRedisKey(key)); } catch {}
   }
-  private async writeRoom(room: Room) { try { await this.redis.set(this.roomKey(room.roomCode), JSON.stringify(room), 'EX', 3600); } catch {} }
+  private async writeRoom(room: Room) {
+    try {
+      await this.redis.set(this.roomKey(room.roomCode), JSON.stringify(room), 'EX', 3600);
+      if (room.partyRoomId && !room.started) await this.redis.zadd(PARTY_LOBBY_INDEX, room.createdAt ?? Date.now(), room.roomCode);
+      if (room.started) await this.redis.zrem(PARTY_LOBBY_INDEX, room.roomCode);
+    } catch {}
+  }
   private async findRoomByMatchId(matchId: string): Promise<Room | undefined> {
     for (const room of this.rooms.values()) if (room.matchId === matchId) return room;
     const key = 'ludo:room:*';
@@ -624,6 +946,50 @@ export class LudoService implements OnModuleDestroy {
     return this.prisma.user.findMany({ where: { id: { in: userIds }, ...base }, select: { id: true, displayName: true, avatarUrl: true }, orderBy: { displayName: 'asc' }, take: 100 });
   }
 
+  // A player's own recent paid Ludo matches, newest first, with the other seats at the table
+  // and what they won or lost. Practice matches never create a GameEntry (nothing was staked),
+  // so they never show up here, which matches "no coins were at stake" everywhere else.
+  // Two reads rather than a join: GameEntry carries no relation to GameRound in this schema,
+  // and this mirrors the same read-time-aggregation tradeoff already made in games.controller.ts.
+  async matchHistory(userId: string, limit = 20) {
+    const ROUNDS_SCANNED = 200; // enough recent Ludo rounds to almost always contain this player's last `limit` matches
+    const rounds = await this.prisma.gameRound.findMany({
+      where: { gameCode: 'LUDO', status: 'SETTLED' },
+      orderBy: { settledAt: 'desc' },
+      take: ROUNDS_SCANNED,
+      select: { id: true, settledAt: true, entryPrice: true, result: true, hiddenState: true },
+    });
+    if (!rounds.length) return [];
+    const entries = await this.prisma.gameEntry.findMany({
+      where: { roundId: { in: rounds.map((r) => r.id) }, userId },
+      select: { roundId: true, coinAmount: true, rewardAmount: true, status: true },
+    });
+    if (!entries.length) return [];
+    const entryByRound = new Map(entries.map((e) => [e.roundId, e]));
+    return rounds
+      .filter((r) => entryByRound.has(r.id))
+      .slice(0, limit)
+      .map((r) => {
+        const entry = entryByRound.get(r.id)!;
+        const result = (r.result ?? {}) as { winnerUserId?: string; secondPlaceUserId?: string };
+        const hidden = (r.hiddenState ?? {}) as { players?: Array<{ userId: string; displayName: string; color: string }> };
+        const seats = Array.isArray(hidden.players) ? hidden.players : [];
+        const place = result.winnerUserId === userId ? 1 : result.secondPlaceUserId === userId ? 2 : null;
+        return {
+          matchId: r.id,
+          settledAt: r.settledAt,
+          entryFee: r.entryPrice,
+          playerCount: seats.length || undefined,
+          place,
+          won: entry.status === 'WON',
+          stake: entry.coinAmount,
+          reward: entry.rewardAmount,
+          net: entry.rewardAmount - entry.coinAmount,
+          opponents: seats.filter((p) => p.userId !== userId).map((p) => ({ displayName: p.displayName, color: p.color })),
+        };
+      });
+  }
+
   async inviteToRoom(fromUserId: string, matchId: string, toUserId: string) {
     const room = [...this.rooms.values()].find(r => r.matchId === matchId) ?? await this.findRoomByMatchId(matchId);
     if (!room) throw new NotFoundException('Ludo room not found');
@@ -631,7 +997,11 @@ export class LudoService implements OnModuleDestroy {
     if (room.started) throw new BadRequestException('Match already started');
     if (room.players.some(p => p.userId === toUserId)) throw new BadRequestException('Player is already in the room');
     if (room.players.length >= room.playerCount) throw new BadRequestException('Room is full');
-    const invite: LudoInvite = { id: uuid(), matchId, roomCode: room.roomCode, fromUserId, toUserId, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 10 * 60_000).toISOString() };
+    const fromDisplayName = room.players.find((p) => p.userId === fromUserId)?.displayName || 'A player';
+    const invite: LudoInvite = {
+      id: uuid(), matchId, roomCode: room.roomCode, fromUserId, toUserId, createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+      entryFee: room.entryFee, playerCount: room.playerCount, fromDisplayName,
+    };
     this.localInvites.set(invite.id, invite);
     const ids = this.localInviteIds.get(toUserId) ?? new Set<string>(); ids.add(invite.id); this.localInviteIds.set(toUserId, ids);
     try {

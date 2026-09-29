@@ -47,7 +47,7 @@ export function validateGameRules(existing: any, incoming: any): GameRules {
   if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) throw new BadRequestException('rulesJson must be an object');
 
   const shape = shapeOf(existing) ?? shapeOf(incoming);
-  if (!shape) throw new BadRequestException('rulesJson must define a supported game: dice (diceCount, diceSides, payoutMultiplier), crash (houseEdge, growthRate) or lucky (payoutMultiplier)');
+  if (!shape) throw new BadRequestException('rulesJson must define a supported game: dice, crash, lucky, or ludo');
   const allowed: readonly string[] = SHAPES[shape];
 
   const unknown = Object.keys(incoming).filter((k) => !allowed.includes(k));

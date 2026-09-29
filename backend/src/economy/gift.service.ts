@@ -8,6 +8,12 @@ import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
 import { WalletType, LedgerEntryType, ChatContext } from '@prisma/client';
 import { pkPointsForCoins, pkSideForRecipient } from './pk-score';
 import { HostLevelsService } from '../host-levels/host-levels.service';
+import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
+import { TeamsService } from '../teams/teams.service';
+import { SupporterLevelsService } from '../supporters/supporter-levels.service';
+import { RoomCommunityService } from '../rooms/room-community.service';
+import { SeasonsService } from '../seasons/seasons.service';
+import { createMoment } from '../experience/experience.moments';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -137,6 +143,22 @@ export class GiftService {
     // injected. Never awaited for its result and never able to fail a gift.
     @Optional() private readonly notifications?: NotificationsService,
     @Optional() private readonly hostLevels?: HostLevelsService,
+    // Same optional pattern as hostLevels above, and the same rule: never awaited for its
+    // result, never able to fail a gift. This one grows the SENDER's Rryda Identity (the doc's
+    // "Support" dimension) — separate from hostLevels above, which grows the RECIPIENT's.
+    @Optional() private readonly rrydaLevels?: RrydaLevelsService,
+    @Optional() private readonly supporterLevels?: SupporterLevelsService,
+    // Same optional pattern as the others above, never able to fail a gift. Only fires for
+    // ROOM-context gifts (see the hook below) — awardGiftXp itself resolves the session's
+    // contextId to the persistent Room.
+    @Optional() private readonly roomCommunity?: RoomCommunityService,
+    // Same optional pattern again — grows the SENDER's team (if they're on one), same full
+    // coinAmount as rrydaLevels above, not the /50 conversion (Rryda Teams contribution is meant
+    // to feel 1:1, see TeamsService.contributeXp).
+    @Optional() private readonly teams?: TeamsService,
+    // Same optional pattern again — full coinAmount, same as teams above, into whichever
+    // season(s) are currently running (contributePoints itself is a no-op if none are).
+    @Optional() private readonly seasons?: SeasonsService,
   ) {}
 
   // Backing for a gift-picker UI — before this, the only way a client
@@ -253,6 +275,17 @@ export class GiftService {
         );
       }
 
+      // Party seats display the gift value received during the current seat
+      // session. The RoomSeat row is deleted when the guest leaves, so the
+      // next visit starts from zero while the room-wide gift total remains
+      // cumulative in GiftTransaction.
+      if (params.context === 'ROOM' && params.contextId) {
+        await tx.roomSeat.updateMany({
+          where: { roomId: params.contextId, userId: params.recipientId },
+          data: { giftCoins: { increment: coinAmount } },
+        });
+      }
+
       return tx.giftTransaction.create({
         data: {
           senderId: params.senderId,
@@ -275,8 +308,43 @@ export class GiftService {
       });
     }, EXTENDED_TX_OPTIONS);
 
+    // Large gifts become Rryda Moments so the social layer has memorable events to surface.
+    // The threshold is intentionally conservative to avoid filling the feed with every small gift.
+    if (coinAmount >= 1000) {
+      void createMoment(this.prisma, {
+        userId: params.recipientId,
+        type: 'GIFT_MILESTONE',
+        title: `A ${coinAmount.toLocaleString()}-coin gift arrived`,
+        description: 'A standout gift moment from your community.',
+        payload: { senderId: params.senderId, coinAmount, context: params.context ?? null, contextId: params.contextId ?? null },
+      }).catch(() => undefined);
+    }
+
     if (this.hostLevels) {
       try { await this.hostLevels.awardRule(params.recipientId, 'GIFT_100_COINS', Math.floor(coinAmount / 100)); } catch { /* progression must never fail a paid gift */ }
+    }
+    if (this.rrydaLevels) {
+      void this.rrydaLevels.addXp(params.senderId, Math.floor(coinAmount / 50));
+    }
+    // Grows the (sender, recipient) supporter relationship specifically — separate from
+    // rrydaLevels above, which grows the sender's platform-wide identity. Full coinAmount, no
+    // conversion (see supporter-levels.service.ts): this is meant to track cumulative spend on
+    // this one creator directly.
+    if (this.supporterLevels) {
+      void this.supporterLevels.addXp(params.senderId, params.recipientId, coinAmount);
+    }
+    // A gift sent inside a Party Room also grows the sender's standing in that room's
+    // community (and, more slowly, the room's own level) — see RoomCommunityService.
+    // params.contextId here is the live PartyRoom session id; awardGiftXp resolves it to the
+    // persistent Room itself.
+    if (this.roomCommunity && params.context === 'ROOM' && params.contextId) {
+      void this.roomCommunity.awardGiftXp(params.contextId, params.senderId, coinAmount);
+    }
+    if (this.teams) {
+      void this.teams.contributeXp(params.senderId, coinAmount);
+    }
+    if (this.seasons) {
+      void this.seasons.contributePoints(params.senderId, coinAmount);
     }
 
     // 4. If sent during an active PK battle, feed the score. Kept outside
@@ -311,12 +379,44 @@ export class GiftService {
   // never count.
   private async resolvePkBattleId(params: SendGiftParams): Promise<string | null> {
     if (params.context && params.context !== 'LIVE') return null;
-    const battle = await this.prisma.pKBattle.findFirst({
+    const direct = await this.prisma.pKBattle.findFirst({
       where: { status: 'ACTIVE', OR: [{ challengerId: params.recipientId }, { opponentId: params.recipientId }] },
       select: { id: true },
       orderBy: { startedAt: 'desc' },
     });
-    return battle?.id ?? null;
+    if (direct) return direct.id;
+
+    // Team PK: a gift to a team member counts only when that member is the
+    // host receiving the gift in the same live session. This prevents a gift
+    // sent to a team member in an unrelated live from leaking into Team PK.
+    if (!params.contextId) return null;
+    const [membership, liveSession] = await Promise.all([
+      this.prisma.teamMember.findUnique({ where: { userId: params.recipientId }, select: { teamId: true } }),
+      this.prisma.liveSession.findFirst({ where: { id: params.contextId, hostId: params.recipientId, status: 'LIVE' }, select: { id: true } }),
+    ]);
+    if (membership && liveSession) {
+      const teamBattle = await this.prisma.pKBattle.findFirst({
+        where: { status: 'ACTIVE', mode: 'TEAM', OR: [{ challengerTeamId: membership.teamId }, { opponentTeamId: membership.teamId }] },
+        select: { id: true },
+        orderBy: { startedAt: 'desc' },
+      });
+      if (teamBattle) return teamBattle.id;
+    }
+
+    // Family/Guild PK: the same rule as Team PK above, one level up — a gift only counts when
+    // the recipient is themself hosting the live session it was sent in, and their AGENCY (not
+    // just any member's activity anywhere) has an active AGENCY-mode battle.
+    if (!liveSession) return null;
+    const agencyMembership = await this.prisma.agencyMembership.findFirst({ where: { creatorId: params.recipientId, status: 'ACTIVE' }, select: { agencyId: true } });
+    const ownedAgency = await this.prisma.agency.findFirst({ where: { ownerId: params.recipientId, status: 'APPROVED' }, select: { id: true } });
+    const agencyId = agencyMembership?.agencyId ?? ownedAgency?.id;
+    if (!agencyId) return null;
+    const agencyBattle = await this.prisma.pKBattle.findFirst({
+      where: { status: 'ACTIVE', mode: 'AGENCY', OR: [{ challengerAgencyId: agencyId }, { opponentAgencyId: agencyId }] },
+      select: { id: true },
+      orderBy: { startedAt: 'desc' },
+    });
+    return agencyBattle?.id ?? null;
   }
 
   private async applyPkScore(pkBattleId: string, recipientId: string, coinAmount: number) {
@@ -324,7 +424,19 @@ export class GiftService {
     if (!battle || battle.status !== 'ACTIVE') return; // gift still counts financially even if PK isn't live
     if (battle.endsAt && battle.endsAt.getTime() <= Date.now()) return; // buzzer has sounded
 
-    const side = pkSideForRecipient(battle, recipientId);
+    let side = pkSideForRecipient(battle, recipientId);
+    if (!side && battle.mode === 'TEAM') {
+      const membership = await this.prisma.teamMember.findUnique({ where: { userId: recipientId }, select: { teamId: true } });
+      if (membership?.teamId === battle.challengerTeamId) side = 'CHALLENGER';
+      else if (membership?.teamId === battle.opponentTeamId) side = 'OPPONENT';
+    }
+    if (!side && battle.mode === 'AGENCY') {
+      const membership = await this.prisma.agencyMembership.findFirst({ where: { creatorId: recipientId, status: 'ACTIVE' }, select: { agencyId: true } });
+      const owned = await this.prisma.agency.findFirst({ where: { ownerId: recipientId, status: 'APPROVED' }, select: { id: true } });
+      const agencyId = membership?.agencyId ?? owned?.id;
+      if (agencyId === battle.challengerAgencyId) side = 'CHALLENGER';
+      else if (agencyId === battle.opponentAgencyId) side = 'OPPONENT';
+    }
     if (!side) return;
 
     const scoreConfig = await this.prisma.pKScoreConfig.findFirst({ where: { active: true }, orderBy: { id: 'desc' } });

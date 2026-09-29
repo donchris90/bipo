@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { UserThrottlerGuard } from '../common/guards/user-throttler.guard';
 import { Request } from 'express';
@@ -33,8 +33,8 @@ export class PkController {
   @Post('challenge/:opponentId')
   @UseGuards(UserThrottlerGuard)
   @Throttle({ default: { limit: 20, ttl: 60_000 } })
-  async challenge(@Param('opponentId') opponentId: string, @Req() req: AuthedRequest) {
-    return toResponse(await this.pk.challenge(req.user.userId, opponentId));
+  async challenge(@Param('opponentId') opponentId: string, @Body() body: { durationSec?: number } | undefined, @Req() req: AuthedRequest) {
+    return toResponse(await this.pk.challenge(req.user.userId, opponentId, body?.durationSec));
   }
 
   // Who you can challenge, online right now: ?category=friends | agency | random
@@ -42,6 +42,48 @@ export class PkController {
   candidates(@Query('category') category: string | undefined, @Req() req: AuthedRequest) {
     const cat = category === 'agency' || category === 'random' ? category : 'friends';
     return this.pk.candidates(req.user.userId, cat);
+  }
+
+  // Real matchmaking queue: join without selecting an opponent.
+  @Post('random-match')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  async randomMatch(@Body() body: { durationSec?: number } | undefined, @Req() req: AuthedRequest) {
+    return this.pk.randomMatch(req.user.userId, body?.durationSec);
+  }
+
+  @Get('random-match/status')
+  async randomMatchStatus(@Req() req: AuthedRequest) {
+    return this.pk.randomMatchStatus(req.user.userId);
+  }
+
+  @Post('random-match/cancel')
+  async cancelRandomMatch(@Req() req: AuthedRequest) {
+    return this.pk.cancelRandomMatch(req.user.userId);
+  }
+
+  @Get('team/candidates')
+  async teamCandidates(@Req() req: AuthedRequest) {
+    return this.pk.teamCandidates(req.user.userId);
+  }
+
+  @Post('team/challenge/:opponentTeamId')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  async teamChallenge(@Param('opponentTeamId') opponentTeamId: string, @Body() body: { durationSec?: number } | undefined, @Req() req: AuthedRequest) {
+    return toResponse(await this.pk.teamChallenge(req.user.userId, opponentTeamId, body?.durationSec));
+  }
+
+  @Get('agency/candidates')
+  async agencyCandidates(@Req() req: AuthedRequest) {
+    return this.pk.agencyCandidates(req.user.userId);
+  }
+
+  @Post('agency/challenge/:opponentAgencyId')
+  @UseGuards(UserThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  async agencyChallenge(@Param('opponentAgencyId') opponentAgencyId: string, @Body() body: { durationSec?: number } | undefined, @Req() req: AuthedRequest) {
+    return toResponse(await this.pk.agencyChallenge(req.user.userId, opponentAgencyId, body?.durationSec));
   }
 
   // "Random match": challenge one online creator picked for you.

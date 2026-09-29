@@ -97,3 +97,21 @@ describe('validateGameRules — Lucky Number 3-digit formula mode', () => {
     expect(() => validateGameRules(lucky, { ...lucky, basePrize: 100.5 })).toThrow(/basePrize/);
   });
 });
+
+
+describe('validateGameRules — Ludo', () => {
+  const ludo = { minEntry: 100, maxEntry: 500000, turnSeconds: 20, reconnectSeconds: 120, prizeFirstPercent: 66.67, prizeSecondPercent: 33.33, prizeFirstPercent2p: 100, botFillSeconds: 20, botPrizePercent: 100 };
+
+  it('detects and accepts the current Ludo rules', () => {
+    expect(shapeOf(ludo)).toBe('ludo');
+    expect(validateGameRules(ludo, ludo)).toMatchObject({ prizeFirstPercent: 66.67, prizeSecondPercent: 33.33, prizeFirstPercent2p: 100 });
+  });
+
+  it('requires four-player prize percentages to total 100', () => {
+    expect(() => validateGameRules(ludo, { ...ludo, prizeFirstPercent: 70, prizeSecondPercent: 20 })).toThrow(/add up to 100/);
+  });
+
+  it('allows a 100% two-player first-place rule', () => {
+    expect(validateGameRules(ludo, { ...ludo, prizeFirstPercent2p: 100 }).prizeFirstPercent2p).toBe(100);
+  });
+});

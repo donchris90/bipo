@@ -20,9 +20,39 @@ export class UsersController {
     return this.usersService.findMe(req.user.userId);
   }
 
+  @Get('me/photos')
+  myProfilePhotos(@Req() req: AuthedRequest) {
+    return this.usersService.findMyProfilePhotos(req.user.userId);
+  }
+
+  @Post('me/photos')
+  addProfilePhoto(@Body('url') url: string, @Req() req: AuthedRequest) {
+    return this.usersService.addProfilePhoto(req.user.userId, url);
+  }
+
+  @Patch('me/photos/:id/primary')
+  setPrimaryProfilePhoto(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.usersService.setPrimaryProfilePhoto(req.user.userId, id);
+  }
+
+  @Post('me/photos/:id/delete')
+  deleteProfilePhoto(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.usersService.deleteProfilePhoto(req.user.userId, id);
+  }
+
   @Get('me/referrals')
   myReferrals(@Req() req: AuthedRequest) {
     return this.usersService.findMyReferrals(req.user.userId);
+  }
+
+  @Patch('me/nearby')
+  nearby(
+    @Body('enabled') enabled: boolean,
+    @Body('latitude') latitude: number | undefined,
+    @Body('longitude') longitude: number | undefined,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.usersService.updateNearbyPreferences(req.user.userId, enabled, latitude, longitude);
   }
 
   @Get('me/check-in')
@@ -39,11 +69,13 @@ export class UsersController {
   updateMe(
     @Body('displayName') displayName: string | undefined,
     @Body('avatarUrl') avatarUrl: string | undefined,
+    @Body('coverUrl') coverUrl: string | undefined,
     @Body('bio') bio: string | undefined,
     @Body('oneOnOneEnabled') oneOnOneEnabled: boolean | undefined,
+    @Body('languageCode') languageCode: string | undefined,
     @Req() req: AuthedRequest,
   ) {
-    return this.usersService.updateMe(req.user.userId, { displayName, avatarUrl, bio, oneOnOneEnabled });
+    return this.usersService.updateMe(req.user.userId, { displayName, avatarUrl, coverUrl, bio, oneOnOneEnabled, languageCode });
   }
 
   @Patch(':id/suspend')

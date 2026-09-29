@@ -48,7 +48,9 @@ model User {
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   avatarUrl     String?
+  coverUrl      String?
   bio           String?
+  profilePhotos ProfilePhoto[]
   liveViews     LiveViewer[]
   privateLiveRequests PrivateLiveRequest[]
   liveModerators LiveModerator[]
@@ -59,6 +61,17 @@ model User {
   hostDailyTaskProgress HostDailyTaskProgress[]
 
   @@index([countryCode])
+}
+
+model ProfilePhoto {
+  id        String   @id @default(uuid())
+  userId    String
+  url       String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, sortOrder])
 }
 
 model UserRole {
@@ -534,6 +547,7 @@ model RoomSeat {
   userId     String
   seatNumber Int
   joinedAt   DateTime @default(now())
+  giftCoins  Int      @default(0)
 
   @@unique([roomId, seatNumber])
   @@unique([roomId, userId])
@@ -1024,7 +1038,14 @@ model PKBattle {
   mode            String    @default("NORMAL")
   challengerTeamId String?
   opponentTeamId   String?
+  // Family/Guild PK: mode "AGENCY". Mirrors the Team PK fields above exactly — the two agency
+  // OWNERS are challengerId/opponentId (same role as team leaders), while these hold which
+  // agency each side represents so any member's gift can be pooled into it (see
+  // GiftService.resolvePkBattleId / applyPkScore).
+  challengerAgencyId String?
+  opponentAgencyId   String?
   objectiveConfig  Json?
+  durationSec     Int       @default(180)
   createdAt       DateTime  @default(now())
   settledAt       DateTime?
 
@@ -1058,6 +1079,25 @@ model GameRegionConfig {
   enabled     Boolean @default(false)
 
   @@unique([gameCode, countryCode])
+}
+
+
+model LudoSpectatorBet {
+  id              String   @id @default(uuid())
+  matchId         String
+  userId          String
+  playerUserId    String
+  coinAmount      Int
+  rewardAmount    Int      @default(0)
+  status          GameEntryStatus @default(PLACED)
+  idempotencyKey  String   @unique
+  createdAt       DateTime @default(now())
+  settledAt       DateTime?
+
+  @@unique([matchId, userId])
+  @@index([matchId])
+  @@index([matchId, playerUserId])
+  @@index([userId])
 }
 
 model GameRound {

@@ -21,13 +21,36 @@ model User {
   referredById  String?
   lastCheckInAt DateTime?
   checkInStreak Int            @default(0)
+  // "Rryda Journey": consecutive days every one of that day's EVERYONE-audience missions was
+  // completed (see MissionDefinition.creatorOnly and MissionTierClaim). Same UTC-day rule as
+  // checkInStreak, kept separate because completing a Perfect Day is a different act from
+  // checking in.
+  perfectDayStreak Int         @default(0)
+  lastPerfectDayAt DateTime?
   hostXp        Int            @default(0)
   hostLevel     Int            @default(1)
+  // Rryda Identity: EVERY user's level, not only creators. Grows from Journey missions/chests,
+  // checking in, following someone new, and sending gifts — see RrydaLevelsService.addXp() and
+  // its call sites. Separate from hostXp/hostLevel, which stay creator-only.
+  rrydaXp       Int            @default(0)
+  rrydaLevel    Int            @default(1)
   oneOnOneEnabled Boolean       @default(true)
+  // First-run flow (pick interests, follow a few people). null = not completed yet. Existing
+  // users are backfilled to their createdAt in the migration so only NEW sign-ups see it.
+  onboardedAt   DateTime?
+  interests     UserInterest[]
+  // Nearby discovery is opt-in. Coordinates are intentionally stored rounded by the service
+  // before persistence, so the platform does not retain a user's exact GPS position.
+  nearbyEnabled Boolean         @default(false)
+  nearbyLat     Float?
+  nearbyLon     Float?
+  nearbyUpdatedAt DateTime?
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
   avatarUrl     String?
+  coverUrl      String?
   bio           String?
+  profilePhotos ProfilePhoto[]
   liveViews     LiveViewer[]
   privateLiveRequests PrivateLiveRequest[]
   liveModerators LiveModerator[]
@@ -38,6 +61,17 @@ model User {
   hostDailyTaskProgress HostDailyTaskProgress[]
 
   @@index([countryCode])
+}
+
+model ProfilePhoto {
+  id        String   @id @default(uuid())
+  userId    String
+  url       String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, sortOrder])
 }
 
 model UserRole {
@@ -74,6 +108,8 @@ model RegionalConfig {
   // Country-level economy controls.
   creatorEarningMinorPer100Coins Int?
   coinUsdCentsPer100 Int?
+  // Fiat value used to quote C2C coin orders, in minor currency units per 100 coins.
+  c2cFiatMinorPer100Coins Int?
   paymentMethods Json?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
@@ -156,6 +192,19 @@ model AuditLog {
   @@index([actorId])
   @@index([action])
   @@index([createdAt])
+}
+
+model RrydaMoment {
+  id          String   @id @default(uuid())
+  userId      String
+  type        String
+  title       String
+  description String?
+  payload     Json?
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([type, createdAt])
 }
 
 model LiveSession {
@@ -254,12 +303,242 @@ model PartyRoom {
   providerChannel String      @unique
   category        String?
   themeColor      String?
+  // When a seat frees up, should the longest-waiting queued request be seated into it
+  // automatically (true — the previous, only behavior), or does every open seat wait for the
+  // host to explicitly choose who fills it (false)? See RoomsService.releaseSeat.
+  autoAssignSeats Boolean     @default(true)
   // A video party (seats show camera) or an audio lounge (voice only). Chosen by
   // the host when starting the room; the Party tab's two filters use it.
   mode            RoomMode    @default(AUDIO)
+  // The persistent Room this session belongs to (see Room below). Nullable because
+  // existing rows predate the Room Community feature; backfilled by the migration
+  // for any host who already has sessions, and set on every create() from here on.
+  roomId          String?
 
   @@index([hostId])
   @@index([status])
+  @@index([roomId])
+}
+
+// A host's persistent room IDENTITY — separate from PartyRoom, which is one LIVE
+// SESSION of it. Before this, "the room" only ever existed for as long as one
+// session did: closing it (or the host's app dying) erased the title, theme,
+// category and any sense that the same audience had been here before. This is
+// the thing that carries across sessions, the way a Twitch channel outlives any
+// one stream. One per host for now (hostId is unique) — multiple named rooms per
+// host is a real possible future, but nothing in the product today asks a host to
+// juggle more than one, so it isn't modeled until something does.
+model Room {
+  id          String    @id @default(uuid())
+  hostId      String    @unique
+  title       String
+  description String?
+  themeColor  String?
+  category    String?
+  // Community-wide progression — grows from members visiting and gifting here
+  // (see RoomCommunityService.awardRoomXp), gated against RoomLevel below the
+  // same way HostLevel gates hostXp.
+  roomXp      Int       @default(0)
+  roomLevel   Int       @default(1)
+  // Consecutive UTC days with at least one closed session — same day-boundary
+  // rule as User.checkInStreak (see check-in-rules.ts's resolveCheckIn, reused
+  // here rather than re-implemented).
+  streak      Int       @default(0)
+  lastLiveAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([roomLevel])
+}
+
+// The room's own level curve — admin-configurable, same shape as HostLevel/
+// RrydaLevel/SupporterLevel. unlocks (room banners, entry effects, exclusive
+// seat frames) works exactly like HostLevel.unlocks.
+model RoomLevel {
+  level      Int      @id
+  name       String
+  xpRequired Int
+  unlocks    Json?
+  badgeUrl   String?
+  active     Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+}
+
+// One row per (room, member) — a visitor's standing INSIDE one specific room,
+// the room-scoped counterpart to CreatorSupporter (which tracks gifting to a
+// creator across all their content). xp grows from visiting and gifting in
+// THIS room; visitStreak/visitCount are what "regular" is computed from.
+model RoomMember {
+  id          String    @id @default(uuid())
+  roomId      String
+  userId      String
+  xp          Int       @default(0)
+  level       Int       @default(1)
+  visitCount  Int       @default(0)
+  // Same resolveCheckIn day-boundary logic as Room.streak and User.checkInStreak,
+  // scoped to this member's visits to this one room.
+  visitStreak Int       @default(0)
+  lastVisitAt DateTime?
+  // Cached, not computed on every read: true once visitCount/visitStreak cross
+  // the thresholds in RoomCommunityService, recomputed on each visit. A "regulars"
+  // list is then a plain WHERE isRegular = true, not a full-table scan every time
+  // the host opens the community tab.
+  isRegular   Boolean   @default(false)
+  joinedAt    DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([roomId, userId])
+  @@index([roomId, xp])
+  @@index([userId])
+}
+
+// The member-side level curve — global, like SupporterLevel, not per-room. A
+// member's rank in one room is denominated on the same scale as any other room,
+// the way SupporterLevel is one scale reused for every (supporter, creator) pair.
+model RoomMemberLevel {
+  level      Int      @id
+  name       String
+  xpRequired Int
+  badgeUrl   String?
+  active     Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+}
+
+// Small catalog of room-community achievements — same shape as Badge (earned
+// once, kept forever even if the underlying stat later drops).
+model RoomAchievement {
+  key         String   @id
+  label       String
+  emoji       String
+  description String
+  active      Boolean  @default(true)
+  updatedAt   DateTime @updatedAt
+}
+
+model RoomMemberAchievement {
+  id             String   @id @default(uuid())
+  roomId         String
+  userId         String
+  achievementKey String
+  earnedAt       DateTime @default(now())
+
+  @@unique([roomId, userId, achievementKey])
+  @@index([roomId, userId])
+}
+
+// Rryda Teams: a cross-platform tribe a user can join — not the same thing as Agency, which is a
+// creator payout/commission structure (see AgencyMembership). A user belongs to at most ONE team
+// at a time (a "tribe", not a set of overlapping subscriptions); both creators and supporters can
+// join. Architecture mirrors Room/RoomLevel/RoomMember on purpose — same admin-configurable level
+// curve, same addXp/level-up-notify shape — scoped to a team instead of a room.
+//
+// This is the structural core only: identity, membership, roles, XP/level, and ranking. Team
+// missions, team-specific events, and a team rewards/achievement catalog are deliberately NOT
+// part of this pass — they would all sit on top of this foundation (the way Room's achievements
+// sit on top of Room/RoomMember), and building them before the foundation exists would mean
+// redoing them once it does.
+model Team {
+  id          String       @id @default(uuid())
+  name        String       @unique
+  description String?
+  themeColor  String?
+  category    String?
+  countryCode String
+  leaderId    String       @unique
+  teamXp      Int          @default(0)
+  teamLevel   Int          @default(1)
+  createdAt   DateTime     @default(now())
+  members     TeamMember[]
+
+  @@index([countryCode])
+  @@index([teamXp])
+}
+
+enum TeamRole {
+  LEADER
+  MODERATOR
+  MEMBER
+}
+
+// One row per (team, user) — a member's own contribution to the one team they belong to. No
+// per-member level curve in this pass (unlike RoomMember, which has one) — an individual's own
+// growth is already tracked by Rryda Level; this table is about standing WITHIN the team
+// (contribution and role), not a second personal progression system.
+model TeamMember {
+  id       String   @id @default(uuid())
+  teamId   String
+  userId   String   @unique // enforces "at most one team at a time" at the database level
+  role     TeamRole @default(MEMBER)
+  xp       Int      @default(0)
+  joinedAt DateTime @default(now())
+  team     Team     @relation(fields: [teamId], references: [id])
+
+  @@index([teamId])
+}
+
+// The team's own level curve — same shape as RoomLevel/RoomMemberLevel/RrydaLevel/HostLevel.
+model TeamLevel {
+  level      Int      @id
+  name       String
+  xpRequired Int
+  badgeUrl   String?
+  active     Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+}
+
+// Rryda Seasons: a time-boxed competitive period ("Rryda Season 1", or a short one like "Friday
+// Night PK"). No separate "join" step — everyone already using the app during the window competes
+// automatically (see SeasonsService.contributePoints, wired at the same everyday-activity call
+// sites as RrydaLevelsService.addXp/TeamsService.contributeXp: missions, chests, check-in,
+// following someone new, sending a gift). Deliberately the structural core — a season's own
+// event-specific objectives ("event missions") and a dedicated event-badge catalog are NOT part
+// of this pass; they would sit on top of this foundation, same reasoning as Teams/Rooms before.
+//
+// Status is never stored — it's derived from now vs startsAt/endsAt/settledAt (see
+// SeasonsService.deriveStatus), so nothing needs a background job just to flip a flag.
+model Season {
+  id          String               @id @default(uuid())
+  name        String
+  description String?
+  startsAt    DateTime
+  endsAt      DateTime
+  settledAt   DateTime?
+  // Set once SeasonAutoStartService has broadcast the "new season started" push for this
+  // season — the same once-only guard settledAt is for settlement, so a sweep that runs twice
+  // (or two instances racing) never double-sends the announcement.
+  startNotifiedAt DateTime?
+  createdAt   DateTime             @default(now())
+  participants SeasonParticipant[]
+  rewardTiers  SeasonRewardTier[]
+
+  @@index([startsAt, endsAt])
+}
+
+// One row per (season, user) who has contributed at least once — there is no separate "join",
+// so this row is created lazily on a user's first contribution during the season's window.
+model SeasonParticipant {
+  id        String   @id @default(uuid())
+  seasonId  String
+  userId    String
+  points    Int      @default(0)
+  joinedAt  DateTime @default(now())
+  season    Season   @relation(fields: [seasonId], references: [id])
+
+  @@unique([seasonId, userId])
+  @@index([seasonId, points])
+}
+
+// Admin-configured payout bands, e.g. rank 1 -> 5000 coins, ranks 2-10 -> 1000 coins each, ranks
+// 11-50 -> 200 coins each. Applied once, by SeasonsService.settleSeason, after the season ends.
+model SeasonRewardTier {
+  id          String @id @default(uuid())
+  seasonId    String
+  minRank     Int
+  maxRank     Int
+  rewardCoins Int
+  season      Season @relation(fields: [seasonId], references: [id])
+
+  @@index([seasonId])
 }
 
 model RoomSeat {
@@ -268,6 +547,7 @@ model RoomSeat {
   userId     String
   seatNumber Int
   joinedAt   DateTime @default(now())
+  giftCoins  Int      @default(0)
 
   @@unique([roomId, seatNumber])
   @@unique([roomId, userId])
@@ -400,6 +680,51 @@ model CoinPackage {
   @@index([countryCode, active])
 }
 
+
+
+model C2COrder {
+  id               String         @id @default(uuid())
+  buyerId          String
+  sellerId         String
+  coinAmount       Int
+  fiatAmountMinor  Int
+  currencyCode     String
+  status           C2COrderStatus  @default(OPEN)
+  paymentReference String?
+  paymentProofUrl  String?
+  paymentProofNote String?
+  disputeReason    String?
+  adminNote        String?
+  expiresAt        DateTime
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  acceptedAt       DateTime?
+  paidAt           DateTime?
+  releasedAt       DateTime?
+  cancelledAt      DateTime?
+  disputedAt       DateTime?
+  resolvedAt       DateTime?
+
+  @@index([buyerId, status])
+  @@index([sellerId, status])
+  @@index([status, expiresAt])
+}
+
+model PaymentWebhookEvent {
+  id          String   @id @default(uuid())
+  provider    String
+  eventKey    String   @unique
+  eventType   String?
+  providerRef String?
+  status      String   @default("PROCESSING")
+  error       String?
+  receivedAt  DateTime @default(now())
+  processedAt DateTime?
+
+  @@index([provider, receivedAt])
+  @@index([providerRef])
+}
+
 model CoinPurchase {
   id             String         @id @default(uuid())
   userId         String
@@ -448,11 +773,13 @@ model Chargeback {
 model LoginEvent {
   id        String   @id @default(uuid())
   userId    String
-  ipAddress String?
-  createdAt DateTime @default(now())
+  ipAddress     String?
+  deviceIdHash  String?
+  createdAt     DateTime @default(now())
 
   @@index([userId])
   @@index([ipAddress])
+  @@index([deviceIdHash])
 }
 
 model GiftTransaction {
@@ -522,10 +849,41 @@ model MissionDefinition {
   target      Int
   // Paid in coins into the claimer's BONUS wallet.
   rewardCoins Int
+  // false ("everyone"): shown and claimable by every signed-in user — the Rryda Journey.
+  // true: shown only to users with the CREATOR role (the original 4 hosting-activity missions).
+  // A user with the CREATOR role sees both sets.
+  creatorOnly Boolean        @default(false)
   active      Boolean        @default(true)
   sortOrder   Int            @default(0)
   createdAt   DateTime       @default(now())
   claims      MissionClaim[]
+}
+
+// One row per (user, day, tier) chest claimed from the Rryda Journey — completing several of
+// that day's EVERYONE missions, on top of whatever each mission already pays on its own. `tier`
+// is a key from journeyTiers() (e.g. "HALFWAY", "ALL"), not a fixed number, so the reward scales
+// automatically if an admin adds or removes Journey missions later.
+model MissionTierClaim {
+  id          String   @id @default(uuid())
+  userId      String
+  periodKey   String
+  tier        String
+  rewardCoins Int
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, periodKey, tier])
+  @@index([userId, periodKey])
+}
+
+// Singleton config row (id is always "default") for the Rryda Journey chest rewards — what
+// admin.controller/missions previously hardcoded as JOURNEY_HALFWAY_REWARD_COINS /
+// JOURNEY_ALL_REWARD_COINS. Missing row = MissionsService falls back to those same defaults, so a
+// fresh install with no admin edits yet behaves exactly as before this table existed.
+model JourneyConfig {
+  id                 String   @id @default("default")
+  halfwayRewardCoins Int      @default(50)
+  allRewardCoins     Int      @default(150)
+  updatedAt          DateTime @updatedAt
 }
 
 model MissionClaim {
@@ -675,6 +1033,19 @@ model PKBattle {
   startedAt       DateTime?
   endsAt          DateTime?
   winnerId        String?
+  // Advanced PK metadata. NORMAL keeps the original 1-v-1 behavior; TEAM stores the
+  // participating team ids while the battle still uses the existing authoritative scores.
+  mode            String    @default("NORMAL")
+  challengerTeamId String?
+  opponentTeamId   String?
+  // Family/Guild PK: mode "AGENCY". Mirrors the Team PK fields above exactly — the two agency
+  // OWNERS are challengerId/opponentId (same role as team leaders), while these hold which
+  // agency each side represents so any member's gift can be pooled into it (see
+  // GiftService.resolvePkBattleId / applyPkScore).
+  challengerAgencyId String?
+  opponentAgencyId   String?
+  objectiveConfig  Json?
+  durationSec     Int       @default(180)
   createdAt       DateTime  @default(now())
   settledAt       DateTime?
 
@@ -708,6 +1079,25 @@ model GameRegionConfig {
   enabled     Boolean @default(false)
 
   @@unique([gameCode, countryCode])
+}
+
+
+model LudoSpectatorBet {
+  id              String   @id @default(uuid())
+  matchId         String
+  userId          String
+  playerUserId    String
+  coinAmount      Int
+  rewardAmount    Int      @default(0)
+  status          GameEntryStatus @default(PLACED)
+  idempotencyKey  String   @unique
+  createdAt       DateTime @default(now())
+  settledAt       DateTime?
+
+  @@unique([matchId, userId])
+  @@index([matchId])
+  @@index([matchId, playerUserId])
+  @@index([userId])
 }
 
 model GameRound {
@@ -790,6 +1180,29 @@ enum NotificationType {
   HOST_TASK_COMPLETED
   HOST_ACHIEVEMENT
   HOST_RANKING
+  // Rryda Identity level-up, for every user (see HOST_LEVEL_UP for the creator-only equivalent).
+  RRYDA_LEVEL_UP
+  BADGE_EARNED
+  // Sent to a host's followers and fellow agency members when they go live or open a party room
+  // (see common/friend-announce.ts).
+  FOLLOWED_HOST_LIVE
+  FOLLOWED_HOST_ROOM
+  // Supporter level-up on a specific creator (see SUPPORTER_LEVEL_UP for the creator-only
+  // equivalent of RRYDA_LEVEL_UP / HOST_LEVEL_UP — this one is per (supporter, creator) pair).
+  SUPPORTER_LEVEL_UP
+  // Room Community: the room's own level curve (sent to the host) vs. ROOM_MEMBER_LEVEL_UP
+  // (sent to a visitor about their own standing in one room — the Room/RoomMember split
+  // mirrors HOST_LEVEL_UP/SUPPORTER_LEVEL_UP above).
+  ROOM_LEVEL_UP
+  ROOM_MEMBER_LEVEL_UP
+  // A visitor just crossed the "regular" threshold in one of the rooms they attend.
+  ROOM_REGULAR
+  ROOM_ACHIEVEMENT
+  // Rryda Teams: the team's own level curve, sent to the team's leader (same reasoning as
+  // ROOM_LEVEL_UP going to the room's host, not every visitor).
+  TEAM_LEVEL_UP
+  // A season ended and this user was in a reward tier — see SeasonsService.settleSeason.
+  SEASON_REWARD
 }
 
 enum LiveStatus {
@@ -855,6 +1268,17 @@ enum WalletType {
   BONUS
 }
 
+enum C2COrderStatus {
+  OPEN
+  ACCEPTED
+  PAYMENT_SUBMITTED
+  RELEASED
+  CANCELLED
+  DISPUTED
+  REFUNDED
+  EXPIRED
+}
+
 enum LedgerEntryType {
   COIN_PURCHASE
   GIFT_SENT
@@ -870,6 +1294,9 @@ enum LedgerEntryType {
   AGENCY_COMMISSION
   PK_SCORE
   PRIVATE_LIVE_PAYMENT
+  C2C_ESCROW
+  C2C_RELEASE
+  C2C_REFUND
 }
 
 enum PurchaseStatus {
@@ -940,6 +1367,14 @@ enum MissionMetric {
   PK_WINS
   GIFT_COINS_RECEIVED
   NEW_FOLLOWERS
+  // Added for the Rryda Journey: available to every user, not only creators (see
+  // MissionDefinition.creatorOnly). Each is counted from data that already exists elsewhere
+  // (chat, gifts, game rounds, live viewing, follows) — no new activity logging was needed.
+  MESSAGES_SENT
+  GIFTS_SENT
+  GAMES_PLAYED
+  LIVE_SESSIONS_WATCHED
+  NEW_FOLLOWS_MADE
 }
 
 enum WithdrawalStatus {
@@ -1125,6 +1560,83 @@ model HostXpRule {
   updatedAt   DateTime @updatedAt
 }
 
+// The generic level curve for RrydaLevelsService — every user's identity level, independent of
+// HostLevel (which only ever applies to creators and gates creator features). This one gates
+// nothing yet; it exists to give every user's activity somewhere to add up to.
+model RrydaLevel {
+  level      Int      @id
+  name       String
+  xpRequired Int
+  badgeUrl   String?
+  active     Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+}
+
+// A small, deliberately short catalog of prestige badges (see BadgesService) — earned once and
+// kept forever, never re-evaluated away if the underlying stat later drops (a 7-day streak badge
+// stays even if the streak later breaks; that is the point of a badge versus a live stat).
+model Badge {
+  key         String      @id
+  label       String
+  emoji       String
+  description String
+  active      Boolean     @default(true)
+  sortOrder   Int         @default(0)
+  updatedAt   DateTime    @updatedAt
+  earners     UserBadge[]
+}
+
+model UserBadge {
+  id        String   @id @default(uuid())
+  userId    String
+  badgeKey  String
+  earnedAt  DateTime @default(now())
+  badge     Badge    @relation(fields: [badgeKey], references: [key])
+
+  @@unique([userId, badgeKey])
+  @@index([userId])
+}
+
+// The level curve for SupporterLevelsService — mirrors RrydaLevel/HostLevel in shape
+// (admin-configurable table + addXp()), but the XP it tracks is scoped to ONE creator at a
+// time: it's "how much you've supported THIS creator", not a platform-wide stat. xpRequired is
+// denominated directly in lifetime coins gifted, since that's the one thing this progression is
+// meant to reward — no unit conversion, unlike RrydaLevel's smaller everyday-XP curve.
+model SupporterLevel {
+  level      Int      @id
+  name       String
+  xpRequired Int
+  badgeUrl   String?
+  active     Boolean  @default(true)
+  updatedAt  DateTime @updatedAt
+  fanClubJoinedAt DateTime?
+}
+
+// The per-relationship record itself: one row per (supporter, creator) pair, holding that pair's
+// lifetime gifted coins and current level. Deliberately its own table rather than a column on
+// GiftTransaction — GiftTransaction is an immutable ledger of individual gifts; this is the
+// running total derived from it, updated once per gift the same way User.rrydaXp is.
+model CreatorSupporter {
+  id             String   @id @default(uuid())
+  supporterId    String
+  creatorId      String
+  xp             Int      @default(0)
+  level          Int      @default(1)
+  totalGiftCoins Int      @default(0)
+  giftCount      Int      @default(0)
+  firstGiftAt    DateTime @default(now())
+  lastGiftAt     DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  fanClubJoinedAt DateTime?
+
+  @@unique([supporterId, creatorId])
+  // Powers a creator's "top supporters" leaderboard (lifetime, unlike live.service.ts's
+  // per-session topGifters groupBy) — ordered by creatorId, then rank within it.
+  @@index([creatorId, xp])
+  // Powers "creators I support" on a user's own profile.
+  @@index([supporterId])
+}
+
 model HostDailyTask {
   id          String   @id @default(uuid())
   key         String   @unique
@@ -1148,4 +1660,68 @@ model HostDailyTaskProgress {
   task        HostDailyTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
   @@unique([userId, taskId, day])
   @@index([userId, day])
+}
+
+
+// ---- Onboarding ------------------------------------------------------------------------------
+// A small curated catalog of interests a new user picks from on first run (same shape as Badge).
+model Interest {
+  key    String         @id
+  label  String
+  emoji  String
+  active Boolean        @default(true)
+  users  UserInterest[]
+}
+
+model UserInterest {
+  id          String   @id @default(uuid())
+  userId      String
+  interestKey String
+  user        User     @relation(fields: [userId], references: [id])
+  interest    Interest @relation(fields: [interestKey], references: [key])
+
+  @@unique([userId, interestKey])
+  @@index([userId])
+}
+
+// ---- Random 1-on-1 video match ---------------------------------------------------------------
+// One row per user currently looking for a match. Pairing is claim-based (see MatchingService),
+// so it stays correct with several backend instances and needs no Redis.
+enum MatchTicketStatus {
+  WAITING
+  MATCHED
+}
+
+model MatchTicket {
+  id              String            @id @default(uuid())
+  userId          String            @unique
+  status          MatchTicketStatus @default(WAITING)
+  countryCode     String
+  sameCountryOnly Boolean           @default(false)
+  sessionId       String?
+  createdAt       DateTime          @default(now())
+  lastSeenAt      DateTime          @default(now())
+
+  @@index([status, createdAt])
+}
+
+enum MatchSessionStatus {
+  ACTIVE
+  ENDED
+}
+
+model MatchSession {
+  id              String             @id @default(uuid())
+  userAId         String
+  userBId         String
+  providerChannel String             @unique
+  status          MatchSessionStatus @default(ACTIVE)
+  aLiked          Boolean            @default(false)
+  bLiked          Boolean            @default(false)
+  endedById       String?
+  createdAt       DateTime           @default(now())
+  endedAt         DateTime?
+
+  @@index([userAId, status])
+  @@index([userBId, status])
 }

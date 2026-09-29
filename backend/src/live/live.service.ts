@@ -18,8 +18,12 @@ import { fetchChatHistory } from '../common/chat-history';
 import { ModerationService } from '../moderation/moderation.service';
 import { WalletService } from '../economy/wallet.service';
 import { RevenueSplitService } from '../economy/revenue-split.service';
+import { GifterService } from '../economy/gifter.service';
 import { LedgerEntryType, WalletType } from '@prisma/client';
 import { HostLevelsService } from '../host-levels/host-levels.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { SeasonsService } from '../seasons/seasons.service';
+import { announceToFollowersAndAgency } from '../common/friend-announce';
 
 export const RTC_PROVIDER = 'RTC_PROVIDER';
 
@@ -33,10 +37,13 @@ export class LiveService {
     private readonly moderation: ModerationService,
     private readonly wallet: WalletService,
     private readonly revenueSplit: RevenueSplitService,
+    private readonly gifters: GifterService,
     // Optional parameters must come last (TypeScript rejects a required one
     // after it; SWC let it through, ts-jest did not).
     @Optional() private readonly media?: LiveMediaService,
     @Optional() private readonly hostLevels?: HostLevelsService,
+    @Optional() private readonly notifications?: NotificationsService,
+    @Optional() private readonly seasons?: SeasonsService,
   ) {}
 
   // Per-user like throttle: recent (timestamp, count) entries within the
@@ -140,6 +147,14 @@ export class LiveService {
     });
 
     const token = await this.rtc.generateToken(channelName, hostId, 'host');
+
+    if (this.notifications) {
+      const host = await this.prisma.user.findUnique({ where: { id: hostId }, select: { displayName: true, avatarUrl: true } });
+      void announceToFollowersAndAgency(this.prisma, this.notifications, hostId, 'FOLLOWED_HOST_LIVE', {
+        hostId, hostDisplayName: host?.displayName ?? null, avatarUrl: host?.avatarUrl ?? null, sessionId, title,
+      }, this.realtime);
+    }
+
     return { session, token };
   }
 
@@ -185,7 +200,7 @@ export class LiveService {
     // Everything the viewer's header needs in the same round trip: who the
     // host really is (the screen used to show the stream title and a letter
     // as the "host"), whether I already follow them, and the live count.
-    const [host, follow, viewerCount] = await Promise.all([
+    const [host, follow, viewerCount, entrance] = await Promise.all([
       this.prisma.user.findUnique({ where: { id: session.hostId }, select: { id: true, displayName: true, avatarUrl: true } }),
       session.hostId === userId
         ? Promise.resolve(null)
@@ -194,7 +209,21 @@ export class LiveService {
             select: { followerId: true },
           }),
       this.prisma.liveViewer.count({ where: { sessionId, leftAt: null } }),
+      session.hostId === userId ? Promise.resolve(null) : this.gifters.entrance(userId).catch(() => null),
     ]);
+
+    // VIP entrance is an ephemeral live-room event. It is deliberately not stored in chat
+    // history: reconnecting viewers should not replay old entrance banners.
+    if (entrance?.vip) {
+      this.realtime.broadcastLiveEntrance(sessionId, {
+        userId,
+        displayName: entrance.displayName,
+        avatarUrl: entrance.avatarUrl,
+        tier: entrance.tier,
+        level: entrance.level,
+        message: `${entrance.displayName ?? 'A VIP'} entered the live`,
+      });
+    }
 
     return {
       session,
@@ -518,6 +547,12 @@ export class LiveService {
       where: { id: session.id },
       data: { status: 'ENDED', endedAt, durationSeconds },
     });
+
+    if (this.seasons) {
+      // Hosting is a core Rryda activity. Award a bounded Season signal at session end;
+      // the season layer is best-effort and must never block ending the live.
+      void this.seasons.contributePoints(session.hostId, Math.min(70, 10 + Math.floor(durationSeconds / 300)));
+    }
 
     if (this.hostLevels && durationSeconds >= 60) {
       try { await this.hostLevels.awardRule(session.hostId, 'LIVE_MINUTE', Math.floor(durationSeconds / 60)); } catch { /* progression must never block ending a live */ }

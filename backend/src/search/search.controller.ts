@@ -11,4 +11,9 @@ export class SearchController {
   users(@Query('q') q: string) {
     return this.search.searchUsers(q ?? '');
   }
+
+  @Get('all')
+  all(@Query('q') q: string) {
+    return this.search.searchAll(q ?? '');
+  }
 }

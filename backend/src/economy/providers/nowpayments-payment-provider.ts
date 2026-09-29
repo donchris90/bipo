@@ -49,7 +49,7 @@ export class NowPaymentsPaymentProvider implements PaymentProvider {
     return (this.config.get<string>('NOWPAYMENTS_PAY_CURRENCY') ?? 'USDTTRC20').toLowerCase();
   }
 
-  async createPayment(params: { amountMinor: number; currencyCode: string; userId: string; idempotencyKey: string }): Promise<CreatePaymentResult> {
+  async createPayment(params: { amountMinor: number; currencyCode: string; userId: string; idempotencyKey: string; method?: string }): Promise<CreatePaymentResult> {
     if (params.currencyCode.toUpperCase() !== this.priceCurrency) {
       throw new Error(`NOWPayments is configured for ${this.priceCurrency}, not ${params.currencyCode}`);
     }
@@ -117,7 +117,8 @@ export class NowPaymentsPaymentProvider implements PaymentProvider {
     if (!id) return { providerRef: '', status: 'ignored' as const };
     const status = String(payload?.payment_status ?? '').toLowerCase();
     if (status === 'finished') return { providerRef: `np_${id}`, status: 'confirmed' as const };
-    if (['failed', 'expired', 'refunded'].includes(status)) return { providerRef: `np_${id}`, status: 'failed' as const };
+    if (status === 'refunded') return { providerRef: `np_${id}`, status: 'refunded' as const };
+    if (['failed', 'expired'].includes(status)) return { providerRef: `np_${id}`, status: 'failed' as const };
     return { providerRef: `np_${id}`, status: 'ignored' as const };
   }
 }

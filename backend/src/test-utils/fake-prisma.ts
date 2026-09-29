@@ -74,8 +74,62 @@ export class FakePrisma {
     },
   };
 
+  // key: battle id. Real enough to test resolvePkBattleId / applyPkScore end-to-end — direct
+  // 1v1, Team, and Agency modes all resolve through the same findFirst/create/updateMany shape
+  // the real code uses.
+  pkBattles = new Map<string, any>();
+  private pkBattleSeq = 0;
+
   pKBattle = {
-    findUnique: async () => null, // no PK tests exercise this path here
+    findUnique: async ({ where: { id } }: any) => this.pkBattles.get(id) ?? null,
+    findFirst: async ({ where, orderBy }: any) => {
+      let rows = [...this.pkBattles.values()].filter((b) => {
+        if (where.status && b.status !== where.status) return false;
+        if (where.mode && b.mode !== where.mode) return false;
+        if (where.OR) {
+          const matches = where.OR.some((cond: any) => Object.entries(cond).every(([k, v]) => b[k] === v));
+          if (!matches) return false;
+        }
+        return true;
+      });
+      if (orderBy?.startedAt === 'desc') rows = rows.sort((a, b) => (b.startedAt?.getTime() ?? 0) - (a.startedAt?.getTime() ?? 0));
+      return rows[0] ?? null;
+    },
+    create: async ({ data }: any) => {
+      const battle = { id: `battle_${this.pkBattleSeq++}`, scoreChallenger: 0n, scoreOpponent: 0n, status: 'CHALLENGED', createdAt: new Date(), ...data };
+      this.pkBattles.set(battle.id, battle);
+      return battle;
+    },
+    updateMany: async ({ where, data }: any) => {
+      const rows = [...this.pkBattles.values()].filter((b) => b.id === where.id && (!where.status || b.status === where.status));
+      for (const b of rows) {
+        if (data.scoreChallenger?.increment !== undefined) b.scoreChallenger = (b.scoreChallenger ?? 0n) + data.scoreChallenger.increment;
+        if (data.scoreOpponent?.increment !== undefined) b.scoreOpponent = (b.scoreOpponent ?? 0n) + data.scoreOpponent.increment;
+      }
+      return { count: rows.length };
+    },
+  };
+
+  pKScoreConfig = {
+    findFirst: async () => null, // no test here overrides the default 1-coin-per-point rate
+  };
+
+  // key: userId — a user is on at most one team, matching the real uniqueness rule.
+  teamMembers = new Map<string, any>();
+  teamMember = {
+    findUnique: async ({ where: { userId } }: any) => this.teamMembers.get(userId) ?? null,
+  };
+
+  // key: sessionId
+  liveSessions = new Map<string, any>();
+  liveSession = {
+    findFirst: async ({ where }: any) => {
+      const s = this.liveSessions.get(where.id);
+      if (!s) return null;
+      if (where.hostId && s.hostId !== where.hostId) return null;
+      if (where.status && s.status !== where.status) return null;
+      return s;
+    },
   };
 
   agencyMemberships = new Map<string, any>(); // key: creatorId (only one ACTIVE membership per creator, matches the real uniqueness rule)
@@ -90,12 +144,47 @@ export class FakePrisma {
 
   agency = {
     findUnique: async ({ where: { id } }: any) => this.agencies.get(id) ?? null,
+    // Only ever queried by ownerId here (agency ownership check for Family PK) — not a general
+    // filter, matches exactly what GiftService/PkService actually ask for.
+    findFirst: async ({ where }: any) => {
+      const a = [...this.agencies.values()].find((a) => a.ownerId === where.ownerId);
+      return a && (!where.status || a.status === where.status) ? a : null;
+    },
   };
 
   revenueSplitConfig = {
     findFirst: async ({ where }: any) =>
       this.revenueSplitConfigs.find((c) => c.scope === where.scope && (!where.scopeKey || c.scopeKey === where.scopeKey)) ??
       null,
+  };
+
+  // key: `${roomId}:${userId}` — matches the real @@unique([roomId, userId]) on RoomSeat.
+  roomSeats = new Map<string, any>();
+
+  roomSeat = {
+    // Only updateMany is used by the code under test (GiftService.send, for the ROOM-context
+    // per-seat gift total). At most one row can ever match, since (roomId, userId) is unique —
+    // matching zero rows (the recipient isn't actually seated) is a normal no-op, not an error.
+    updateMany: async ({ where, data }: any) => {
+      const key = `${where.roomId}:${where.userId}`;
+      const seat = this.roomSeats.get(key);
+      if (!seat) return { count: 0 };
+      if (data.giftCoins?.increment !== undefined) seat.giftCoins = (seat.giftCoins ?? 0) + data.giftCoins.increment;
+      return { count: 1 };
+    },
+  };
+
+  // Row-locking read used by WalletService.applyMovement (`SELECT ... FOR UPDATE`) before it
+  // debits/credits a balance. There is no concurrency to simulate here — these tests run
+  // sequentially — so this only needs to hand back the wallet's current row. Recognizes the
+  // query by shape (the id is the tagged template's first interpolated value) rather than by
+  // parsing SQL text, since that's all Prisma.sql actually gives us to go on. If a second raw
+  // query is ever added elsewhere, this will need a real dispatch — it deliberately doesn't try
+  // to guess that in advance.
+  $queryRaw = async (query: any) => {
+    const walletId = query?.values?.[0];
+    const wallet = walletId ? [...this.wallets.values()].find((w) => w.id === walletId) : undefined;
+    return wallet ? [{ id: wallet.id, balance: wallet.balance }] : [];
   };
 
   $transaction = async (cb: (tx: any) => Promise<any>) => cb(this);

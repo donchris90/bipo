@@ -22,4 +22,8 @@ export class RegisterDto {
   @IsOptional()
   @IsString()
   referralCode?: string;
+  @IsOptional()
+  @IsString()
+  @Length(16, 200)
+  deviceId?: string;
 }

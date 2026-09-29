@@ -10,6 +10,7 @@ const RECOMMENDED: { name: string; effect: string }[] = [
   { name: 'PAYSTACK_SECRET_KEY', effect: 'coin purchases, bank lookups and payouts are unavailable (503)' },
   { name: 'S3_BUCKET', effect: 'video uploads are unavailable (503)' },
   { name: 'CORS_ORIGINS', effect: 'the admin dashboard cannot connect from a browser' },
+  { name: 'GOOGLE_TRANSLATE_API_KEY', effect: 'automatic machine translation falls back to the original English text' },
 ];
 
 export function checkEnv(env: Record<string, string | undefined>, production: boolean) {

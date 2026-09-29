@@ -36,7 +36,7 @@ export class RoomsController {
 
   @Get(':id/chat')
   chat(@Param('id') id: string, @Query('limit') limit?: string, @Query('before') before?: string) {
-    return this.rooms.chatHistory(id, limit ? Number(limit) : undefined, before);
+    return this.rooms.chatHistory(id, req.user.userId, limit ? Number(limit) : undefined, before);
   }
 
   @Patch(':id/theme')
@@ -165,6 +165,11 @@ export class RoomsController {
   @Patch(':id/mode')
   setMode(@Param('id') id: string, @Body('mode') mode: string, @Req() req: AuthedRequest) {
     return this.rooms.setMode(id, req.user.userId, mode);
+  }
+
+  @Patch(':id/auto-assign')
+  setAutoAssign(@Param('id') id: string, @Body('enabled') enabled: boolean, @Req() req: AuthedRequest) {
+    return this.rooms.setAutoAssign(id, req.user.userId, enabled === true);
   }
 
   @Patch(':id/seat-count')

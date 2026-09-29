@@ -34,8 +34,19 @@ import { AnnouncementsModule } from './announcements/announcements.module';
 import { ProfilesModule } from './profiles/profiles.module';
 import { WebhookRouterModule } from './common/webhook-router.service';
 import { HostLevelsModule } from './host-levels/host-levels.module';
+import { RrydaLevelsModule } from './rryda-levels/rryda-levels.module';
+import { SupporterLevelsModule } from './supporters/supporter-levels.module';
+import { FanClubsModule } from './fan-clubs/fan-clubs.module';
+import { BadgesModule } from './badges/badges.module';
+import { TeamsModule } from './teams/teams.module';
+import { SeasonsModule } from './seasons/seasons.module';
+import { OnboardingModule } from './onboarding/onboarding.module';
+import { MatchingModule } from './matching/matching.module';
 import { ModerationModule } from './moderation/moderation.module';
 import { HealthModule } from './health/health.module';
+import { C2CModule } from './c2c/c2c.module';
+import { RrydaExperienceModule } from './experience/experience.module';
+import { TranslationModule } from './translation/translation.module';
 
 @Module({
   imports: [
@@ -74,8 +85,19 @@ import { HealthModule } from './health/health.module';
     ProfilesModule,
     WebhookRouterModule,
     HostLevelsModule,
+    RrydaLevelsModule,
+    SupporterLevelsModule,
+    FanClubsModule,
+    BadgesModule,
+    TeamsModule,
+    SeasonsModule,
+    OnboardingModule,
+    MatchingModule,
     ModerationModule,
     HealthModule,
+    C2CModule,
+    RrydaExperienceModule,
+    TranslationModule,
   ],
 })
 export class AppModule {}

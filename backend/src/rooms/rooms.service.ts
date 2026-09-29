@@ -11,6 +11,9 @@ import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { NotificationsService } from '../notifications/notifications.service';
 import { assertNotBlocked } from '../common/blocks';
 import { publicName } from '../common/public-name';
+import { LudoService } from '../games/ludo.service';
+import { announceToFollowersAndAgency } from '../common/friend-announce';
+import { RoomCommunityService } from './room-community.service';
 
 @Injectable()
 export class RoomsService {
@@ -21,6 +24,8 @@ export class RoomsService {
     @Inject(RTC_PROVIDER) private readonly rtc: RtcProvider,
     private readonly realtime: RealtimeGateway,
     private readonly notifications: NotificationsService,
+    private readonly ludo: LudoService,
+    private readonly roomCommunity: RoomCommunityService,
   ) {}
 
   async create(hostId: string, title: string, privacy: RoomPrivacy, seatCount: number, countryCode: string, category?: string, themeColor?: string, mode?: string) {
@@ -29,6 +34,15 @@ export class RoomsService {
     // could be created, seats assigned, moderation applied, but nothing
     // ever gave anyone in it an actual voice channel to speak on.
     const { channelName } = await this.rtc.createChannel(`room-${Date.now()}`);
+    // Persistent Room identity (see RoomCommunityService) — created once per host on their
+    // very first session, reused (never overwritten from session input) on every one after.
+    // This is the piece that used to be missing entirely: a host's room used to only ever
+    // exist for the lifetime of one PartyRoom row.
+    const persistentRoom = await this.roomCommunity.getOrCreateRoomForHost(hostId, {
+      title,
+      themeColor: themeColor && /^#[0-9A-Fa-f]{6}$/.test(themeColor) ? themeColor : null,
+      category,
+    });
     const room = await this.prisma.partyRoom.create({
       data: {
         hostId,
@@ -40,6 +54,7 @@ export class RoomsService {
         category,
         themeColor: themeColor && /^#[0-9A-Fa-f]{6}$/.test(themeColor) ? themeColor : null,
         mode: mode === 'VIDEO' ? 'VIDEO' : 'AUDIO',
+        roomId: persistentRoom.id,
       },
     });
     // Host occupies seat 0 by convention. Guest seats start EMPTY and OPEN.
@@ -47,6 +62,12 @@ export class RoomsService {
     // used when there is no vacant unlocked seat (or when the guest explicitly
     // presses Join queue). Locks are explicit host/moderator actions only.
     await this.prisma.roomSeat.create({ data: { roomId: room.id, userId: hostId, seatNumber: 0 } });
+
+    const host = await this.prisma.user.findUnique({ where: { id: hostId }, select: { displayName: true, avatarUrl: true } });
+    void announceToFollowersAndAgency(this.prisma, this.notifications, hostId, 'FOLLOWED_HOST_ROOM', {
+      hostId, hostDisplayName: host?.displayName ?? null, avatarUrl: host?.avatarUrl ?? null, roomId: room.id, title,
+    }, this.realtime);
+
     return room;
   }
 
@@ -101,6 +122,7 @@ export class RoomsService {
   async getRoomDetails(roomId: string, viewerId: string) {
     const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
     if (!room) throw new NotFoundException('Room not found');
+    await this.assertRoomAccess(room, viewerId);
 
     const seats = await this.prisma.roomSeat.findMany({ where: { roomId }, orderBy: { seatNumber: 'asc' } });
     const users = await this.prisma.user.findMany({
@@ -114,12 +136,17 @@ export class RoomsService {
     // ever told the client who the moderators actually are, so mobile
     // could only ever show those controls to the literal host, hiding
     // real capabilities a moderator genuinely has.
-    const [moderators, mutedUserIds, locks, giftAgg, giftByRecipient] = await Promise.all([
+    const [moderators, mutedUserIds, locks, giftAgg, giftByRecipient, community] = await Promise.all([
       this.prisma.roomModerator.findMany({ where: { roomId }, select: { userId: true } }),
       this.moderation.mutedUserIds('ROOM', roomId),
       this.prisma.roomSeatLock.findMany({ where: { roomId }, select: { seatNumber: true } }),
       this.prisma.giftTransaction.aggregate({ where: { context: 'ROOM', contextId: roomId }, _sum: { coinAmount: true } }),
       this.prisma.giftTransaction.groupBy({ by: ['recipientId'], where: { context: 'ROOM', contextId: roomId }, _sum: { coinAmount: true } }),
+      // The persistent Room's level/streak, folded straight into the session payload so the
+      // header badge on mobile doesn't need a second request to the community endpoint — that
+      // endpoint (and communitySnapshot's fuller shape) is still what the Community tab itself
+      // uses for member/regular counts and the viewer's own standing.
+      this.roomCommunity.roomLevelSummary(room.roomId),
     ]);
     const profileGiftAgg = await this.prisma.giftTransaction.aggregate({
       where: { recipientId: viewerId },
@@ -136,6 +163,7 @@ export class RoomsService {
       giftCoins: giftAgg._sum.coinAmount ?? 0,
       seatGiftCoins,
       profileGiftCoins: profileGiftAgg._sum.coinAmount ?? 0,
+      community,
       seats: seats.map((s) => ({
         seatNumber: s.seatNumber,
         userId: s.userId,
@@ -159,6 +187,11 @@ export class RoomsService {
     if (await this.moderation.isBanned('ROOM', roomId, userId)) {
       throw new ForbiddenException('You are banned from this room');
     }
+    // INVITE_ONLY is an access boundary, not just a seat-request rule. A
+    // caller must already be the host, hold a seat, or have accepted a host
+    // invitation before we issue an RTC token. This prevents an uninvited
+    // user from bypassing the invite flow by calling /join directly.
+    await this.assertRoomAccess(room, userId);
 
     const seat = await this.prisma.roomSeat.findFirst({ where: { roomId, userId } });
     // A muted guest keeps their seat but is issued a subscribe-only token,
@@ -167,6 +200,9 @@ export class RoomsService {
     const muted = await this.moderation.isMuted('ROOM', roomId, userId);
     const role = seat && !muted ? 'host' : 'audience';
     const token = await this.rtc.generateToken(room.providerChannel, userId, role);
+    // Best-effort, never awaited into the join path's latency: this is what turns "entered a
+    // session" into "visited this community" (see RoomCommunityService.recordVisit).
+    void this.roomCommunity.recordVisit(room.roomId, userId);
     return { room, token, role, muted };
   }
 
@@ -192,9 +228,9 @@ export class RoomsService {
       if (!follows) throw new ForbiddenException('Only followers of the host can request a seat in this room');
     }
 
-    // INVITE_ONLY requires a host invitation before the user may enter the
-    // queue. A user who already accepted a host invitation is represented by
-    // an ACCEPTED request and is already in the queue.
+    // INVITE_ONLY requires the guest to accept the host invitation before
+    // they may enter the queue. A pending invite is intentionally not treated
+    // as access: the popup's Join action must call acceptInvite() first.
     const acceptedInvite = await this.prisma.seatRequest.findFirst({
       where: { roomId, userId, status: 'ACCEPTED', invitedByHost: true },
     });
@@ -203,10 +239,7 @@ export class RoomsService {
     }
 
     if (room.privacy === 'INVITE_ONLY') {
-      const invite = await this.prisma.seatRequest.findFirst({
-        where: { roomId, userId, status: 'PENDING', invitedByHost: true },
-      });
-      if (!invite) throw new ForbiddenException('You must be invited to request a seat in this room');
+      throw new ForbiddenException('You must accept an invitation before requesting a seat in this room');
     }
 
     const existingPending = await this.prisma.seatRequest.findFirst({
@@ -221,6 +254,22 @@ export class RoomsService {
     });
     this.emitRoomState(roomId, 'SEAT_REQUESTED', userId, { requestId: request.id });
     return { requested: true, requestId: request.id, waitingForSeat: true };
+  }
+
+  private async assertRoomAccess(room: { id: string; hostId: string; privacy: RoomPrivacy }, userId: string) {
+    if (room.privacy !== 'INVITE_ONLY' || room.hostId === userId) return;
+
+    const [seat, acceptedInvite] = await Promise.all([
+      this.prisma.roomSeat.findFirst({ where: { roomId: room.id, userId }, select: { id: true } }),
+      this.prisma.seatRequest.findFirst({
+        where: { roomId: room.id, userId, status: 'ACCEPTED', invitedByHost: true },
+        select: { id: true },
+      }),
+    ]);
+
+    if (!seat && !acceptedInvite) {
+      throw new ForbiddenException('This room is invite-only');
+    }
   }
 
   private async assertHostOrModerator(roomId: string, userId: string) {
@@ -251,10 +300,13 @@ export class RoomsService {
       if (!follows) throw new ForbiddenException('Only followers of the host can join this room');
     }
     if (room.privacy === 'INVITE_ONLY') {
+      // A pending invite is not enough to enter through the direct seat
+      // endpoint. The guest must accept the invite first; acceptInvite()
+      // changes it to ACCEPTED (or seats them immediately).
       const invite = await this.prisma.seatRequest.findFirst({
-        where: { roomId, userId, status: { in: ['PENDING', 'ACCEPTED'] }, invitedByHost: true },
+        where: { roomId, userId, status: 'ACCEPTED', invitedByHost: true },
       });
-      if (!invite) throw new ForbiddenException('You must be invited to join this room');
+      if (!invite) throw new ForbiddenException('You must accept an invitation before joining this room');
     }
 
     const existingSeat = await this.prisma.roomSeat.findFirst({ where: { roomId, userId } });
@@ -727,13 +779,16 @@ export class RoomsService {
 
   // Idempotent: closing a room that is already closed returns it untouched, so a
   // repeated call (or the sweeper racing the host) can't rewrite the close time.
-  private async finishClose(room: { id: string; providerChannel: string; status: string }) {
+  private async finishClose(room: { id: string; providerChannel: string; status: string; roomId?: string | null }) {
     if (room.status === 'CLOSED') return this.prisma.partyRoom.findUniqueOrThrow({ where: { id: room.id } });
     await this.rtc.destroyChannel(room.providerChannel);
     const closed = await this.prisma.partyRoom.update({
       where: { id: room.id },
       data: { status: 'CLOSED', closedAt: new Date() },
     });
+    // Room streak bookkeeping (see RoomCommunityService.recordHostSession) — a session having
+    // actually happened and closed is what counts as "the room was live today".
+    void this.roomCommunity.recordHostSession(closed.roomId);
     // Everyone still inside must be told. Before, guests sat in a dead,
     // silent room until they left on their own.
     try {
@@ -749,6 +804,14 @@ export class RoomsService {
       });
     } catch {
       /* best effort — findMyInvites already hides closed rooms */
+    }
+    // A Ludo table hosted by this room must not become an orphan: cancel it if nothing was
+    // staked yet, or leave it running to a normal finish if real coins are already in it. Never
+    // silently delete a table with money in it.
+    try {
+      await this.ludo.resolvePartyLudoOnRoomClose(room.id);
+    } catch {
+      /* the table's own reconnect/timeout handling still resolves it either way */
     }
     return closed;
   }
@@ -808,9 +871,10 @@ export class RoomsService {
     return { themeColor: updated.themeColor };
   }
 
-  async chatHistory(roomId: string, limit?: number, before?: string) {
-    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { id: true } });
+  async chatHistory(roomId: string, viewerId: string, limit?: number, before?: string) {
+    const room = await this.prisma.partyRoom.findUnique({ where: { id: roomId } });
     if (!room) throw new NotFoundException('Room not found');
+    await this.assertRoomAccess(room, viewerId);
     return fetchChatHistory(this.prisma, 'ROOM', roomId, { limit, before });
   }
 

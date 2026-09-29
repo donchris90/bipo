@@ -50,4 +50,54 @@ export class PushService {
       this.logger.warn(`Push to ${userId} failed: ${e?.message ?? e}`);
     }
   }
+
+  // Every registered device, not one user's — for platform-wide pushes (a season starting),
+  // where there is no single recipient. Unlike sendToUser/announceToFollowersAndAgency (which
+  // load their (small, capped) recipient set in one findMany), the whole PushToken table can be
+  // arbitrarily large, so this pages through it with cursor pagination rather than loading it
+  // all into memory at once. Each page is still handed to the provider as-is; provider.send
+  // does its own further chunking (EXPO_MAX_BATCH) for the actual HTTP calls.
+  //
+  // Best-effort like sendToUser: a page that fails to send is logged and skipped, never thrown,
+  // and never blocks the pages after it.
+  async broadcastToAll(
+    message: { title: string; body: string; data?: Record<string, unknown> },
+    pageSize = 500,
+  ): Promise<{ sent: number }> {
+    let cursor: string | undefined;
+    let sent = 0;
+
+    for (;;) {
+      let page: { id: string; token: string }[];
+      try {
+        page = await this.prisma.pushToken.findMany({
+          take: pageSize,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+          orderBy: { id: 'asc' },
+          select: { id: true, token: true },
+        });
+      } catch (e: any) {
+        this.logger.warn(`Broadcast push page failed to load: ${e?.message ?? e}`);
+        break;
+      }
+      if (page.length === 0) break;
+
+      try {
+        const { invalidTokens } = await this.provider.send(page.map((t) => ({ to: t.token, ...message })));
+        if (invalidTokens.length > 0) {
+          await this.prisma.pushToken.deleteMany({ where: { token: { in: invalidTokens } } });
+        }
+        sent += page.length - invalidTokens.length;
+      } catch (e: any) {
+        this.logger.warn(`Broadcast push page failed to send: ${e?.message ?? e}`);
+        // Still advance the cursor — a transient failure on one page shouldn't spin forever on
+        // it, and the next scheduled broadcast (not a retry of this one) will reach these devices.
+      }
+
+      cursor = page[page.length - 1].id;
+      if (page.length < pageSize) break;
+    }
+
+    return { sent };
+  }
 }

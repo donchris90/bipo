@@ -9,8 +9,8 @@ export class UploadsController {
   constructor(private readonly images: ImageUploadService) {}
 
   // Body: { base64: string } — plain base64 or a data URI, JPEG/PNG/GIF/WebP,
-  // up to 5 MB decoded. Returns { url }. Tightly rate-limited: an upload is
-  // the most expensive thing a client can ask of this API.
+  // up to 5 MB decoded. Returns { url }. Images are stored in Cloudflare R2
+  // using the server-side S3_* credentials; no storage credentials reach mobile.
   @Post('image')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
   image(@Body('base64') base64: string) {

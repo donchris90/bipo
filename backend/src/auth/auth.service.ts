@@ -98,14 +98,26 @@ export class AuthService {
       targetId: user.id,
       ipAddress,
     });
-    await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress } });
+    await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress, deviceIdHash: dto.deviceId ? this.hashDeviceId(dto.deviceId) : undefined } });
 
     // A failed bonus credit must never break registration itself — the
     // account already exists and is usable either way. Logged, not
     // silently swallowed, so a real crediting bug doesn't go unnoticed.
     if (referrer) {
       try {
-        await this.wallet.credit({
+        const deviceHash = dto.deviceId ? this.hashDeviceId(dto.deviceId) : null;
+        const recentSince = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const [sameDevice, sameIp] = await Promise.all([
+          deviceHash ? this.prisma.loginEvent.findFirst({ where: { userId: referrer.id, deviceIdHash: deviceHash, createdAt: { gte: recentSince } }, select: { id: true } }) : null,
+          ipAddress ? this.prisma.loginEvent.findFirst({ where: { userId: referrer.id, ipAddress, createdAt: { gte: recentSince } }, select: { id: true } }) : null,
+        ]);
+        if (sameDevice) {
+          await this.audit.record({ actorId: user.id, action: 'referral.reward_blocked_device_reuse', targetType: 'user', targetId: referrer.id, ipAddress, metadata: { referredUserId: user.id } });
+        } else if (sameIp) {
+          await this.audit.record({ actorId: user.id, action: 'referral.same_ip_signal', targetType: 'user', targetId: referrer.id, ipAddress, metadata: { referredUserId: user.id } });
+        }
+        if (!sameDevice) {
+          await this.wallet.credit({
           userId: referrer.id,
           walletType: WalletType.COIN,
           amount: REFERRAL_BONUS_COINS,
@@ -120,7 +132,8 @@ export class AuthService {
           ledgerType: LedgerEntryType.BONUS,
           reference: `referred-by:${referrer.id}`,
           idempotencyKey: `referral-bonus-referee-${user.id}`,
-        });
+          });
+        }
       } catch (err) {
         console.error('[AuthService] Failed to credit referral bonus', err);
       }
@@ -159,7 +172,7 @@ export class AuthService {
       targetId: user.id,
       ipAddress,
     });
-    await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress } });
+    await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress, deviceIdHash: dto.deviceId ? this.hashDeviceId(dto.deviceId) : undefined } });
 
     return this.issueTokens(user.id, user.roles.map((r: { role: RoleName }) => r.role), user.countryCode);
   }
@@ -198,6 +211,11 @@ export class AuthService {
       where: { tokenHash },
       data: { revoked: true },
     });
+  }
+
+  private hashDeviceId(deviceId: string): string {
+    const secret = this.config.get<string>('DEVICE_FINGERPRINT_SECRET') || this.config.get<string>('JWT_ACCESS_SECRET') || 'ryda-device-signal';
+    return crypto.createHmac('sha256', secret).update(deviceId).digest('hex');
   }
 
   private async issueTokens(userId: string, roles: RoleName[], countryCode: string) {

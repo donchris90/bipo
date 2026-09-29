@@ -5,5 +5,6 @@ import { ReconciliationController } from './reconciliation.controller';
 @Module({
   providers: [ReconciliationService],
   controllers: [ReconciliationController],
+  exports: [ReconciliationService],
 })
 export class ReconciliationModule {}
