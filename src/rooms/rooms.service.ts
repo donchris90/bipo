@@ -63,10 +63,10 @@ export class RoomsService {
     // presses Join queue). Locks are explicit host/moderator actions only.
     await this.prisma.roomSeat.create({ data: { roomId: room.id, userId: hostId, seatNumber: 0 } });
 
-    const host = await this.prisma.user.findUnique({ where: { id: hostId }, select: { displayName: true, avatarUrl: true } });
+    const host = await this.prisma.user.findUnique({ where: { id: hostId }, select: { displayName: true } });
     void announceToFollowersAndAgency(this.prisma, this.notifications, hostId, 'FOLLOWED_HOST_ROOM', {
-      hostId, hostDisplayName: host?.displayName ?? null, avatarUrl: host?.avatarUrl ?? null, roomId: room.id, title,
-    }, this.realtime);
+      hostId, hostDisplayName: host?.displayName ?? null, roomId: room.id, title,
+    });
 
     return room;
   }
@@ -654,11 +654,68 @@ export class RoomsService {
 
   // Frees a guest's seat and tells the room. Shared by leaveSeat and the
   // reaper (a guest whose app died must not hold a seat forever).
+  //
+  // Also where a freed seat gets auto-filled from the queue, when the room has that turned on
+  // (PartyRoom.autoAssignSeats, default true). This previously did not exist at all: the mobile
+  // app already told guests their request "will be seated automatically when an unlocked seat
+  // becomes available", but nothing here ever checked the queue — a request just sat there until
+  // a host happened to notice and approve it by hand. The free + fill happens in one transaction
+  // so a seat can't be grabbed by a concurrent requestSeat/approveSeatRequest between the two.
   async releaseSeat(roomId: string, userId: string) {
-    const seat = await this.prisma.roomSeat.findUnique({ where: { roomId_userId: { roomId, userId } } });
-    await this.prisma.roomSeat.deleteMany({ where: { roomId, userId } });
-    if (seat) this.emitRoomState(roomId, 'SEAT_LEFT', userId, { seatNumber: seat.seatNumber });
+    const outcome = await this.prisma.$transaction(async (tx) => {
+      const seat = await tx.roomSeat.findUnique({ where: { roomId_userId: { roomId, userId } } });
+      if (!seat) return null;
+      await tx.roomSeat.delete({ where: { roomId_userId: { roomId, userId } } });
+
+      const room = await tx.partyRoom.findUnique({ where: { id: roomId }, select: { autoAssignSeats: true, title: true } });
+      if (!room?.autoAssignSeats) return { seatNumber: seat.seatNumber, filled: null as null | { userId: string; requestId: string; roomTitle: string } };
+
+      const lock = await tx.roomSeatLock.findUnique({ where: { roomId_seatNumber: { roomId, seatNumber: seat.seatNumber } } });
+      if (lock) return { seatNumber: seat.seatNumber, filled: null };
+
+      const nextRequest = await tx.seatRequest.findFirst({
+        where: { roomId, status: { in: ['PENDING', 'ACCEPTED'] } },
+        orderBy: { createdAt: 'asc' },
+      });
+      if (!nextRequest) return { seatNumber: seat.seatNumber, filled: null };
+
+      // Defensive: a request whose user already holds a different seat (shouldn't normally
+      // happen — a request is resolved once someone is seated — but never double-seat them).
+      const alreadySeated = await tx.roomSeat.findFirst({ where: { roomId, userId: nextRequest.userId } });
+      if (alreadySeated) {
+        await tx.seatRequest.update({ where: { id: nextRequest.id }, data: { status: 'APPROVED', decidedAt: new Date() } });
+        return { seatNumber: seat.seatNumber, filled: null };
+      }
+
+      await tx.roomSeat.create({ data: { roomId, userId: nextRequest.userId, seatNumber: seat.seatNumber } });
+      await tx.seatRequest.update({ where: { id: nextRequest.id }, data: { status: 'APPROVED', decidedAt: new Date() } });
+      return { seatNumber: seat.seatNumber, filled: { userId: nextRequest.userId, requestId: nextRequest.id, roomTitle: room.title } };
+    });
+
+    if (!outcome) return { left: true };
+    this.emitRoomState(roomId, 'SEAT_LEFT', userId, { seatNumber: outcome.seatNumber });
+    if (outcome.filled) {
+      this.emitRoomState(roomId, 'SEAT_APPROVED', outcome.filled.userId, { seatNumber: outcome.seatNumber });
+      await this.notifications.notifyOnce(outcome.filled.userId, 'SEAT_APPROVED', `seat:${outcome.filled.requestId}`, {
+        roomId,
+        roomTitle: outcome.filled.roomTitle,
+        seatNumber: outcome.seatNumber,
+      });
+    }
     return { left: true };
+  }
+
+  // Host-only toggle: when off, a freed seat waits for an explicit "Choose seat" instead of
+  // auto-filling from the queue. See releaseSeat.
+  async setAutoAssign(roomId: string, actorId: string, enabled: boolean) {
+    await this.assertHostOrModerator(roomId, actorId);
+    const room = await this.prisma.partyRoom.update({
+      where: { id: roomId },
+      data: { autoAssignSeats: enabled },
+      select: { autoAssignSeats: true },
+    });
+    this.emitRoomState(roomId, 'AUTO_ASSIGN_CHANGED', undefined, { autoAssignSeats: room.autoAssignSeats });
+    return room;
   }
 
   // Separate from rejectSeatRequest on purpose — that one requires

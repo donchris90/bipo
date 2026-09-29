@@ -167,6 +167,11 @@ export class RoomsController {
     return this.rooms.setMode(id, req.user.userId, mode);
   }
 
+  @Patch(':id/auto-assign')
+  setAutoAssign(@Param('id') id: string, @Body('enabled') enabled: boolean, @Req() req: AuthedRequest) {
+    return this.rooms.setAutoAssign(id, req.user.userId, enabled === true);
+  }
+
   @Patch(':id/seat-count')
   setSeatCount(@Param('id') id: string, @Body('seatCount') seatCount: number, @Req() req: AuthedRequest) {
     return this.rooms.setSeatCount(id, req.user.userId, Number(seatCount));

@@ -547,6 +547,7 @@ model RoomSeat {
   userId     String
   seatNumber Int
   joinedAt   DateTime @default(now())
+  giftCoins  Int      @default(0)
 
   @@unique([roomId, seatNumber])
   @@unique([roomId, userId])
@@ -1044,6 +1045,7 @@ model PKBattle {
   challengerAgencyId String?
   opponentAgencyId   String?
   objectiveConfig  Json?
+  durationSec     Int       @default(180)
   createdAt       DateTime  @default(now())
   settledAt       DateTime?
 
