@@ -14,6 +14,7 @@ import { SupporterLevelsService } from '../supporters/supporter-levels.service';
 import { RoomCommunityService } from '../rooms/room-community.service';
 import { SeasonsService } from '../seasons/seasons.service';
 import { createMoment } from '../experience/experience.moments';
+import { applyRoomPkScore } from './room-pk-score';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -307,6 +308,16 @@ export class GiftService {
         },
       });
     }, EXTENDED_TX_OPTIONS);
+
+    // Feed committed room gifts into the active multi-guest Room PK. This is deliberately
+    // after the paid transaction commits: a scoring failure must never roll back a real gift.
+    if (params.context === 'ROOM' && params.contextId) {
+      try {
+        await applyRoomPkScore(this.prisma, params.contextId, params.recipientId, coinAmount);
+      } catch {
+        // Room PK scoring is supplementary game state; the gift transaction is already committed.
+      }
+    }
 
     // Large gifts become Rryda Moments so the social layer has memorable events to surface.
     // The threshold is intentionally conservative to avoid filling the feed with every small gift.
