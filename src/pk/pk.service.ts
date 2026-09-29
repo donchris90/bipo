@@ -13,7 +13,19 @@ import { createMoment } from '../experience/experience.moments';
 import { SeasonsService } from '../seasons/seasons.service';
 
 const COUNTDOWN_MS = 10_000;
-const DEFAULT_BATTLE_DURATION_MS = 3 * 60_000;
+// Battle lengths a host may pick, in seconds. One list, used by the server to validate and
+// mirrored by the app's picker (api/pk.ts). 180 stays the default: it is what every PK was before.
+export const PK_DURATIONS_SEC = [180, 300, 600, 900] as const;
+export const DEFAULT_PK_DURATION_SEC = 180;
+
+function normalizeDuration(value: unknown): number {
+  if (value === undefined || value === null || value === '') return DEFAULT_PK_DURATION_SEC;
+  const n = Number(value);
+  if (!(PK_DURATIONS_SEC as readonly number[]).includes(n)) {
+    throw new BadRequestException(`PK length must be one of: ${PK_DURATIONS_SEC.map((x) => `${x / 60} min`).join(', ')}`);
+  }
+  return n;
+}
 // An unanswered PK invitation lapses after this long (BIGO/Poppo style), so
 // a challenger is never stuck waiting and old invites don't pile up.
 export const CHALLENGE_TTL_MS = 30_000;
@@ -62,7 +74,8 @@ export class PkService implements OnModuleDestroy {
     return [pool[Math.floor(Math.random() * pool.length)]];
   }
 
-  async challenge(challengerId: string, opponentId: string) {
+  async challenge(challengerId: string, opponentId: string, durationSecInput?: number) {
+    const durationSec = normalizeDuration(durationSecInput);
     if (challengerId === opponentId) throw new BadRequestException('Cannot challenge yourself');
     await assertNotBlocked(this.prisma, challengerId, opponentId, "You can't challenge this user");
 
@@ -90,13 +103,13 @@ export class PkService implements OnModuleDestroy {
     if (selfBusy) throw new BadRequestException('Finish your current PK first');
     // Tapping Challenge twice must not send two challenges.
     const pending = await this.prisma.pKBattle.findFirst({ where: { challengerId, opponentId, status: 'CHALLENGED' } });
-    if (pending && !isExpired(pending.createdAt)) return pending;
+    if (pending && !isExpired(pending.createdAt) && pending.durationSec === durationSec) return pending;
     // One invitation at a time: a new challenge replaces any other one this
     // host still has waiting (including an expired one to the same person).
     await this.closeChallenges({ challengerId, status: 'CHALLENGED' }, 'SUPERSEDED');
 
     const battle = await this.prisma.pKBattle.create({
-      data: { challengerId, opponentId, status: 'CHALLENGED', objectiveConfig: this.buildObjectives() },
+      data: { challengerId, opponentId, status: 'CHALLENGED', durationSec, objectiveConfig: this.buildObjectives() },
     });
 
     // A challenged user otherwise only finds out by polling the incoming
@@ -155,7 +168,8 @@ export class PkService implements OnModuleDestroy {
     }
   }
 
-  async randomMatch(userId: string) {
+  async randomMatch(userId: string, durationSecInput?: number) {
+    const durationSec = normalizeDuration(durationSecInput);
     if (!(await this.isHostLive(userId))) throw new BadRequestException('You must be live before joining Random PK');
     if (await this.isPkBusy(userId)) throw new BadRequestException('Finish your current PK first');
 
@@ -170,24 +184,33 @@ export class PkService implements OnModuleDestroy {
       let ids = await this.redis.lrange(this.randomQueueKey, 0, 199).catch(() => [] as string[]);
       const unique = [...new Set(ids)].filter((id) => id !== userId);
       const valid: string[] = [];
+      const waitingDuration = new Map<string, number>();
       for (const id of unique) {
-        const ticketExists = await this.redis.exists(`${this.randomTicketPrefix}${id}`).catch(() => 0);
-        if (ticketExists && await this.isHostLive(id) && !(await this.isPkBusy(id))) valid.push(id);
+        const rawTicket = await this.redis.get(`${this.randomTicketPrefix}${id}`).catch(() => null);
+        if (rawTicket && await this.isHostLive(id) && !(await this.isPkBusy(id))) {
+          valid.push(id);
+          try { waitingDuration.set(id, Number(JSON.parse(rawTicket).durationSec) || DEFAULT_PK_DURATION_SEC); } catch { waitingDuration.set(id, DEFAULT_PK_DURATION_SEC); }
+        }
       }
       if (valid.length) {
-        const opponentId = valid[randomInt(valid.length)];
+        // Prefer someone who picked the same length; otherwise take anyone waiting and use THEIR
+        // length (they were in the queue first).
+        const sameLength = valid.filter((id) => waitingDuration.get(id) === durationSec);
+        const pool = sameLength.length ? sameLength : valid;
+        const opponentId = pool[randomInt(pool.length)];
+        const battleDuration = waitingDuration.get(opponentId) ?? durationSec;
         await this.redis.lrem(this.randomQueueKey, 0, opponentId).catch(() => undefined);
         await this.redis.del(`${this.randomTicketPrefix}${opponentId}`).catch(() => undefined);
-        const battle = await this.createRandomBattle(opponentId, userId);
-        const opponentTicket = { status: 'MATCHED', battleId: battle.id, opponentId: userId };
-        const myTicket = { status: 'MATCHED', battleId: battle.id, opponentId };
+        const battle = await this.createRandomBattle(opponentId, userId, battleDuration);
+        const opponentTicket = { status: 'MATCHED', battleId: battle.id, opponentId: userId, durationSec: battleDuration };
+        const myTicket = { status: 'MATCHED', battleId: battle.id, opponentId, durationSec: battleDuration };
         await this.redis.set(`${this.randomTicketPrefix}${opponentId}`, JSON.stringify(opponentTicket), 'EX', this.randomTicketTtl);
         await this.redis.set(ticketKey, JSON.stringify(myTicket), 'EX', this.randomTicketTtl);
         return myTicket;
       }
 
       await this.redis.rpush(this.randomQueueKey, userId);
-      const ticket = { status: 'WAITING', queuePosition: await this.redis.llen(this.randomQueueKey) };
+      const ticket = { status: 'WAITING', queuePosition: await this.redis.llen(this.randomQueueKey), durationSec };
       await this.redis.set(ticketKey, JSON.stringify(ticket), 'EX', this.randomTicketTtl);
       return ticket;
     });
@@ -210,12 +233,12 @@ export class PkService implements OnModuleDestroy {
     return { status: 'CANCELLED' as const };
   }
 
-  private async createRandomBattle(challengerId: string, opponentId: string) {
+  private async createRandomBattle(challengerId: string, opponentId: string, durationSec: number = DEFAULT_PK_DURATION_SEC) {
     const now = new Date();
     const startedAt = new Date(now.getTime() + COUNTDOWN_MS);
-    const endsAt = new Date(now.getTime() + COUNTDOWN_MS + DEFAULT_BATTLE_DURATION_MS);
+    const endsAt = new Date(now.getTime() + COUNTDOWN_MS + durationSec * 1000);
     const battle = await this.prisma.pKBattle.create({
-      data: { challengerId, opponentId, status: 'COUNTDOWN', mode: 'RANDOM', startedAt, endsAt, objectiveConfig: this.buildObjectives() },
+      data: { challengerId, opponentId, status: 'COUNTDOWN', mode: 'RANDOM', startedAt, endsAt, durationSec, objectiveConfig: this.buildObjectives() },
     });
     void this.scheduleTransitionsBestEffort(battle.id, startedAt, endsAt);
     await this.emitLifecycle('pk:countdown_start', battle);
@@ -237,7 +260,8 @@ export class PkService implements OnModuleDestroy {
     return teams.filter((t) => live.has(t.leaderId)).map((t) => ({ ...t, live: true }));
   }
 
-  async teamChallenge(userId: string, opponentTeamId: string) {
+  async teamChallenge(userId: string, opponentTeamId: string, durationSecInput?: number) {
+    const durationSec = normalizeDuration(durationSecInput);
     const mine = await this.prisma.teamMember.findUnique({ where: { userId }, select: { teamId: true, role: true } });
     if (!mine || mine.role !== 'LEADER') throw new BadRequestException('Only a team leader can start a Team PK');
     const opponentTeam = await this.prisma.team.findUnique({ where: { id: opponentTeamId }, select: { id: true, name: true, leaderId: true, themeColor: true } });
@@ -246,7 +270,7 @@ export class PkService implements OnModuleDestroy {
     await assertNotBlocked(this.prisma, userId, opponentTeam.leaderId, "You can't challenge this team");
     if (!(await this.isHostLive(userId)) || !(await this.isHostLive(opponentTeam.leaderId))) throw new BadRequestException('Both team leaders must be live');
     if (await this.isPkBusy(userId) || await this.isPkBusy(opponentTeam.leaderId)) throw new BadRequestException('One of the team leaders is already in a PK');
-    const battle = await this.prisma.pKBattle.create({ data: { challengerId: userId, opponentId: opponentTeam.leaderId, challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id, mode: 'TEAM', status: 'CHALLENGED', objectiveConfig: this.buildObjectives() } });
+    const battle = await this.prisma.pKBattle.create({ data: { challengerId: userId, opponentId: opponentTeam.leaderId, challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id, mode: 'TEAM', status: 'CHALLENGED', durationSec, objectiveConfig: this.buildObjectives() } });
     const challenger = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true, avatarUrl: true } });
     this.realtime.emitToUser(opponentTeam.leaderId, 'pk:challenge', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, challengerAvatarUrl: challenger?.avatarUrl ?? null, mode: 'TEAM', teamName: opponentTeam.name });
     await this.notifications.notify(opponentTeam.leaderId, 'PK_CHALLENGE', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, mode: 'TEAM', challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id });
@@ -504,7 +528,7 @@ export class PkService implements OnModuleDestroy {
 
     const now = new Date();
     const startedAt = new Date(now.getTime() + COUNTDOWN_MS);
-    const endsAt = new Date(now.getTime() + COUNTDOWN_MS + DEFAULT_BATTLE_DURATION_MS);
+    const endsAt = new Date(now.getTime() + COUNTDOWN_MS + (battle.durationSec ?? DEFAULT_PK_DURATION_SEC) * 1000);
 
     const flipped = await this.prisma.pKBattle.updateMany({
       where: { id: battleId, status: 'CHALLENGED' },

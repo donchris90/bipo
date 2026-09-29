@@ -69,12 +69,13 @@ export class UsersController {
   updateMe(
     @Body('displayName') displayName: string | undefined,
     @Body('avatarUrl') avatarUrl: string | undefined,
+    @Body('coverUrl') coverUrl: string | undefined,
     @Body('bio') bio: string | undefined,
     @Body('oneOnOneEnabled') oneOnOneEnabled: boolean | undefined,
     @Body('languageCode') languageCode: string | undefined,
     @Req() req: AuthedRequest,
   ) {
-    return this.usersService.updateMe(req.user.userId, { displayName, avatarUrl, bio, oneOnOneEnabled, languageCode });
+    return this.usersService.updateMe(req.user.userId, { displayName, avatarUrl, coverUrl, bio, oneOnOneEnabled, languageCode });
   }
 
   @Patch(':id/suspend')
