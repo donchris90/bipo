@@ -41,8 +41,16 @@ export class RoomPkService {
     const running = await this.prisma.roomPk.findFirst({ where: { roomId, status: 'ACTIVE' }, select: { id: true } });
     if (running) throw new BadRequestException('A Room PK is already running');
 
-    const seats = await this.prisma.roomSeat.findMany({ where: { roomId }, select: { userId: true, seatNumber: true } });
-    const entrants = buildEntrants(seats, mode, input.sides);
+    const seats = await this.prisma.roomSeat.findMany({
+      where: { roomId },
+      select: { userId: true, seatNumber: true },
+      orderBy: { seatNumber: 'asc' },
+    });
+    const uniqueSeats = Array.from(new Map(seats.map((seat) => [seat.userId, seat])).values());
+    if (uniqueSeats.length < 2) {
+      throw new BadRequestException(`At least 2 people must be seated to start a Room PK. Currently seated: ${uniqueSeats.length}`);
+    }
+    const entrants = buildEntrants(uniqueSeats, mode, input.sides);
 
     // The battle clock starts after the get-ready countdown; nothing scores before startedAt.
     const startedAt = new Date(Date.now() + ROOM_PK_COUNTDOWN_MS);
