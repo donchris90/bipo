@@ -9,7 +9,7 @@ export class UploadsController {
   constructor(private readonly images: ImageUploadService) {}
 
   // Body: { base64: string } — plain base64 or a data URI, JPEG/PNG/GIF/WebP,
-  // up to 5 MB decoded. Returns { url }. Tightly rate-limited: an upload is
+  // up to 5 MB decoded. Returns { url }. The image provider key stays server-side. Tightly rate-limited: an upload is
   // the most expensive thing a client can ask of this API.
   @Post('image')
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
