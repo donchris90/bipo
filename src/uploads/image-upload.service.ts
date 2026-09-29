@@ -24,7 +24,7 @@ export class ImageUploadService {
     this.imgbbKey = (this.config.get<string>('IMGBB_API_KEY') ?? '').trim();
   }
 
-  async upload(input: unknown): Promise<string> {
+  async upload(input: unknown): Promise<{ url: string }> {
     if (!this.imgbbKey) {
       throw new ServiceUnavailableException('Image uploads are not configured on the server. Set IMGBB_API_KEY and redeploy.');
     }
@@ -53,7 +53,7 @@ export class ImageUploadService {
         throw new Error(payload?.error?.message ?? `HTTP ${response.status}`);
       }
 
-      return String(payload.data.url);
+      return { url: String(payload.data.url) };
     } catch (error: any) {
       this.logger.warn(`Image upload failed: ${String(error?.message ?? error).slice(0, 300)}`);
       throw new BadGatewayException('Image upload failed. Please retry.');
