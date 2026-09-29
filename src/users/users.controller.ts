@@ -20,6 +20,26 @@ export class UsersController {
     return this.usersService.findMe(req.user.userId);
   }
 
+  @Get('me/photos')
+  myProfilePhotos(@Req() req: AuthedRequest) {
+    return this.usersService.findMyProfilePhotos(req.user.userId);
+  }
+
+  @Post('me/photos')
+  addProfilePhoto(@Body('url') url: string, @Req() req: AuthedRequest) {
+    return this.usersService.addProfilePhoto(req.user.userId, url);
+  }
+
+  @Patch('me/photos/:id/primary')
+  setPrimaryProfilePhoto(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.usersService.setPrimaryProfilePhoto(req.user.userId, id);
+  }
+
+  @Post('me/photos/:id/delete')
+  deleteProfilePhoto(@Param('id') id: string, @Req() req: AuthedRequest) {
+    return this.usersService.deleteProfilePhoto(req.user.userId, id);
+  }
+
   @Get('me/referrals')
   myReferrals(@Req() req: AuthedRequest) {
     return this.usersService.findMyReferrals(req.user.userId);
