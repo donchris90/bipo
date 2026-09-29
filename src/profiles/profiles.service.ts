@@ -19,7 +19,7 @@ export class ProfilesService {
   private async loadVisible(viewerId: string, targetId: string) {
     const user = await this.prisma.user.findUnique({
       where: { id: targetId },
-      select: { id: true, displayName: true, avatarUrl: true, coverUrl: true, bio: true, countryCode: true, kycVerified: true, status: true, oneOnOneEnabled: true, createdAt: true, rrydaLevel: true },
+      select: { id: true, displayName: true, avatarUrl: true, countryCode: true, bio: true, createdAt: true, rrydaLevel: true, rrydaXp: true, kycVerified: true, status: true, oneOnOneEnabled: true },
     });
     if (!user || user.status !== 'ACTIVE') throw new NotFoundException(NOT_FOUND);
     if (viewerId !== targetId && (await isBlockedEitherWay(this.prisma as any, viewerId, targetId))) throw new NotFoundException(NOT_FOUND);
@@ -29,7 +29,7 @@ export class ProfilesService {
   // What the profile card shows. Never an email, phone number or balance.
   async get(viewerId: string, targetId: string) {
     const user = await this.loadVisible(viewerId, targetId);
-    const [followerCount, followingCount, follow, live, hostLevel, photos] = await Promise.all([
+    const [followerCount, followingCount, follow, live, hostLevel] = await Promise.all([
       this.prisma.follow.count({ where: { followingId: targetId } }),
       this.prisma.follow.count({ where: { followerId: targetId } }),
       viewerId === targetId
@@ -37,16 +37,16 @@ export class ProfilesService {
         : this.prisma.follow.findUnique({ where: { followerId_followingId: { followerId: viewerId, followingId: targetId } }, select: { followerId: true } }),
       this.prisma.liveSession.findFirst({ where: { hostId: targetId, status: 'LIVE' }, select: { id: true, title: true } }),
       this.hostLevels ? this.hostLevels.progress(targetId) : Promise.resolve({ xp: 0, level: 1, name: 'New Host', badgeUrl: null, unlocks: ['SOLO_LIVE'], nextLevel: null, progressXp: 0, requiredForNext: 0, remainingXp: 0 }),
-      this.prisma.profilePhoto.findMany({ where: { userId: targetId }, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }], select: { id: true, url: true, sortOrder: true } }),
     ]);
     return {
       id: user.id,
       displayName: user.displayName,
       avatarUrl: user.avatarUrl,
-      coverUrl: user.coverUrl,
-      bio: user.bio,
-      photos: photos.map((photo) => photo.url),
       countryCode: user.countryCode,
+      bio: user.bio,
+      createdAt: user.createdAt.toISOString(),
+      rrydaLevel: user.rrydaLevel,
+      rrydaXp: user.rrydaXp,
       verified: user.kycVerified,
       followerCount,
       followingCount,
@@ -55,8 +55,6 @@ export class ProfilesService {
       live: live ? { sessionId: live.id, title: live.title } : null,
       oneOnOneEnabled: !!user.oneOnOneEnabled,
       hostLevel,
-      rrydaLevel: user.rrydaLevel,
-      createdAt: user.createdAt,
     };
   }
 

@@ -1,7 +1,7 @@
 import { NotFoundException } from '@nestjs/common';
 import { ProfilesService } from './profiles.service';
 
-const user = { id: 'host', displayName: 'Ada', avatarUrl: 'https://x/a.jpg', countryCode: 'NG', kycVerified: true, status: 'ACTIVE' };
+const user = { id: 'host', displayName: 'Ada', avatarUrl: 'https://x/a.jpg', countryCode: 'NG', bio: 'Late night conversations and music.', createdAt: new Date('2024-03-01T00:00:00.000Z'), rrydaLevel: 7, rrydaXp: 640, kycVerified: true, status: 'ACTIVE' };
 
 function build(over: { target?: any; blocked?: boolean; follows?: boolean; live?: any; notified?: any } = {}) {
   const prisma: any = {
@@ -18,7 +18,7 @@ describe('ProfilesService.get', () => {
   it('returns what a profile card needs — counts, whether you follow them, whether they are live — and nothing private', async () => {
     const { svc } = build({ follows: true, live: { id: 's1', title: 'Late night chat' } });
     const p = await svc.get('me', 'host');
-    expect(p).toEqual({ id: 'host', displayName: 'Ada', avatarUrl: 'https://x/a.jpg', countryCode: 'NG', verified: true, followerCount: 12, followingCount: 3, isMe: false, isFollowing: true, live: { sessionId: 's1', title: 'Late night chat' } });
+    expect(p).toEqual({ id: 'host', displayName: 'Ada', avatarUrl: 'https://x/a.jpg', countryCode: 'NG', bio: 'Late night conversations and music.', createdAt: '2024-03-01T00:00:00.000Z', rrydaLevel: 7, rrydaXp: 640, verified: true, followerCount: 12, followingCount: 3, isMe: false, isFollowing: true, live: { sessionId: 's1', title: 'Late night chat' } });
     expect(Object.keys(p)).not.toEqual(expect.arrayContaining(['email', 'passwordHash', 'phone']));
   });
 
