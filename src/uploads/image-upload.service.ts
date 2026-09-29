@@ -11,11 +11,6 @@ const MIME_BY_TYPE: Record<string, string> = {
   webp: 'image/webp',
 };
 
-/**
- * Profile/cover images are stored in the same Cloudflare R2 bucket used by
- * the rest of Rryda's media storage. R2 is S3-compatible, so the existing
- * S3_* environment variables are used here as well.
- */
 @Injectable()
 export class ImageUploadService {
   private readonly logger = new Logger(ImageUploadService.name);
@@ -23,41 +18,49 @@ export class ImageUploadService {
   private readonly bucket: string;
   private readonly publicBaseUrl: string;
 
+  // ConfigService.getOrThrow() only rejects a key that is completely UNSET (undefined) — a
+  // variable that exists in .env but is left blank (`S3_ENDPOINT=`) still passes it, since ''
+  // is a defined value. That let a blank S3_ENDPOINT slip through here silently: the app booted
+  // fine, and every upload failed at runtime with a generic "storage host rejected it" message
+  // that gave no hint the actual cause was a blank endpoint. This requires the value to be a
+  // non-empty string after trimming whitespace, and fails at startup — loud and immediate,
+  // naming exactly which variable is blank — instead of failing quietly per-upload later.
   private requireNonEmpty(key: string): string {
-    const value = (this.config.get<string>(key) ?? '').trim();
+    const value = this.config.getOrThrow<string>(key).trim();
     if (!value) {
-      throw new Error(`${key} is required for image uploads.`);
+      throw new Error(`${key} is set but empty — image uploads (avatar, live cover, etc.) cannot work without a real value here.`);
     }
     return value;
   }
 
   constructor(private readonly config: ConfigService) {
     this.bucket = this.requireNonEmpty('S3_BUCKET');
+    // Custom domain or CDN URL images are served from publicly (e.g.
+    // https://cdn.yourapp.com) — NOT S3_ENDPOINT, which is the API
+    // endpoint used to talk to the storage host, not a public URL.
     this.publicBaseUrl = this.requireNonEmpty('S3_PUBLIC_BASE_URL').replace(/\/+$/, '');
 
-    const endpoint = this.requireNonEmpty('S3_ENDPOINT');
-    const region = (this.config.get<string>('S3_REGION') ?? 'auto').trim() || 'auto';
-
     this.s3 = new S3Client({
-      region,
-      endpoint,
+      region: this.requireNonEmpty('S3_REGION'),
+      endpoint: this.requireNonEmpty('S3_ENDPOINT'),
       forcePathStyle: true,
       credentials: {
         accessKeyId: this.requireNonEmpty('S3_ACCESS_KEY_ID'),
         secretAccessKey: this.requireNonEmpty('S3_SECRET_ACCESS_KEY'),
       },
-      // Cloudflare R2 is S3-compatible but does not need the SDK to add
-      // optional checksum headers to every request.
-      requestChecksumCalculation: 'WHEN_REQUIRED',
-      responseChecksumValidation: 'WHEN_REQUIRED',
     });
   }
 
-  async upload(input: unknown): Promise<{ url: string }> {
-    const { bytes, type } = decodeImage(input);
-    const mime = MIME_BY_TYPE[type];
-    if (!mime) throw new BadGatewayException('Unsupported image type');
 
+  /**
+   * Takes whatever the client sent (plain base64 or a data: URI — see
+   * decodeImage) and returns a publicly-viewable URL, same contract the
+   * old ImgBB-backed version had. Validation (size limit, format
+   * allowlist via magic-byte sniffing) is delegated to image-rules.ts,
+   * which is already unit-tested — this service only owns the upload.
+   */
+  async upload(input: unknown): Promise<string> {
+    const { bytes, type } = decodeImage(input);
     const key = `uploads/${new Date().toISOString().slice(0, 10)}/${randomUUID()}.${type === 'jpeg' ? 'jpg' : type}`;
 
     try {
@@ -66,21 +69,17 @@ export class ImageUploadService {
           Bucket: this.bucket,
           Key: key,
           Body: bytes,
-          ContentType: mime,
+          ContentType: MIME_BY_TYPE[type],
+          // R2 doesn't use ACLs the way S3 does — public access is granted
+          // at the bucket/custom-domain level in the dashboard, not per
+          // object, so no ACL field is set here.
         }),
       );
-    } catch (err: any) {
-      const name = String(err?.name ?? err?.Code ?? 'StorageError');
-      const status = err?.$metadata?.httpStatusCode ?? '-';
-      this.logger.warn(
-        `R2 image upload failed: ${name} HTTP ${status} ${String(err?.message ?? err).slice(0, 300)}`,
-      );
+    } catch (err) {
+      this.logger.warn(`Storage host rejected the upload: ${(err as Error).message}`);
       throw new BadGatewayException('Image upload failed at the storage host. Please retry.');
     }
 
-    // S3_PUBLIC_BASE_URL may be the Rryda storage proxy
-    // (https://<api>/api/v1/storage/files) or a Cloudflare public/custom
-    // domain. Both use the same stored object key.
-    return { url: `${this.publicBaseUrl}/${key}` };
+    return `${this.publicBaseUrl}/${key}`;
   }
 }

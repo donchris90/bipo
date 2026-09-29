@@ -44,8 +44,6 @@ export class LudoController {
   @Post('invites/:inviteId/accept') accept(@Req() req: AuthedRequest, @Param('inviteId') inviteId: string, @Body() body: { displayName?: string }) { return this.ludo.acceptInvite(req.user.userId, inviteId, body.displayName?.trim() || 'Player', req.user.countryCode || 'NG'); }
   @Post('invites/:inviteId/decline') decline(@Req() req: AuthedRequest, @Param('inviteId') inviteId: string) { return this.ludo.declineInvite(req.user.userId, inviteId); }
   @Get('matches/:matchId') state(@Param('matchId') matchId: string) { return this.ludo.getState(matchId); }
-  @Get('matches/:matchId/spectator-bets') spectatorBets(@Req() req: AuthedRequest, @Param('matchId') matchId: string) { return this.ludo.spectatorBetStatus(req.user.userId, matchId); }
-  @Post('matches/:matchId/spectator-bets') spectatorBet(@Req() req: AuthedRequest, @Param('matchId') matchId: string, @Body() body: { playerUserId: string; amount: number }) { return this.ludo.placeSpectatorBet(req.user.userId, matchId, body.playerUserId, Number(body.amount)); }
   @Post('matches/:matchId/roll') roll(@Req() req: AuthedRequest, @Param('matchId') matchId: string) { return this.ludo.roll(req.user.userId, matchId); }
   @Post('matches/:matchId/move') move(@Req() req: AuthedRequest, @Param('matchId') matchId: string, @Body() body: { tokenIndex: number }) { return this.ludo.move(req.user.userId, matchId, body.tokenIndex); }
   @Post('matches/:matchId/reconnect') reconnect(@Req() req: AuthedRequest, @Param('matchId') matchId: string) { return this.ludo.reconnect(req.user.userId, matchId); }

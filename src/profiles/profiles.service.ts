@@ -19,7 +19,7 @@ export class ProfilesService {
   private async loadVisible(viewerId: string, targetId: string) {
     const user = await this.prisma.user.findUnique({
       where: { id: targetId },
-      select: { id: true, displayName: true, avatarUrl: true, countryCode: true, bio: true, createdAt: true, rrydaLevel: true, rrydaXp: true, kycVerified: true, status: true, oneOnOneEnabled: true },
+      select: { id: true, displayName: true, avatarUrl: true, countryCode: true, kycVerified: true, status: true, oneOnOneEnabled: true, bio: true, createdAt: true, rrydaLevel: true, rrydaXp: true },
     });
     if (!user || user.status !== 'ACTIVE') throw new NotFoundException(NOT_FOUND);
     if (viewerId !== targetId && (await isBlockedEitherWay(this.prisma as any, viewerId, targetId))) throw new NotFoundException(NOT_FOUND);
@@ -43,10 +43,6 @@ export class ProfilesService {
       displayName: user.displayName,
       avatarUrl: user.avatarUrl,
       countryCode: user.countryCode,
-      bio: user.bio,
-      createdAt: user.createdAt.toISOString(),
-      rrydaLevel: user.rrydaLevel,
-      rrydaXp: user.rrydaXp,
       verified: user.kycVerified,
       followerCount,
       followingCount,
@@ -55,6 +51,10 @@ export class ProfilesService {
       live: live ? { sessionId: live.id, title: live.title } : null,
       oneOnOneEnabled: !!user.oneOnOneEnabled,
       hostLevel,
+      bio: user.bio ?? null,
+      createdAt: user.createdAt.toISOString(),
+      rrydaLevel: user.rrydaLevel ?? 1,
+      rrydaXp: user.rrydaXp ?? 0,
     };
   }
 
