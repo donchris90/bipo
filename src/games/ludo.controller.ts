@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { Request } from 'express';
 import { LudoService } from './ludo.service';
@@ -27,7 +27,7 @@ export class LudoController {
   @Get('rooms/:roomCode/status') roomStatus(@Req() req: AuthedRequest, @Param('roomCode') roomCode: string) { return this.ludo.roomStatus(req.user.userId, roomCode); }
   @Post('rooms/:roomCode/join') join(@Req() req: AuthedRequest, @Param('roomCode') roomCode: string, @Body() body: { displayName?: string }) { return this.ludo.joinRoom(req.user.userId, body.displayName?.trim() || 'Player', roomCode, req.user.countryCode || 'NG'); }
   @Get('candidates/:category')
-  candidatesByCategory(@Req() req: AuthedRequest, @Param('category') category: 'friends' | 'agency') { return this.ludo.ludoCandidates(req.user.userId, category); }
+  candidatesByCategory(@Req() req: AuthedRequest, @Param('category') category: 'friends' | 'agency', @Query('search') search?: string) { return this.ludo.ludoCandidates(req.user.userId, category, search); }
 
   @Get('agency/players')
   async agencyPlayers(@Req() req: AuthedRequest) {

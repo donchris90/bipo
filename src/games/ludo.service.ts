@@ -809,6 +809,15 @@ export class LudoService implements OnModuleDestroy {
     if (state.winnerUserId) payouts.set(state.winnerUserId, state.prizeFirst);
     if (state.secondPlaceUserId) payouts.set(state.secondPlaceUserId, state.prizeSecond);
     await this.prisma.$transaction(async tx => {
+      if (spectatorPool > 0 && spectatorBets.length > 0 && spectatorSplit.platform > 0) {
+        await this.wallet.recordPlatformEntry({
+          ledgerType: LedgerEntryType.GAME_REWARD,
+          amount: BigInt(spectatorSplit.platform),
+          reference: state.matchId,
+          idempotencyKey: `ludo_spectator_platform:${state.matchId}`,
+        }, tx);
+      }
+
       if (state.winnerUserId && spectatorPool > 0 && spectatorBets.length > 0) {
         if (spectatorSplit.winner > 0) {
           const winnerEntry = await tx.gameEntry.findFirst({ where: { roundId: state.matchId, userId: state.winnerUserId, status: { in: ['PLACED', 'WON'] } }, select: { id: true } });
