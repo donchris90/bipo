@@ -1,5 +1,5 @@
 import { DAY_MS, DEFAULT_DAY_OFFSET_MINUTES, dayPeriod } from '../common/day-period';
-import { BadRequestException, Injectable, NotFoundException, Optional } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from './wallet.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -183,7 +183,12 @@ export class GiftService {
     const existing = await this.prisma.giftTransaction.findUnique({
       where: { idempotencyKey: params.idempotencyKey },
     });
-    if (existing) return existing; // idempotent on retry
+    if (existing) {
+      // A retry must come from the same sender. Never hand one user another user's transaction
+      // (and its lucky result) because a key happened to collide.
+      if (existing.senderId !== params.senderId) throw new ConflictException('Idempotency key already used');
+      return existing; // idempotent on retry
+    }
 
     const gift = await this.prisma.gift.findUnique({ where: { id: params.giftId } });
     if (!gift || !gift.active) throw new NotFoundException('Gift not available');
@@ -292,6 +297,18 @@ export class GiftService {
             ledgerType: LedgerEntryType.BONUS,
             reference: params.idempotencyKey,
             idempotencyKey: `gift_lucky_bonus:${params.idempotencyKey}`,
+          },
+          tx,
+        );
+        // The bonus coins are newly issued to the sender, so the platform books the same
+        // amount as an expense (negative, walletId null). Without this the ledger shows
+        // coins appearing from nowhere and platform revenue is overstated.
+        await this.wallet.recordPlatformEntry(
+          {
+            ledgerType: LedgerEntryType.BONUS,
+            amount: -BigInt(luckyCoins),
+            reference: params.idempotencyKey,
+            idempotencyKey: `gift_lucky_platform:${params.idempotencyKey}`,
           },
           tx,
         );

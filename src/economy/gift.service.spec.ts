@@ -80,6 +80,57 @@ describe('GiftService', () => {
     expect(await wallet.getBalance('sender', WalletType.COIN)).toBe(0n); // spent once, not twice
   });
 
+  it('does not let a different user replay someone else\'s idempotency key', async () => {
+    const { prisma, wallet, gifts } = makeService();
+    prisma.users.set('other', { id: 'other', countryCode: 'NG' });
+    await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+    await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'shared-key' });
+    await expect(
+      gifts.send({ senderId: 'other', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'shared-key' }),
+    ).rejects.toThrow(/already used/);
+  });
+
+  describe('lucky gifts', () => {
+    function luckyService(rewards: any[]) {
+      const ctx = makeService();
+      ctx.prisma.gifts.set('lucky', { id: 'lucky', coinPrice: 100, active: true, luckyEnabled: true, luckyType: 'clover', luckyRewards: rewards });
+      return ctx;
+    }
+    const alwaysWin = [{ label: 'Win', coins: 60, probability: 100 }, { label: 'None', coins: 0, probability: 0 }];
+    const neverWin = [{ label: 'None', coins: 0, probability: 100 }, { label: 'Win', coins: 60, probability: 0 }];
+
+    it('returns the bonus to the sender and books it as a platform expense', async () => {
+      const { prisma, wallet, gifts } = luckyService(alwaysWin);
+      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      const tx = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'lucky', idempotencyKey: 'lucky-1' });
+
+      expect(tx).toMatchObject({ luckyRewardCoins: 60, luckyRewardLabel: 'Win', luckyType: 'clover' });
+      expect(await wallet.getBalance('sender', WalletType.COIN)).toBe(60n); // paid 100, got 60 back
+      const platformBonus = prisma.ledger.get('gift_lucky_platform:lucky-1');
+      expect(platformBonus).toMatchObject({ walletId: null, amount: -60n });
+    });
+
+    it('a losing draw pays nothing and books nothing extra', async () => {
+      const { prisma, wallet, gifts } = luckyService(neverWin);
+      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      const tx = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'lucky', idempotencyKey: 'lucky-2' });
+
+      expect(tx).toMatchObject({ luckyRewardCoins: 0, luckyRewardLabel: 'None' });
+      expect(await wallet.getBalance('sender', WalletType.COIN)).toBe(0n);
+      expect(prisma.ledger.has('gift_lucky_bonus:lucky-2')).toBe(false);
+      expect(prisma.ledger.has('gift_lucky_platform:lucky-2')).toBe(false);
+    });
+
+    it('retrying the same key never pays the bonus twice', async () => {
+      const { wallet, gifts } = luckyService(alwaysWin);
+      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      const first = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'lucky', idempotencyKey: 'lucky-3' });
+      const second = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'lucky', idempotencyKey: 'lucky-3' });
+      expect(second).toEqual(first);
+      expect(await wallet.getBalance('sender', WalletType.COIN)).toBe(60n);
+    });
+  });
+
   it('rejects sending an inactive or unknown gift', async () => {
     const { prisma, gifts } = makeService();
     prisma.gifts.set('retired', { id: 'retired', coinPrice: 50, active: false });

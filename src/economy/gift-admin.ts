@@ -2,7 +2,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { RoleName } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
-import { validateLuckyRewards, luckyGameType } from './lucky-gift';
+import { validateLuckyRewards, luckyGameType, luckyPayoutRate } from './lucky-gift';
 
 export function cleanGiftInput(body: any, creating: boolean) {
   if (!body || typeof body !== 'object') throw new BadRequestException('Body is required');
@@ -28,7 +28,7 @@ export function cleanGiftInput(body: any, creating: boolean) {
   if (out.category && out.category.length > 20) errors.push('category can be at most 20 characters');
   if (typeof out.active !== 'boolean') errors.push('active must be true or false');
   if (out.luckyEnabled) {
-    try { out.luckyRewards = validateLuckyRewards(body.luckyRewards); } catch (e: any) { errors.push(e?.message ?? 'Invalid Lucky Gift rewards'); }
+    try { out.luckyRewards = validateLuckyRewards(body.luckyRewards, Number.isInteger(out.coinPrice) ? out.coinPrice : undefined); } catch (e: any) { errors.push(e?.message ?? 'Invalid Lucky Gift rewards'); }
   }
   if (errors.length) throw new BadRequestException(errors.join('; '));
   return out;
@@ -49,14 +49,14 @@ export class GiftAdminService {
     const data = cleanGiftInput(body, true) as ReturnType<typeof cleanGiftInput> & { code: string };
     if (await this.prisma.gift.findUnique({ where: { code: data.code } })) throw new ConflictException('A gift with that code already exists');
     const gift = await this.prisma.gift.create({ data });
-    await this.audit.record({ actorId, actorRole: roles[0], action: 'gift.create', targetType: 'gift', targetId: gift.id, metadata: { code: gift.code, coinPrice: gift.coinPrice } as any });
+    await this.audit.record({ actorId, actorRole: roles[0], action: 'gift.create', targetType: 'gift', targetId: gift.id, metadata: { code: gift.code, coinPrice: gift.coinPrice, luckyEnabled: gift.luckyEnabled, luckyType: gift.luckyType, luckyRewards: gift.luckyRewards } as any });
     return gift;
   }
 
   async luckyStats() {
     const gifts = await this.prisma.gift.findMany({
       where: { luckyEnabled: true },
-      select: { id: true, name: true, code: true, icon: true, coinPrice: true, luckyEnabled: true, luckyType: true },
+      select: { id: true, name: true, code: true, icon: true, coinPrice: true, luckyEnabled: true, luckyType: true, luckyRewards: true },
       orderBy: { coinPrice: 'asc' },
     });
     if (!gifts.length) return [];
@@ -70,7 +70,11 @@ export class GiftAdminService {
     const stats = new Map(rows.map(r => [r.giftId, r]));
     return gifts.map(g => {
       const r = stats.get(g.id);
-      return { giftId: g.id, gift: g, sends: r?._count._all ?? 0, coinsSpent: r?._sum.coinAmount ?? 0, bonusPaid: r?._sum.luckyRewardCoins ?? 0 };
+      let configuredPayoutPct: number | null = null;
+      try { configuredPayoutPct = Number((luckyPayoutRate(validateLuckyRewards(g.luckyRewards), g.coinPrice) * 100).toFixed(2)); } catch { /* invalid legacy config */ }
+      const coinsSpent = r?._sum.coinAmount ?? 0;
+      const bonusPaid = r?._sum.luckyRewardCoins ?? 0;
+      return { giftId: g.id, gift: g, sends: r?._count._all ?? 0, coinsSpent, bonusPaid, configuredPayoutPct, actualPayoutPct: coinsSpent > 0 ? Number(((bonusPaid / coinsSpent) * 100).toFixed(2)) : null };
     });
   }
 
@@ -88,7 +92,10 @@ export class GiftAdminService {
       action: 'gift.update',
       targetType: 'gift',
       targetId: id,
-      metadata: { before: { name: before.name, coinPrice: before.coinPrice, icon: before.icon, active: before.active }, after: { name: gift.name, coinPrice: gift.coinPrice, icon: gift.icon, active: gift.active } } as any,
+      metadata: {
+        before: { name: before.name, coinPrice: before.coinPrice, icon: before.icon, active: before.active, luckyEnabled: before.luckyEnabled, luckyType: before.luckyType, luckyRewards: before.luckyRewards },
+        after: { name: gift.name, coinPrice: gift.coinPrice, icon: gift.icon, active: gift.active, luckyEnabled: gift.luckyEnabled, luckyType: gift.luckyType, luckyRewards: gift.luckyRewards },
+      } as any,
     });
     return gift;
   }

@@ -43,20 +43,49 @@ function normalizeRows(value: unknown): Array<{ label: string; coins: number; pr
   return raw.map(r => ({ label: r.label, coins: r.coins, probability: (r.weight! / totalWeight) * 100 }));
 }
 
-export function validateLuckyRewards(value: unknown): LuckyRewardTier[] {
-  return normalizeRows(value).map(r => ({ ...r, probability: Number(r.probability.toFixed(4)) }));
+/** Hard safety limits so a typo (or a compromised admin) cannot configure a coin-minting gift. */
+export const LUCKY_MAX_RTP = 1; // expected payout may never exceed the price paid (100%)
+export const LUCKY_MAX_PRIZE_MULTIPLE = 100; // no single prize above 100x the gift price
+
+/** Expected coins returned per send, as a fraction of the price (0.615 = 61.5%). */
+export function luckyPayoutRate(rewards: LuckyRewardTier[], coinPrice: number): number {
+  if (!(coinPrice > 0)) return 0;
+  const expected = rewards.reduce((s, r) => s + r.coins * (r.probability / 100), 0);
+  return expected / coinPrice;
+}
+
+/**
+ * Validates the tiers. When coinPrice is given (always, from the admin API), also enforces the
+ * payout-rate and largest-prize limits above.
+ */
+export function validateLuckyRewards(value: unknown, coinPrice?: number): LuckyRewardTier[] {
+  const rows = normalizeRows(value).map(r => ({ ...r, probability: Number(r.probability.toFixed(4)) }));
+  if (coinPrice !== undefined) {
+    if (!Number.isInteger(coinPrice) || coinPrice < 1) throw new Error('Lucky gifts need a valid coin price');
+    const rtp = luckyPayoutRate(rows, coinPrice);
+    if (rtp > LUCKY_MAX_RTP) {
+      throw new Error(`Expected payout is ${(rtp * 100).toFixed(1)}% of the price; it must not exceed ${LUCKY_MAX_RTP * 100}%`);
+    }
+    const top = Math.max(...rows.map(r => r.coins));
+    if (top > coinPrice * LUCKY_MAX_PRIZE_MULTIPLE) {
+      throw new Error(`Largest prize (${top}) is more than ${LUCKY_MAX_PRIZE_MULTIPLE}x the gift price`);
+    }
+  }
+  return rows;
 }
 
 export function drawLuckyReward(value: unknown): LuckyRewardTier {
   const rows = validateLuckyRewards(value);
   // Hundredths of a percent gives predictable admin-visible probabilities while
-  // still using cryptographically secure randomness.
-  const totalUnits = 10_000;
+  // still using cryptographically secure randomness. The range is the sum of the
+  // rounded units (not a fixed 10,000) so rounding can never leave a gap that
+  // silently favours the last tier.
+  const units = rows.map(r => Math.max(0, Math.round(r.probability * 100)));
+  const totalUnits = units.reduce((s, u) => s + u, 0);
   let cursor = randomInt(totalUnits);
-  for (const row of rows) {
-    const units = Math.max(0, Math.round(row.probability * 100));
-    if (cursor < units) return row;
-    cursor -= units;
+  for (let i = 0; i < rows.length; i++) {
+    if (cursor < units[i]) return rows[i];
+    cursor -= units[i];
   }
   return rows[rows.length - 1];
 }
