@@ -841,6 +841,9 @@ model GiftTransaction {
   agencyCommissionBps   Int?
   agencyId              String?
   agencyOwnerId         String?
+  luckyRewardCoins      Int          @default(0)
+  luckyRewardLabel      String?
+  luckyType             String?
   idempotencyKey String       @unique
   createdAt      DateTime     @default(now())
 
