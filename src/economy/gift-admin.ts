@@ -2,7 +2,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { RoleName } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
-import { validateLuckyRewards, luckyGameType, luckyPayoutRate } from './lucky-gift';
+import { validateLuckyRewards, luckyGameType, luckyPayoutRate, planLuckyOdds, validateOddsPreset } from './lucky-gift';
 
 export function cleanGiftInput(body: any, creating: boolean) {
   if (!body || typeof body !== 'object') throw new BadRequestException('Body is required');
@@ -76,6 +76,41 @@ export class GiftAdminService {
       const bonusPaid = r?._sum.luckyRewardCoins ?? 0;
       return { giftId: g.id, gift: g, sends: r?._count._all ?? 0, coinsSpent, bonusPaid, configuredPayoutPct, actualPayoutPct: coinsSpent > 0 ? Number(((bonusPaid / coinsSpent) * 100).toFixed(2)) : null };
     });
+  }
+
+  /**
+   * Applies one odds table to every lucky gift (or just `giftIds`). With `dryRun` nothing is written and
+   * the caller gets the before/after payout of each gift. Gifts that cannot take the table (a prize that
+   * would not be a whole number of coins, or a payout over the limit) are skipped and reported, never half-applied.
+   */
+  async applyLuckyOdds(body: any, actorId: string, roles: RoleName[]) {
+    if (!body || typeof body !== 'object') throw new BadRequestException('Body is required');
+    let preset;
+    try { preset = validateOddsPreset(body.tiers); } catch (e: any) { throw new BadRequestException(e?.message ?? 'Invalid odds preset'); }
+    const ids: string[] | null = Array.isArray(body.giftIds) && body.giftIds.every((x: unknown) => typeof x === 'string') ? body.giftIds : null;
+    const gifts = await this.prisma.gift.findMany({
+      where: { luckyEnabled: true, ...(ids ? { id: { in: ids } } : {}) },
+      select: { id: true, name: true, coinPrice: true, luckyRewards: true },
+      orderBy: { coinPrice: 'asc' },
+    });
+    const plan = planLuckyOdds(gifts, preset);
+    const dryRun = body.dryRun === true;
+    const applicable = plan.filter(p => p.rewards);
+    if (!dryRun && applicable.length) {
+      await this.prisma.$transaction(applicable.map(p => this.prisma.gift.update({ where: { id: p.giftId }, data: { luckyRewards: p.rewards as any } })));
+      for (const p of applicable) {
+        await this.audit.record({
+          actorId, actorRole: roles[0], action: 'gift.lucky_odds_preset', targetType: 'gift', targetId: p.giftId,
+          metadata: { beforePayoutPct: p.beforePct, afterPayoutPct: p.afterPct, luckyRewards: p.rewards } as any,
+        });
+      }
+    }
+    return {
+      dryRun,
+      applied: dryRun ? 0 : applicable.length,
+      skipped: plan.length - applicable.length,
+      results: plan.map(({ rewards, ...rest }) => ({ ...rest, status: rest.error ? 'skipped' : dryRun ? 'preview' : 'applied' })),
+    };
   }
 
   // A price change only affects gifts sent from then on: every sent gift keeps the
