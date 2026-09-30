@@ -3,4 +3,4 @@
 -- GiftTransaction record. Without this column, that call throws a Prisma validation error and
 -- rolls back the ENTIRE transaction — meaning gifts sent to anyone sitting in a Party Room seat
 -- have been failing outright, not just failing to update a display number.
-ALTER TABLE "RoomSeat" ADD COLUMN IF NOT EXISTS "giftCoins" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "RoomSeat" ADD COLUMN "giftCoins" INTEGER NOT NULL DEFAULT 0;

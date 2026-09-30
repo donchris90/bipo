@@ -1,5 +1,5 @@
 import { DAY_MS, DEFAULT_DAY_OFFSET_MINUTES, dayPeriod } from '../common/day-period';
-import { BadRequestException, Injectable, NotFoundException, Optional } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException, Optional } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from './wallet.service';
 import { NotificationsService } from '../notifications/notifications.service';
@@ -14,6 +14,8 @@ import { SupporterLevelsService } from '../supporters/supporter-levels.service';
 import { RoomCommunityService } from '../rooms/room-community.service';
 import { SeasonsService } from '../seasons/seasons.service';
 import { createMoment } from '../experience/experience.moments';
+import { applyRoomPkScore } from './room-pk-score';
+import { drawLuckyReward, luckyGameType } from './lucky-gift';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -169,7 +171,7 @@ export class GiftService {
     return this.prisma.gift.findMany({
       where: { active: true },
       orderBy: { coinPrice: 'asc' },
-      select: { id: true, code: true, name: true, coinPrice: true, category: true, icon: true },
+      select: { id: true, code: true, name: true, coinPrice: true, category: true, icon: true, luckyEnabled: true, luckyType: true, luckyRewards: true },
     });
   }
 
@@ -181,7 +183,12 @@ export class GiftService {
     const existing = await this.prisma.giftTransaction.findUnique({
       where: { idempotencyKey: params.idempotencyKey },
     });
-    if (existing) return existing; // idempotent on retry
+    if (existing) {
+      // A retry must come from the same sender. Never hand one user another user's transaction
+      // (and its lucky result) because a key happened to collide.
+      if (existing.senderId !== params.senderId) throw new ConflictException('Idempotency key already used');
+      return existing; // idempotent on retry
+    }
 
     const gift = await this.prisma.gift.findUnique({ where: { id: params.giftId } });
     if (!gift || !gift.active) throw new NotFoundException('Gift not available');
@@ -191,6 +198,9 @@ export class GiftService {
 
     const split = await this.revenueSplit.resolve(sender.countryCode);
     const coinAmount = gift.coinPrice;
+    const lucky = gift.luckyEnabled && gift.luckyRewards ? drawLuckyReward(gift.luckyRewards) : null;
+    const luckyCoins = lucky?.coins ?? 0;
+    const luckyType = lucky ? luckyGameType(gift.luckyType) : null;
 
     // Which PK (if any) this gift counts towards, decided here from the
     // recipient — never trusted from the client.
@@ -275,6 +285,35 @@ export class GiftService {
         );
       }
 
+      // Lucky Gifts return bonus coins to the SENDER. The reward is selected
+      // server-side and credited in the same transaction as the gift debit,
+      // so a retry can never create a second bonus.
+      if (luckyCoins > 0) {
+        await this.wallet.credit(
+          {
+            userId: params.senderId,
+            walletType: WalletType.COIN,
+            amount: BigInt(luckyCoins),
+            ledgerType: LedgerEntryType.BONUS,
+            reference: params.idempotencyKey,
+            idempotencyKey: `gift_lucky_bonus:${params.idempotencyKey}`,
+          },
+          tx,
+        );
+        // The bonus coins are newly issued to the sender, so the platform books the same
+        // amount as an expense (negative, walletId null). Without this the ledger shows
+        // coins appearing from nowhere and platform revenue is overstated.
+        await this.wallet.recordPlatformEntry(
+          {
+            ledgerType: LedgerEntryType.BONUS,
+            amount: -BigInt(luckyCoins),
+            reference: params.idempotencyKey,
+            idempotencyKey: `gift_lucky_platform:${params.idempotencyKey}`,
+          },
+          tx,
+        );
+      }
+
       // Party seats display the gift value received during the current seat
       // session. The RoomSeat row is deleted when the guest leaves, so the
       // next visit starts from zero while the room-wide gift total remains
@@ -303,10 +342,23 @@ export class GiftService {
           agencyCommissionBps: membership?.commissionBps ?? 0,
           agencyId: agency?.id ?? null,
           agencyOwnerId: agency?.ownerId ?? null,
+          luckyRewardCoins: luckyCoins,
+          luckyRewardLabel: lucky?.label ?? null,
+          luckyType,
           idempotencyKey: params.idempotencyKey,
         },
       });
     }, EXTENDED_TX_OPTIONS);
+
+    // Feed committed room gifts into the active multi-guest Room PK. This is deliberately
+    // after the paid transaction commits: a scoring failure must never roll back a real gift.
+    if (params.context === 'ROOM' && params.contextId) {
+      try {
+        await applyRoomPkScore(this.prisma, params.contextId, params.recipientId, coinAmount);
+      } catch {
+        // Room PK scoring is supplementary game state; the gift transaction is already committed.
+      }
+    }
 
     // Large gifts become Rryda Moments so the social layer has memorable events to surface.
     // The threshold is intentionally conservative to avoid filling the feed with every small gift.
@@ -386,37 +438,23 @@ export class GiftService {
     });
     if (direct) return direct.id;
 
-    // Team PK: a gift to a team member counts only when that member is the
-    // host receiving the gift in the same live session. This prevents a gift
-    // sent to a team member in an unrelated live from leaking into Team PK.
+    // Team/Agency PK: a gift to any of the snapshotted participants (captured once at challenge
+    // time — see PkService.teamChallenge / agencyChallenge) counts, but only while the recipient
+    // is themself hosting the live it was sent in. Deliberately NOT a live membership lookup:
+    // joining a team or agency after the challenge was sent must never add scoring surface to it.
     if (!params.contextId) return null;
-    const [membership, liveSession] = await Promise.all([
-      this.prisma.teamMember.findUnique({ where: { userId: params.recipientId }, select: { teamId: true } }),
-      this.prisma.liveSession.findFirst({ where: { id: params.contextId, hostId: params.recipientId, status: 'LIVE' }, select: { id: true } }),
-    ]);
-    if (membership && liveSession) {
-      const teamBattle = await this.prisma.pKBattle.findFirst({
-        where: { status: 'ACTIVE', mode: 'TEAM', OR: [{ challengerTeamId: membership.teamId }, { opponentTeamId: membership.teamId }] },
-        select: { id: true },
-        orderBy: { startedAt: 'desc' },
-      });
-      if (teamBattle) return teamBattle.id;
-    }
-
-    // Family/Guild PK: the same rule as Team PK above, one level up — a gift only counts when
-    // the recipient is themself hosting the live session it was sent in, and their AGENCY (not
-    // just any member's activity anywhere) has an active AGENCY-mode battle.
+    const liveSession = await this.prisma.liveSession.findFirst({ where: { id: params.contextId, hostId: params.recipientId, status: 'LIVE' }, select: { id: true } });
     if (!liveSession) return null;
-    const agencyMembership = await this.prisma.agencyMembership.findFirst({ where: { creatorId: params.recipientId, status: 'ACTIVE' }, select: { agencyId: true } });
-    const ownedAgency = await this.prisma.agency.findFirst({ where: { ownerId: params.recipientId, status: 'APPROVED' }, select: { id: true } });
-    const agencyId = agencyMembership?.agencyId ?? ownedAgency?.id;
-    if (!agencyId) return null;
-    const agencyBattle = await this.prisma.pKBattle.findFirst({
-      where: { status: 'ACTIVE', mode: 'AGENCY', OR: [{ challengerAgencyId: agencyId }, { opponentAgencyId: agencyId }] },
+    const poolBattle = await this.prisma.pKBattle.findFirst({
+      where: {
+        status: 'ACTIVE',
+        mode: { in: ['TEAM', 'AGENCY'] },
+        OR: [{ challengerParticipantIds: { has: params.recipientId } }, { opponentParticipantIds: { has: params.recipientId } }],
+      },
       select: { id: true },
       orderBy: { startedAt: 'desc' },
     });
-    return agencyBattle?.id ?? null;
+    return poolBattle?.id ?? null;
   }
 
   private async applyPkScore(pkBattleId: string, recipientId: string, coinAmount: number) {
@@ -425,17 +463,10 @@ export class GiftService {
     if (battle.endsAt && battle.endsAt.getTime() <= Date.now()) return; // buzzer has sounded
 
     let side = pkSideForRecipient(battle, recipientId);
-    if (!side && battle.mode === 'TEAM') {
-      const membership = await this.prisma.teamMember.findUnique({ where: { userId: recipientId }, select: { teamId: true } });
-      if (membership?.teamId === battle.challengerTeamId) side = 'CHALLENGER';
-      else if (membership?.teamId === battle.opponentTeamId) side = 'OPPONENT';
-    }
-    if (!side && battle.mode === 'AGENCY') {
-      const membership = await this.prisma.agencyMembership.findFirst({ where: { creatorId: recipientId, status: 'ACTIVE' }, select: { agencyId: true } });
-      const owned = await this.prisma.agency.findFirst({ where: { ownerId: recipientId, status: 'APPROVED' }, select: { id: true } });
-      const agencyId = membership?.agencyId ?? owned?.id;
-      if (agencyId === battle.challengerAgencyId) side = 'CHALLENGER';
-      else if (agencyId === battle.opponentAgencyId) side = 'OPPONENT';
+    if (!side && (battle.mode === 'TEAM' || battle.mode === 'AGENCY')) {
+      // Snapshot-based, same as resolvePkBattleId above — never a live membership lookup.
+      if (battle.challengerParticipantIds?.includes(recipientId)) side = 'CHALLENGER';
+      else if (battle.opponentParticipantIds?.includes(recipientId)) side = 'OPPONENT';
     }
     if (!side) return;
 

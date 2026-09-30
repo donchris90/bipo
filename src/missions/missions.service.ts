@@ -248,7 +248,7 @@ export class MissionsService {
       tier,
       rewardCoins: target.rewardCoins,
       bonusBalance: bonus.toString(),
-      perfectDayStreak: streakResult?.nextStreak,
+      perfectDayStreak: streakResult ? streakResult.nextStreak : undefined,
     };
   }
 

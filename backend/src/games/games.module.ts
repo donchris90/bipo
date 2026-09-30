@@ -18,11 +18,14 @@ import { LudoService } from './ludo.service';
 import { LudoController } from './ludo.controller';
 import { LudoGateway } from './ludo.gateway';
 import { SeasonsModule } from '../seasons/seasons.module';
+import { AyoService } from './ayo.service';
+import { AyoController } from './ayo.controller';
+import { AyoGateway } from './ayo.gateway';
 
 @Module({
   imports: [EconomyModule, SeasonsModule, RealtimeModule, RegionalConfigModule, FeatureFlagsModule, ConfigModule, JwtModule.registerAsync({ imports: [ConfigModule], inject: [ConfigService], useFactory: (config: ConfigService) => ({ secret: config.get<string>('JWT_ACCESS_SECRET') }) })],
-  providers: [RngService, RoundService, EntryService, SettlementService, CrashService, GameAdminService, RoundSchedulerService, GamesReadinessService, LudoService, LudoGateway],
-  controllers: [GamesController, GameOperatorController, LudoController],
+  providers: [RngService, RoundService, EntryService, SettlementService, CrashService, GameAdminService, RoundSchedulerService, GamesReadinessService, LudoService, LudoGateway, AyoService, AyoGateway],
+  controllers: [GamesController, GameOperatorController, LudoController, AyoController],
   exports: [RoundService, SettlementService, CrashService, LudoService],
 })
 export class GamesModule {}

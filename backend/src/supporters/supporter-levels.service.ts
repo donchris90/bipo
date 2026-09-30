@@ -87,7 +87,6 @@ export class SupporterLevelsService {
       supporterId: r.supporterId,
       displayName: byId.get(r.supporterId)?.displayName ?? null,
       avatarUrl: byId.get(r.supporterId)?.avatarUrl ?? null,
-      xp: r.xp,
       totalGiftCoins: r.totalGiftCoins,
       ...this.shapeProgress(r.xp, levels),
     }));

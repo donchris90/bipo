@@ -1,4 +1,5 @@
-import { WebSocketGateway, WebSocketServer, SubscribeMessage, MessageBody, ConnectedSocket, OnGatewayConnection, OnModuleDestroy, WsException } from '@nestjs/websockets';
+import { WebSocketGateway, WebSocketServer, SubscribeMessage, MessageBody, ConnectedSocket, OnGatewayConnection, WsException } from '@nestjs/websockets';
+import { OnModuleDestroy } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -63,7 +64,9 @@ export class AyoGateway implements OnGatewayConnection, OnModuleDestroy {
       if (!state.players.some(p => p.userId === client.data.userId)) throw new WsException('You are not a player in this match');
       client.data.matchId = data.matchId;
       client.data.spectator = false;
-      await this.ayo.setConnection(client.data.userId, data.matchId, true);
+      const userId = client.data.userId;
+      if (!userId) throw new WsException('Unauthorized');
+      await this.ayo.setConnection(userId, data.matchId, true);
       client.join(`AYO:${data.matchId}`);
       client.emit('ayo:state', state);
       return state;

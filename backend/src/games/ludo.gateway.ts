@@ -85,7 +85,9 @@ export class LudoGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     return guard(async () => {
       const result = await this.ludo.placeSpectatorBet(client.data.userId!, client.data.matchId!, data.playerUserId, Number(data.amount));
       const status = await this.ludo.spectatorBetStatus(client.data.userId!, client.data.matchId!);
-      this.server.to(`LUDO:${client.data.matchId}`).emit('ludo:bet-state', status);
+      // Pool totals are public to viewers, but `myBet` is private to the bettor.
+      client.to(`LUDO:${client.data.matchId}`).emit('ludo:bet-state', { ...status, myBet: null });
+      client.emit('ludo:bet-state', status);
       return result;
     });
   }

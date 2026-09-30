@@ -580,7 +580,7 @@ export class LudoService implements OnModuleDestroy {
     if (local) return this.publicState(local);
     const round = await this.prisma.gameRound.findUnique({ where: { id: matchId } });
     if (!round || round.gameCode !== 'LUDO') throw new NotFoundException('Ludo match not found');
-    if (round.hiddenState && typeof round.hiddenState === 'object') return round.hiddenState;
+    if (round.hiddenState && typeof round.hiddenState === 'object') return round.hiddenState as unknown as LudoState;
     throw new NotFoundException('Ludo state unavailable');
   }
 

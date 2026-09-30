@@ -58,10 +58,24 @@ export class AuthService {
     throw new Error('Could not generate a unique referral code after 5 attempts');
   }
 
+  // Accounts created before emails were lower-cased may be stored with capitals
+  // (e.g. "Mark@Gmail.com"). Look up the normalised address first, then fall back
+  // to a case-insensitive match so those existing accounts can still sign in.
+  private async findUserByEmail(email: string) {
+    const exact = await this.prisma.user.findUnique({ where: { email }, include: { roles: true } });
+    if (exact) return exact;
+    return this.prisma.user.findFirst({
+      where: { email: { equals: email, mode: 'insensitive' } },
+      include: { roles: true },
+    });
+  }
+
   async register(dto: RegisterDto, ipAddress?: string) {
     const email = dto.email.trim().toLowerCase();
     const countryCode = dto.countryCode.trim().toUpperCase();
-    const existing = await this.prisma.user.findUnique({ where: { email } });
+    const referralCodeInput = dto.referralCode?.trim().toUpperCase();
+
+    const existing = await this.findUserByEmail(email);
     if (existing) {
       throw new ConflictException('Email already registered');
     }
@@ -70,8 +84,8 @@ export class AuthService {
     // fast with a clear error, rather than silently creating an
     // unreferred account when the person typed something wrong.
     let referrer: { id: string } | null = null;
-    if (dto.referralCode) {
-      referrer = await this.prisma.user.findUnique({ where: { referralCode: dto.referralCode.toUpperCase() } });
+    if (referralCodeInput) {
+      referrer = await this.prisma.user.findUnique({ where: { referralCode: referralCodeInput } });
       if (!referrer) {
         throw new BadRequestException('Invalid referral code');
       }
@@ -84,7 +98,7 @@ export class AuthService {
       data: {
         email,
         passwordHash,
-        displayName: dto.displayName,
+        displayName: dto.displayName?.trim() || undefined,
         countryCode,
         roles: { create: [{ role: RoleName.USER }] },
         referralCode,
@@ -93,9 +107,8 @@ export class AuthService {
       include: { roles: true },
     });
 
-    // Account creation is the critical operation. Audit/login telemetry must
-    // never turn a successfully-created account into a generic registration
-    // failure (for example when a deployment is missing an auxiliary column).
+    // Audit/login telemetry is non-critical. Never turn a successful account
+    // creation into a 500 just because a telemetry table/service is unavailable.
     try {
       await this.audit.record({
         actorId: user.id,
@@ -164,10 +177,7 @@ export class AuthService {
 
   async login(dto: LoginDto, ipAddress?: string) {
     const email = dto.email.trim().toLowerCase();
-    const user = await this.prisma.user.findUnique({
-      where: { email },
-      include: { roles: true },
-    });
+    const user = await this.findUserByEmail(email);
 
     // Constant-shape response whether the email exists or not — avoid
     // leaking account existence via timing/error differences.

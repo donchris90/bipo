@@ -1,0 +1,20 @@
+-- Lower the bundled Lucky Gift payout rate from ~61.5% to ~36% of the price (win rate 36%, jackpot unchanged at 10x).
+-- Prize multiples stay 0 / 0.5x / 1x / 2x / 5x / 10x; only the probabilities change (64 / 22 / 9 / 3.5 / 1.2 / 0.3).
+-- Only gifts whose current expected payout is still above 50% of the price are rewritten, so odds an admin
+-- has already lowered by hand are left alone.
+UPDATE "Gift" AS g SET "luckyRewards" = v.rewards::jsonb FROM (VALUES
+  ('RRYDA_LUCKY_CLOVER', '[{"label":"Try Again","coins":0,"probability":64},{"label":"Lucky","coins":5,"probability":22},{"label":"Small Win","coins":10,"probability":9},{"label":"Good Win","coins":20,"probability":3.5},{"label":"Big Win","coins":50,"probability":1.2},{"label":"Lucky Jackpot","coins":100,"probability":0.3}]'),
+  ('RRYDA_MYSTERY_BOX', '[{"label":"Empty Box","coins":0,"probability":64},{"label":"Small Win","coins":25,"probability":22},{"label":"Double","coins":50,"probability":9},{"label":"Big Win","coins":100,"probability":3.5},{"label":"Super Win","coins":250,"probability":1.2},{"label":"Mystery Jackpot","coins":500,"probability":0.3}]'),
+  ('RRYDA_DIAMOND_CHEST', '[{"label":"Empty Chest","coins":0,"probability":64},{"label":"Diamond Shard","coins":50,"probability":22},{"label":"Double","coins":100,"probability":9},{"label":"Big Win","coins":200,"probability":3.5},{"label":"Diamond Win","coins":500,"probability":1.2},{"label":"Diamond Jackpot","coins":1000,"probability":0.3}]'),
+  ('RRYDA_GOLDEN_CHEST', '[{"label":"Empty Chest","coins":0,"probability":64},{"label":"Gold Shard","coins":250,"probability":22},{"label":"Double","coins":500,"probability":9},{"label":"Big Win","coins":1000,"probability":3.5},{"label":"Golden Win","coins":2500,"probability":1.2},{"label":"Golden Jackpot","coins":5000,"probability":0.3}]'),
+  ('RRYDA_FORTUNE', '[{"label":"No Fortune","coins":0,"probability":64},{"label":"Small Fortune","coins":500,"probability":22},{"label":"Double","coins":1000,"probability":9},{"label":"Big Fortune","coins":2000,"probability":3.5},{"label":"Super Fortune","coins":5000,"probability":1.2},{"label":"Fortune Jackpot","coins":10000,"probability":0.3}]'),
+  ('RRYDA_JACKPOT', '[{"label":"No Jackpot","coins":0,"probability":64},{"label":"Lucky Return","coins":2500,"probability":22},{"label":"Double","coins":5000,"probability":9},{"label":"Big Win","coins":10000,"probability":3.5},{"label":"Mega Win","coins":25000,"probability":1.2},{"label":"Grand Jackpot","coins":50000,"probability":0.3}]')
+) AS v(code, rewards)
+WHERE g."code" = v.code
+  AND g."luckyEnabled" = true
+  AND CASE
+    WHEN jsonb_typeof(g."luckyRewards") = 'array' THEN
+      (SELECT COALESCE(SUM((x->>'coins')::numeric * COALESCE((x->>'probability')::numeric, 0)), 0)
+         FROM jsonb_array_elements(g."luckyRewards") AS x) / 100 / g."coinPrice" > 0.5
+    ELSE false
+  END;

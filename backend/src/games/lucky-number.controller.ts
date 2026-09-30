@@ -1,7 +1,7 @@
 import { BadRequestException, Controller, Get, Query, UseGuards } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
-import { UserThrottlerGuard } from '../../common/guards/user-throttler.guard';
-import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { UserThrottlerGuard } from '../common/guards/user-throttler.guard';
+import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { planStakes, LuckyNumberConfig } from './lucky-number-math';
 
 // Server-authoritative config for this game. In practice this should come

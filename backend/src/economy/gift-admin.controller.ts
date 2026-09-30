@@ -18,6 +18,15 @@ interface AuthedRequest extends Request {
 export class GiftAdminController {
   constructor(private readonly admin: GiftAdminService) {}
 
+  @Get('lucky/stats')
+  luckyStats() { return this.admin.luckyStats(); }
+
+  // Body: { tiers: [{ multiple, probability }], dryRun?: boolean, giftIds?: string[] }
+  @Post('lucky/apply-odds')
+  applyLuckyOdds(@Body() body: unknown, @Req() req: AuthedRequest) {
+    return this.admin.applyLuckyOdds(body, req.user.userId, req.user.roles);
+  }
+
   @Get()
   list() {
     return this.admin.list();

@@ -1,3 +1,4 @@
+import { Prisma } from '@prisma/client';
 // Idempotent settlement for Lucky Number, following the exact claim pattern
 // SettlementService.settle() already uses for sum-dice/lucky (LOCKED ->
 // RESOLVING via a conditional updateMany, then per-entry PLACED -> WON/LOST).
@@ -12,11 +13,11 @@
 // entry (as opposed to sum-dice's number[] selection).
 
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { PrismaService } from '../../prisma/prisma.service';
-import { WalletService } from '../../economy/wallet.service';
-import { RngService } from '../rng.service';
-import { EXTENDED_TX_OPTIONS } from '../../prisma/prisma-transaction-options';
-import { creditGameReward } from '../game-payout';
+import { PrismaService } from '../prisma/prisma.service';
+import { WalletService } from '../economy/wallet.service';
+import { RngService } from './rng.service';
+import { EXTENDED_TX_OPTIONS } from '../prisma/prisma-transaction-options';
+import { creditGameReward } from './game-payout';
 import { computeMultipliers, settleLuckyNumber, LuckyNumberConfig } from './lucky-number-math';
 
 export type LuckyNumberSelection = Record<string, number>; // { "7": 39, "13": 84, ... }
@@ -74,7 +75,7 @@ export class LuckyNumberSettlementService {
         // Credit + status update commit together so a crash between them
         // can never leave a paid entry stuck at PLACED (same fix already
         // applied to CrashService and the sum-dice path above).
-        await this.prisma.$transaction(async (tx) => {
+        await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
           await creditGameReward(
             this.wallet,
             { userId: entry.userId, reward: payout, coinAmount: entry.coinAmount, bonusAmount: entry.bonusAmount, entryId: entry.id },

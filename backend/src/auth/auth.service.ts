@@ -59,7 +59,8 @@ export class AuthService {
   }
 
   async register(dto: RegisterDto, ipAddress?: string) {
-    const existing = await this.prisma.user.findUnique({ where: { email: dto.email } });
+    const email = dto.email.trim().toLowerCase();
+    const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) {
       throw new ConflictException('Email already registered');
     }
@@ -80,7 +81,7 @@ export class AuthService {
 
     const user = await this.prisma.user.create({
       data: {
-        email: dto.email,
+        email,
         passwordHash,
         displayName: dto.displayName,
         countryCode: dto.countryCode.toUpperCase(),
@@ -91,14 +92,21 @@ export class AuthService {
       include: { roles: true },
     });
 
-    await this.audit.record({
-      actorId: user.id,
-      action: 'auth.register',
-      targetType: 'user',
-      targetId: user.id,
-      ipAddress,
-    });
-    await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress, deviceIdHash: dto.deviceId ? this.hashDeviceId(dto.deviceId) : undefined } });
+    // Audit/login telemetry must never turn a successful account creation into
+    // a false 'Registration failed' response if an auxiliary table/provider is
+    // temporarily unavailable. The account itself is already committed.
+    try {
+      await this.audit.record({
+        actorId: user.id,
+        action: 'auth.register',
+        targetType: 'user',
+        targetId: user.id,
+        ipAddress,
+      });
+      await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress, deviceIdHash: dto.deviceId ? this.hashDeviceId(dto.deviceId) : undefined } });
+    } catch (err) {
+      console.error('[AuthService] Registration telemetry failed; account remains valid', err);
+    }
 
     // A failed bonus credit must never break registration itself — the
     // account already exists and is usable either way. Logged, not
@@ -144,14 +152,16 @@ export class AuthService {
     // provider can never block or fail a registration. Not awaited-and-
     // ignored via a dangling promise, though — awaited so a slow provider
     // doesn't race the response, just tolerant of failure once it resolves.
-    await this.email.sendWelcomeEmail({ email: user.email, name: user.displayName ?? undefined });
+    void this.email.sendWelcomeEmail({ email: user.email, name: user.displayName ?? undefined }).catch((err) => {
+      console.error('[AuthService] Welcome email failed', err);
+    });
 
     return this.issueTokens(user.id, user.roles.map((r: { role: RoleName }) => r.role), user.countryCode);
   }
 
   async login(dto: LoginDto, ipAddress?: string) {
     const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
+      where: { email: dto.email.trim().toLowerCase() },
       include: { roles: true },
     });
 
@@ -165,14 +175,18 @@ export class AuthService {
       throw new UnauthorizedException('Account is not active');
     }
 
-    await this.audit.record({
-      actorId: user.id,
-      action: 'auth.login',
-      targetType: 'user',
-      targetId: user.id,
-      ipAddress,
-    });
-    await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress, deviceIdHash: dto.deviceId ? this.hashDeviceId(dto.deviceId) : undefined } });
+    try {
+      await this.audit.record({
+        actorId: user.id,
+        action: 'auth.login',
+        targetType: 'user',
+        targetId: user.id,
+        ipAddress,
+      });
+      await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress, deviceIdHash: dto.deviceId ? this.hashDeviceId(dto.deviceId) : undefined } });
+    } catch (err) {
+      console.error('[AuthService] Login telemetry failed; login remains valid', err);
+    }
 
     return this.issueTokens(user.id, user.roles.map((r: { role: RoleName }) => r.role), user.countryCode);
   }

@@ -33,8 +33,8 @@ const ROUNDS_STALE_MS = 3 * 60 * 1000;
 // Mirrors what the round scheduler can create rounds for: a dice game (diceCount + diceSides)
 // or a crash game (houseEdge + growthRate). Anything else would take bets that can never win.
 export function canRunRounds(rulesJson: unknown): boolean {
-  const r = (rulesJson ?? {}) as { diceCount?: unknown; diceSides?: unknown; houseEdge?: unknown; growthRate?: unknown; turnSeconds?: unknown; prizeFirstPercent?: unknown };
-  return (!!r.diceCount && !!r.diceSides) || (typeof r.houseEdge === 'number' && typeof r.growthRate === 'number') || (typeof r.turnSeconds === 'number' && typeof r.prizeFirstPercent === 'number');
+  const r = (rulesJson ?? {}) as { diceCount?: unknown; diceSides?: unknown; houseEdge?: unknown; growthRate?: unknown; turnSeconds?: unknown; prizeFirstPercent?: unknown; prizePercent?: unknown };
+  return (!!r.diceCount && !!r.diceSides) || (typeof r.houseEdge === 'number' && typeof r.growthRate === 'number') || (typeof r.turnSeconds === 'number' && typeof r.prizeFirstPercent === 'number') || (typeof r.turnSeconds === 'number' && typeof r.prizePercent === 'number');
 }
 
 export function evaluateReadiness(i: ReadinessInput) {
@@ -88,7 +88,7 @@ export function evaluateReadiness(i: ReadinessInput) {
     });
 
     // Ludo uses a persistent match room instead of the scheduler's timed rounds.
-    const realTimeMatch = g.code === 'LUDO';
+    const realTimeMatch = g.code === 'LUDO' || g.code === 'AYO';
     let roundsRunning: boolean | null = realTimeMatch ? null : null;
     if (isActive && !unsupported && !realTimeMatch) {
       const last = i.lastRoundAt[g.code];

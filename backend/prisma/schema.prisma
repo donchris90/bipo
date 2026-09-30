@@ -554,6 +554,42 @@ model RoomSeat {
 }
 
 
+// Multi-guest / Room PK: every seated person in a party room (host = seat 0) competes on the
+// gifts they receive while the PK runs. mode INDIVIDUAL = highest personal score wins;
+// mode TEAMS = participants are split into sides "A"/"B" and each side's scores are pooled.
+// Separate from PKBattle on purpose: PKBattle is strictly two-sided and tied to two live streams.
+// status: ACTIVE | SETTLED | CANCELLED (kept as strings, like PKBattle.mode).
+model RoomPk {
+  id           String              @id @default(uuid())
+  roomId       String
+  hostId       String
+  mode         String              @default("INDIVIDUAL")
+  status       String              @default("ACTIVE")
+  durationSec  Int                 @default(180)
+  startedAt    DateTime            @default(now())
+  endsAt       DateTime
+  settledAt    DateTime?
+  winnerUserId String?
+  winnerSide   String?
+  participants RoomPkParticipant[]
+
+  @@index([roomId, status])
+  @@index([status, endsAt])
+}
+
+model RoomPkParticipant {
+  id         String @id @default(uuid())
+  roomPkId   String
+  userId     String
+  seatNumber Int
+  side       String?
+  score      BigInt @default(0)
+  roomPk     RoomPk @relation(fields: [roomPkId], references: [id], onDelete: Cascade)
+
+  @@unique([roomPkId, userId])
+  @@index([userId])
+}
+
 model RoomSeatLock {
   id         String   @id @default(uuid())
   roomId     String
@@ -753,8 +789,11 @@ model Gift {
   category  String?
   // What the app draws for this gift (an emoji). Editable in the admin.
   icon      String?
-  active    Boolean  @default(true)
-  createdAt DateTime @default(now())
+  active       Boolean  @default(true)
+  luckyEnabled Boolean  @default(false)
+  luckyType    String?
+  luckyRewards Json?
+  createdAt    DateTime @default(now())
 }
 
 model Chargeback {
@@ -802,6 +841,9 @@ model GiftTransaction {
   agencyCommissionBps   Int?
   agencyId              String?
   agencyOwnerId         String?
+  luckyRewardCoins      Int          @default(0)
+  luckyRewardLabel      String?
+  luckyType             String?
   idempotencyKey String       @unique
   createdAt      DateTime     @default(now())
 
@@ -1044,6 +1086,16 @@ model PKBattle {
   // GiftService.resolvePkBattleId / applyPkScore).
   challengerAgencyId String?
   opponentAgencyId   String?
+  // Late-joiner fix: every Team/Agency member's id, captured ONCE when the challenge is created —
+  // never re-derived from live membership. Without this, someone could join a team or agency
+  // mid-battle specifically to add more gifting surface to its score. A gift only pools into this
+  // battle if the recipient's id was ALREADY here at challenge time (see GiftService). Empty for
+  // NORMAL/RANDOM battles, which only ever have their fixed two participants anyway.
+  challengerParticipantIds String[] @default([])
+  opponentParticipantIds   String[] @default([])
+  // Winner reward, paid once at settlement — see PkService.payWinnerReward. Tracks whether it's
+  // been paid so a retried/duplicate settle can never pay twice.
+  rewardCoinsPaid  Boolean   @default(false)
   objectiveConfig  Json?
   durationSec     Int       @default(180)
   createdAt       DateTime  @default(now())
@@ -1081,23 +1133,46 @@ model GameRegionConfig {
   @@unique([gameCode, countryCode])
 }
 
+// A viewer's coin bet on which player wins a Party-Room-hosted match — real Ludo code already
+// referenced this model extensively (ludo.service.ts) despite it never actually existing in the
+// schema, meaning spectator betting has been throwing a Prisma error on every call. Fixed here,
+// and the identical shape reused for Ayo below.
+enum SpectatorBetStatus {
+  PLACED
+  WON
+  LOST
+}
 
 model LudoSpectatorBet {
-  id              String   @id @default(uuid())
-  matchId         String
-  userId          String
-  playerUserId    String
-  coinAmount      Int
-  rewardAmount    Int      @default(0)
-  status          GameEntryStatus @default(PLACED)
-  idempotencyKey  String   @unique
-  createdAt       DateTime @default(now())
-  settledAt       DateTime?
+  id             String              @id @default(uuid())
+  matchId        String
+  userId         String
+  playerUserId   String
+  coinAmount     Int
+  rewardAmount   Int                 @default(0)
+  status         SpectatorBetStatus  @default(PLACED)
+  idempotencyKey String              @unique
+  createdAt      DateTime            @default(now())
+  settledAt      DateTime?
 
   @@unique([matchId, userId])
-  @@index([matchId])
-  @@index([matchId, playerUserId])
-  @@index([userId])
+  @@index([matchId, status])
+}
+
+model AyoSpectatorBet {
+  id             String              @id @default(uuid())
+  matchId        String
+  userId         String
+  playerUserId   String
+  coinAmount     Int
+  rewardAmount   Int                 @default(0)
+  status         SpectatorBetStatus  @default(PLACED)
+  idempotencyKey String              @unique
+  createdAt      DateTime            @default(now())
+  settledAt      DateTime?
+
+  @@unique([matchId, userId])
+  @@index([matchId, status])
 }
 
 model GameRound {

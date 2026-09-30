@@ -11,6 +11,8 @@ import IORedis from 'ioredis';
 import { randomInt } from 'node:crypto';
 import { createMoment } from '../experience/experience.moments';
 import { SeasonsService } from '../seasons/seasons.service';
+import { WalletService } from '../economy/wallet.service';
+import { WalletType, LedgerEntryType } from '@prisma/client';
 
 const COUNTDOWN_MS = 10_000;
 // Battle lengths a host may pick, in seconds. One list, used by the server to validate and
@@ -56,6 +58,7 @@ export class PkService implements OnModuleDestroy {
     private readonly notifications: NotificationsService,
     @Optional() private readonly config?: ConfigService,
     @Optional() private readonly seasons?: SeasonsService,
+    @Optional() private readonly wallet?: WalletService,
   ) {
     this.redis = new IORedis(this.config?.get<string>('REDIS_URL') ?? 'redis://localhost:6379', { maxRetriesPerRequest: 1, enableOfflineQueue: false, lazyConnect: true });
     this.redis.on('error', () => undefined);
@@ -270,7 +273,14 @@ export class PkService implements OnModuleDestroy {
     await assertNotBlocked(this.prisma, userId, opponentTeam.leaderId, "You can't challenge this team");
     if (!(await this.isHostLive(userId)) || !(await this.isHostLive(opponentTeam.leaderId))) throw new BadRequestException('Both team leaders must be live');
     if (await this.isPkBusy(userId) || await this.isPkBusy(opponentTeam.leaderId)) throw new BadRequestException('One of the team leaders is already in a PK');
-    const battle = await this.prisma.pKBattle.create({ data: { challengerId: userId, opponentId: opponentTeam.leaderId, challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id, mode: 'TEAM', status: 'CHALLENGED', durationSec, objectiveConfig: this.buildObjectives() } });
+    // Late-joiner fix: capture who's on each team RIGHT NOW, once. A gift only pools into this
+    // battle's score if the recipient's id was already here at challenge time — joining a team
+    // after the challenge is sent can never add scoring surface to it.
+    const [myMembers, opponentMembers] = await Promise.all([
+      this.prisma.teamMember.findMany({ where: { teamId: mine.teamId }, select: { userId: true } }),
+      this.prisma.teamMember.findMany({ where: { teamId: opponentTeam.id }, select: { userId: true } }),
+    ]);
+    const battle = await this.prisma.pKBattle.create({ data: { challengerId: userId, opponentId: opponentTeam.leaderId, challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id, challengerParticipantIds: myMembers.map((m) => m.userId), opponentParticipantIds: opponentMembers.map((m) => m.userId), mode: 'TEAM', status: 'CHALLENGED', durationSec, objectiveConfig: this.buildObjectives() } });
     const challenger = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true, avatarUrl: true } });
     this.realtime.emitToUser(opponentTeam.leaderId, 'pk:challenge', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, challengerAvatarUrl: challenger?.avatarUrl ?? null, mode: 'TEAM', teamName: opponentTeam.name });
     await this.notifications.notify(opponentTeam.leaderId, 'PK_CHALLENGE', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, mode: 'TEAM', challengerTeamId: mine.teamId, opponentTeamId: opponentTeam.id });
@@ -279,9 +289,8 @@ export class PkService implements OnModuleDestroy {
 
   // ── Family/Guild PK ────────────────────────────────────────────
   // Mirrors Team PK exactly, one level up: the agency OWNER plays the same role a team leader
-  // does (the only one who can start or accept the battle on behalf of the whole agency), and
-  // every approved member's gifts pool into their agency's side — see
-  // GiftService.resolvePkBattleId / applyPkScore, extended the same way the TEAM fallback works.
+  // does, and every approved member's gifts pool into their agency's side — but ONLY the members
+  // captured in the snapshot below at challenge time (see GiftService), never live membership.
   async agencyCandidates(userId: string) {
     const owned = await this.prisma.agency.findFirst({ where: { ownerId: userId, status: 'APPROVED' }, select: { id: true } });
     if (!owned) throw new BadRequestException('Only an approved agency owner can start a Family PK');
@@ -306,7 +315,12 @@ export class PkService implements OnModuleDestroy {
     await assertNotBlocked(this.prisma, userId, opponentAgency.ownerId, "You can't challenge this agency");
     if (!(await this.isHostLive(userId)) || !(await this.isHostLive(opponentAgency.ownerId))) throw new BadRequestException('Both agency owners must be live');
     if (await this.isPkBusy(userId) || await this.isPkBusy(opponentAgency.ownerId)) throw new BadRequestException('One of the agency owners is already in a PK');
-    const battle = await this.prisma.pKBattle.create({ data: { challengerId: userId, opponentId: opponentAgency.ownerId, challengerAgencyId: mine.id, opponentAgencyId: opponentAgency.id, mode: 'AGENCY', status: 'CHALLENGED', durationSec, objectiveConfig: this.buildObjectives() } });
+    // Late-joiner fix: capture who's a member of each agency RIGHT NOW, once. Same rule as Team PK.
+    const [myMembers, opponentMembers] = await Promise.all([
+      this.prisma.agencyMembership.findMany({ where: { agencyId: mine.id, status: 'ACTIVE' }, select: { creatorId: true } }),
+      this.prisma.agencyMembership.findMany({ where: { agencyId: opponentAgency.id, status: 'ACTIVE' }, select: { creatorId: true } }),
+    ]);
+    const battle = await this.prisma.pKBattle.create({ data: { challengerId: userId, opponentId: opponentAgency.ownerId, challengerAgencyId: mine.id, opponentAgencyId: opponentAgency.id, challengerParticipantIds: [userId, ...myMembers.map((m) => m.creatorId)], opponentParticipantIds: [opponentAgency.ownerId, ...opponentMembers.map((m) => m.creatorId)], mode: 'AGENCY', status: 'CHALLENGED', durationSec, objectiveConfig: this.buildObjectives() } });
     const challenger = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true, avatarUrl: true } });
     this.realtime.emitToUser(opponentAgency.ownerId, 'pk:challenge', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, challengerAvatarUrl: challenger?.avatarUrl ?? null, mode: 'AGENCY', agencyName: opponentAgency.name });
     await this.notifications.notify(opponentAgency.ownerId, 'PK_CHALLENGE', { battleId: battle.id, challengerId: userId, challengerDisplayName: challenger?.displayName ?? null, mode: 'AGENCY', challengerAgencyId: mine.id, opponentAgencyId: opponentAgency.id });
@@ -676,6 +690,7 @@ export class PkService implements OnModuleDestroy {
             void this.seasons.contributePoints(participant, points);
           }
         }
+        void this.payWinnerReward(settled.id, settled.winnerId).catch(() => undefined);
         void createMoment(this.prisma, {
           userId: winner,
           type: 'PK_MOMENT',
@@ -721,6 +736,29 @@ export class PkService implements OnModuleDestroy {
     ]);
   }
 
+  // Winner coin reward — a real payout, separate from Season points, on top of whatever the
+  // winner already earned from gifts received during the battle. Skips draws entirely (there is
+  // no winner to pay) and is guarded on rewardCoinsPaid so a retried settle, or settleIfDue racing
+  // a forfeit, can never pay twice.
+  private static readonly WINNER_REWARD_COINS = 500n;
+
+  private async payWinnerReward(battleId: string, winnerId: string | null) {
+    if (!winnerId || !this.wallet) return;
+    const flipped = await this.prisma.pKBattle.updateMany({
+      where: { id: battleId, rewardCoinsPaid: false },
+      data: { rewardCoinsPaid: true },
+    });
+    if (flipped.count === 0) return; // already paid (or lost the race to another caller)
+    await this.wallet.credit({
+      userId: winnerId,
+      walletType: WalletType.BONUS,
+      amount: PkService.WINNER_REWARD_COINS,
+      ledgerType: LedgerEntryType.BONUS,
+      reference: `pk_win:${battleId}`,
+      idempotencyKey: `pk_win:${battleId}`,
+    });
+  }
+
   // ── Ending early ────────────────────────────────────────────────
 
   // A host leaves the PK before the buzzer (the "End PK" button, or their
@@ -759,6 +797,7 @@ export class PkService implements OnModuleDestroy {
       if (flipped.count === 1) {
         await this.emitLifecycle('pk:settled', current);
         await this.notifyResult(current);
+        void this.payWinnerReward(current.id, current.winnerId).catch(() => undefined);
       }
       return current;
     }
