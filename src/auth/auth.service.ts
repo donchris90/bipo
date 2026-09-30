@@ -59,7 +59,9 @@ export class AuthService {
   }
 
   async register(dto: RegisterDto, ipAddress?: string) {
-    const existing = await this.prisma.user.findUnique({ where: { email: dto.email } });
+    const email = dto.email.trim().toLowerCase();
+    const countryCode = dto.countryCode.trim().toUpperCase();
+    const existing = await this.prisma.user.findUnique({ where: { email } });
     if (existing) {
       throw new ConflictException('Email already registered');
     }
@@ -80,10 +82,10 @@ export class AuthService {
 
     const user = await this.prisma.user.create({
       data: {
-        email: dto.email,
+        email,
         passwordHash,
         displayName: dto.displayName,
-        countryCode: dto.countryCode.toUpperCase(),
+        countryCode,
         roles: { create: [{ role: RoleName.USER }] },
         referralCode,
         referredById: referrer?.id,
@@ -91,14 +93,25 @@ export class AuthService {
       include: { roles: true },
     });
 
-    await this.audit.record({
-      actorId: user.id,
-      action: 'auth.register',
-      targetType: 'user',
-      targetId: user.id,
-      ipAddress,
-    });
-    await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress, deviceIdHash: dto.deviceId ? this.hashDeviceId(dto.deviceId) : undefined } });
+    // Account creation is the critical operation. Audit/login telemetry must
+    // never turn a successfully-created account into a generic registration
+    // failure (for example when a deployment is missing an auxiliary column).
+    try {
+      await this.audit.record({
+        actorId: user.id,
+        action: 'auth.register',
+        targetType: 'user',
+        targetId: user.id,
+        ipAddress,
+      });
+    } catch (err) {
+      console.error('[AuthService] Registration audit failed', err);
+    }
+    try {
+      await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress, deviceIdHash: dto.deviceId ? this.hashDeviceId(dto.deviceId) : undefined } });
+    } catch (err) {
+      console.error('[AuthService] Registration login-event write failed', err);
+    }
 
     // A failed bonus credit must never break registration itself — the
     // account already exists and is usable either way. Logged, not
@@ -150,8 +163,9 @@ export class AuthService {
   }
 
   async login(dto: LoginDto, ipAddress?: string) {
+    const email = dto.email.trim().toLowerCase();
     const user = await this.prisma.user.findUnique({
-      where: { email: dto.email },
+      where: { email },
       include: { roles: true },
     });
 
@@ -165,14 +179,22 @@ export class AuthService {
       throw new UnauthorizedException('Account is not active');
     }
 
-    await this.audit.record({
-      actorId: user.id,
-      action: 'auth.login',
-      targetType: 'user',
-      targetId: user.id,
-      ipAddress,
-    });
-    await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress, deviceIdHash: dto.deviceId ? this.hashDeviceId(dto.deviceId) : undefined } });
+    try {
+      await this.audit.record({
+        actorId: user.id,
+        action: 'auth.login',
+        targetType: 'user',
+        targetId: user.id,
+        ipAddress,
+      });
+    } catch (err) {
+      console.error('[AuthService] Login audit failed', err);
+    }
+    try {
+      await this.prisma.loginEvent.create({ data: { userId: user.id, ipAddress, deviceIdHash: dto.deviceId ? this.hashDeviceId(dto.deviceId) : undefined } });
+    } catch (err) {
+      console.error('[AuthService] Login login-event write failed', err);
+    }
 
     return this.issueTokens(user.id, user.roles.map((r: { role: RoleName }) => r.role), user.countryCode);
   }
