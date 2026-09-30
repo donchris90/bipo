@@ -219,7 +219,7 @@ export class LudoService implements OnModuleDestroy {
     if (data.status !== 'WAITING') return this.ticketResponse(data);
     const waitSeconds = await this.botFillSeconds();
     if (waitSeconds <= 0) {
-      if (force) throw new BadRequestException('AI matches are switched off');
+      if (force) throw new BadRequestException('Automated matches are switched off');
       return this.ticketResponse(data);
     }
     if (!force && Date.now() - Date.parse(data.createdAt) < waitSeconds * 1000) return this.ticketResponse(data);

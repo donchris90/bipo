@@ -16,6 +16,10 @@ export type AyoState = {
   winnerUserId?: string;
   lastMove?: { seat: 0 | 1; pit: number; captured: number; path: number[] } | null;
   serverNow: number;
+  prizePool: number;
+  prizePayout: number;
+  disconnectedAt?: [number | null, number | null];
+  reconnectGraceSeconds: number;
 };
 
 const INITIAL = 4;
@@ -182,5 +186,7 @@ export function createInitialAyoState(params: {
     turnStartedAt: new Date(now).toISOString(),
     turnExpiresAt: new Date(now + params.turnSeconds * 1000).toISOString(),
     turnSeconds: params.turnSeconds, lastMove: null, serverNow: now,
+    prizePool: params.entryFee * params.players.length, prizePayout: 0,
+    disconnectedAt: [null, null], reconnectGraceSeconds: 60,
   };
 }

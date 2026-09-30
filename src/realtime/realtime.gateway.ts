@@ -219,6 +219,10 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     return { ok: true };
   }
 
+  broadcastAyo(matchId: string, payload: unknown) {
+    this.server.to(`AYO:${matchId}`).emit('ayo:state', payload);
+  }
+
   // Called by GiftService's controller layer to broadcast a gift event —
   // keeps GiftService itself transport-agnostic.
   broadcastGift(context: ChatContext, contextId: string, payload: unknown) {

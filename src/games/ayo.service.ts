@@ -16,6 +16,8 @@ const QUEUE_KEY = 'ayo:quick-queue';
 const ROOM_PREFIX = 'ayo:room:';
 const STATE_PREFIX = 'ayo:state:';
 const TICKET_PREFIX = 'ayo:ticket:';
+const LOCK_PREFIX = 'ayo:lock:';
+const DISCONNECT_GRACE_SECONDS = 60;
 
 @Injectable()
 export class AyoService implements OnModuleDestroy {
@@ -94,6 +96,15 @@ export class AyoService implements OnModuleDestroy {
     return code;
   }
 
+  private async withLock<T>(key: string, fn: () => Promise<T>, ttlMs = 12000): Promise<T> {
+    const token = uuid();
+    const acquired = await this.redis.set(`${LOCK_PREFIX}${key}`, token, 'PX', ttlMs, 'NX').catch(() => null);
+    if (acquired !== 'OK') throw new BadRequestException('Ayo matchmaking is busy. Please try again.');
+    try { return await fn(); } finally {
+      await this.redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", 1, `${LOCK_PREFIX}${key}`, token).catch(() => undefined);
+    }
+  }
+
   private async startMatch(room: AyoRoom) {
     const game = await this.ensureDefinition();
     const rules = (game.rulesJson ?? {}) as any;
@@ -134,6 +145,8 @@ export class AyoService implements OnModuleDestroy {
       players: room.players.map((p, i) => ({ userId: p.userId, displayName: p.displayName, seat: i as 0 | 1 })),
       turnSeconds,
     });
+    state.prizePool = room.entryFee * room.players.length;
+    state.prizePayout = Math.floor(state.prizePool * Math.max(0, Math.min(100, Number(rules.prizePercent ?? 95))) / 100);
     await this.writeState(state);
     await this.redis.del(`${ROOM_PREFIX}${room.roomCode}`).catch(() => undefined);
     this.localRooms.delete(room.roomCode);
@@ -152,37 +165,36 @@ export class AyoService implements OnModuleDestroy {
       throw new BadRequestException('Invalid Ayo entry amount');
     }
     await this.requireBalance(userId, entryFee);
-
     const existing = await this.redis.get(`ayo:user-ticket:${userId}`).catch(() => null);
     if (existing) {
       const t = await this.readTicket(existing);
-      if (t?.status === 'WAITING') return t;
+      if (t?.status === 'WAITING') return { ...t, queueAhead: Math.max(0, (await this.readQueue()).filter(p => p.entryFee === t.entryFee && p.ticket !== t.ticket).length) };
     }
-
-    const ticket = uuid();
-    const player: WaitingPlayer = { userId, displayName, entryFee, ticket };
-    const queue = await this.readQueue();
-    const match = queue.find(p => p.entryFee === entryFee && p.userId !== userId);
-    if (match) {
-      const remaining = queue.filter(p => p.ticket !== match.ticket);
-      await this.writeQueue(remaining);
-      const room: AyoRoom = {
-        matchId: uuid(), roomCode: this.makeRoomCode(), entryFee,
-        players: [match, player], createdAt: Date.now(),
-      };
-      const state = await this.startMatch(room);
-      const done = { status: 'STARTED', ticket, matchId: state.matchId, roomCode: state.roomCode, players: 2, state };
-      await this.writeTicket(done);
-      const other = await this.readTicket(match.ticket);
-      if (other) await this.writeTicket({ ...other, status: 'STARTED', matchId: state.matchId, roomCode: state.roomCode, players: 2, state });
-      return done;
-    }
-
-    await this.writeQueue([...queue, player]);
-    const waiting = { status: 'WAITING', ticket, players: 1, entryFee };
-    await this.writeTicket(waiting);
-    await this.redis.set(`ayo:user-ticket:${userId}`, ticket, 'EX', 900).catch(() => undefined);
-    return waiting;
+    return this.withLock(`queue:${entryFee}`, async () => {
+      const ticket = uuid();
+      const player: WaitingPlayer = { userId, displayName, entryFee, ticket };
+      let queue = await this.readQueue();
+      queue = queue.filter(p => p.userId !== userId);
+      const match = queue.find(p => p.entryFee === entryFee && p.userId !== userId);
+      if (match) {
+        const remaining = queue.filter(p => p.ticket !== match.ticket);
+        await this.writeQueue(remaining);
+        const room: AyoRoom = { matchId: uuid(), roomCode: this.makeRoomCode(), entryFee, players: [match, player], createdAt: Date.now() };
+        const state = await this.startMatch(room);
+        const done = { status: 'STARTED', ticket, matchId: state.matchId, roomCode: state.roomCode, players: 2, state };
+        await this.writeTicket(done);
+        const other = await this.readTicket(match.ticket);
+        if (other) await this.writeTicket({ ...other, status: 'STARTED', matchId: state.matchId, roomCode: state.roomCode, players: 2, state });
+        await this.redis.del(`ayo:user-ticket:${match.userId}`).catch(() => undefined);
+        await this.redis.del(`ayo:user-ticket:${userId}`).catch(() => undefined);
+        return done;
+      }
+      await this.writeQueue([...queue, player]);
+      const waiting = { status: 'WAITING', ticket, players: 1, entryFee };
+      await this.writeTicket({ ...waiting, userId });
+      await this.redis.set(`ayo:user-ticket:${userId}`, ticket, 'EX', 900).catch(() => undefined);
+      return waiting;
+    });
   }
 
   private async readQueue(): Promise<WaitingPlayer[]> {
@@ -225,24 +237,23 @@ export class AyoService implements OnModuleDestroy {
     const rules = (await this.config()) as any;
     if (!Number.isInteger(entryFee) || entryFee < Number(rules.minEntry ?? 100) || entryFee > Number(rules.maxEntry ?? 500000)) throw new BadRequestException('Invalid Ayo entry amount');
     await this.requireBalance(userId, entryFee);
-    const room: AyoRoom = {
-      matchId: uuid(), roomCode: this.makeRoomCode(), entryFee,
-      players: [{ userId, displayName, entryFee, ticket: uuid() }], createdAt: Date.now(),
-    };
+    const room: AyoRoom = { matchId: uuid(), roomCode: this.makeRoomCode(), entryFee, players: [{ userId, displayName, entryFee, ticket: uuid() }], createdAt: Date.now() };
     await this.writeRoom(room);
     return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: 1, entryFee };
   }
 
   async joinRoom(userId: string, displayName: string, roomCode: string, countryCode = 'NG') {
     await this.rounds.assertGameAvailable('AYO', countryCode);
-    const room = await this.readRoom(roomCode);
-    if (!room) throw new NotFoundException('Ayo room not found');
-    if (room.players.some(p => p.userId === userId)) return { status: 'WAITING', ...room, players: room.players.length };
-    if (room.players.length >= 2) throw new BadRequestException('Ayo room is full');
-    await this.requireBalance(userId, room.entryFee);
-    room.players.push({ userId, displayName, entryFee: room.entryFee, ticket: uuid() });
-    const state = await this.startMatch(room);
-    return { status: 'STARTED', matchId: state.matchId, roomCode: state.roomCode, players: 2, entryFee: room.entryFee, state };
+    return this.withLock(`room:${roomCode.toUpperCase()}`, async () => {
+      const room = await this.readRoom(roomCode);
+      if (!room) throw new NotFoundException('Ayo room not found');
+      if (room.players.some(p => p.userId === userId)) return { status: 'WAITING', ...room, players: room.players.length };
+      if (room.players.length >= 2) throw new BadRequestException('Ayo room is full');
+      await this.requireBalance(userId, room.entryFee);
+      room.players.push({ userId, displayName, entryFee: room.entryFee, ticket: uuid() });
+      const state = await this.startMatch(room);
+      return { status: 'STARTED', matchId: state.matchId, roomCode: state.roomCode, players: 2, entryFee: room.entryFee, state };
+    });
   }
 
   async roomStatus(userId: string, roomCode: string) {
@@ -268,6 +279,20 @@ export class AyoService implements OnModuleDestroy {
     return null;
   }
 
+  async setConnection(userId: string, matchId: string, connected: boolean) {
+    const state = await this.readState(matchId);
+    if (!state || state.status !== 'ACTIVE') return state;
+    const seat = state.players.findIndex(p => p.userId === userId);
+    if (seat < 0) return state;
+    state.players[seat].connected = connected;
+    if (!state.disconnectedAt) state.disconnectedAt = [null, null];
+    state.disconnectedAt[seat as 0 | 1] = connected ? null : Date.now();
+    state.serverNow = Date.now();
+    await this.writeState(state);
+    this.broadcast(state);
+    return state;
+  }
+
   async getState(matchId: string) {
     const state = await this.readState(matchId);
     if (!state) throw new NotFoundException('Ayo match not found');
@@ -275,10 +300,16 @@ export class AyoService implements OnModuleDestroy {
   }
 
   async move(userId: string, matchId: string, pit: number) {
+    return this.withLock(`match:${matchId}`, () => this.moveLocked(userId, matchId, pit));
+  }
+
+  private async moveLocked(userId: string, matchId: string, pit: number) {
     const state = await this.readState(matchId);
     if (!state) throw new NotFoundException('Ayo match not found');
     if (state.status !== 'ACTIVE') throw new BadRequestException('Ayo match is not active');
     const player = state.players[state.currentSeat];
+    const seat = state.players.findIndex(p => p.userId === userId);
+    if (seat >= 0 && !state.players[seat].connected) { state.players[seat].connected = true; if (state.disconnectedAt) state.disconnectedAt[seat as 0 | 1] = null; }
     if (!player || player.userId !== userId) throw new BadRequestException('It is not your turn');
     if (Date.parse(state.turnExpiresAt) <= Date.now()) {
       await this.advanceExpired(state);
@@ -302,7 +333,10 @@ export class AyoService implements OnModuleDestroy {
     state.turnNumber += 1;
     if (result.finished) {
       state.status = 'FINISHED';
+      const gameRules = (rules ?? {}) as any;
+      state.prizePool = state.entryFee * state.players.length;
       state.winnerUserId = result.winnerSeat === null ? undefined : state.players[result.winnerSeat!].userId;
+      state.prizePayout = state.winnerUserId ? Math.floor(state.prizePool * Math.max(0, Math.min(100, Number(gameRules.prizePercent ?? 95))) / 100) : state.entryFee;
       state.serverNow = now;
       await this.writeState(state);
       await this.settle(state);
@@ -314,6 +348,25 @@ export class AyoService implements OnModuleDestroy {
     state.serverNow = now;
     await this.writeState(state);
     this.broadcast(state);
+    return state;
+  }
+
+  async forfeitDisconnected(state: AyoState) {
+    if (state.status !== 'ACTIVE' || !state.disconnectedAt) return state;
+    const now = Date.now();
+    const grace = (state.reconnectGraceSeconds || DISCONNECT_GRACE_SECONDS) * 1000;
+    const expiredSeat = state.disconnectedAt.findIndex(v => v != null && now - Number(v) >= grace);
+    if (expiredSeat < 0) return state;
+    const winnerSeat = expiredSeat === 0 ? 1 : 0;
+    state.status = 'FINISHED';
+    state.winnerUserId = state.players[winnerSeat].userId;
+    const game = await this.ensureDefinition();
+    const rules = (game.rulesJson ?? {}) as any;
+    state.prizePool = state.entryFee * state.players.length;
+    state.prizePayout = Math.floor(state.prizePool * Math.max(0, Math.min(100, Number(rules.prizePercent ?? 95))) / 100);
+    state.serverNow = now;
+    await this.writeState(state);
+    await this.settle(state);
     return state;
   }
 
@@ -378,7 +431,7 @@ export class AyoService implements OnModuleDestroy {
       const raw = await this.redis.get(key).catch(() => null);
       if (!raw) continue;
       const state = JSON.parse(raw) as AyoState;
-      if (state.status === 'ACTIVE' && Date.parse(state.turnExpiresAt) <= Date.now()) await this.advanceExpired(state);
+      if (state.status === 'ACTIVE') { await this.withLock(`tick:${state.matchId}`, async () => { const fresh = await this.readState(state.matchId); if (!fresh || fresh.status !== 'ACTIVE') return; if (fresh.disconnectedAt?.some(v => v != null && Date.now() - Number(v) >= (fresh.reconnectGraceSeconds || DISCONNECT_GRACE_SECONDS) * 1000)) { await this.forfeitDisconnected(fresh); return; } if (Date.parse(fresh.turnExpiresAt) <= Date.now()) await this.advanceExpired(fresh); }).catch(() => undefined); }
     }
   }
 

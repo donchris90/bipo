@@ -143,6 +143,17 @@ async function main() {
     },
   });
 
+  await prisma.gameDefinition.upsert({
+    where: { code: 'AYO' },
+    update: {},
+    create: {
+      code: 'AYO',
+      name: 'Ayo',
+      status: 'DISABLED',
+      rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 30, prizePercent: 95, captureMode: 'FOUR' },
+    },
+  });
+
   // Crash (spec §44-46). growthRate is tuned so the multiplier reaches
   // 2.00x at ~5 seconds into the live phase — see games/crash-rules.ts.
   // houseEdge of 3% matches the (1-houseEdge)/(1-r) formula's defining

@@ -36,6 +36,12 @@ export class AyoGateway implements OnGatewayConnection, OnModuleDestroy {
     } catch { client.disconnect(); }
   }
 
+  async handleDisconnect(client: AyoSocket) {
+    if (client.data.userId && client.data.matchId && !client.data.spectator) {
+      await this.ayo.setConnection(client.data.userId, client.data.matchId, false).catch(() => undefined);
+    }
+  }
+
   @SubscribeMessage('ayo:watch')
   async watch(@MessageBody() data: { matchId: string }, @ConnectedSocket() client: AyoSocket) {
     if (!client.data.userId) return { error: 'unauthenticated' };
@@ -57,6 +63,7 @@ export class AyoGateway implements OnGatewayConnection, OnModuleDestroy {
       if (!state.players.some(p => p.userId === client.data.userId)) throw new WsException('You are not a player in this match');
       client.data.matchId = data.matchId;
       client.data.spectator = false;
+      await this.ayo.setConnection(client.data.userId, data.matchId, true);
       client.join(`AYO:${data.matchId}`);
       client.emit('ayo:state', state);
       return state;

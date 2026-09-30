@@ -5,7 +5,7 @@ import { BadRequestException } from '@nestjs/common';
 // typo or an out-of-range number here would silently change real money
 // outcomes — hence a strict allow-list with bounds instead of "any JSON".
 
-export type GameRules = Record<string, number | null>;
+export type GameRules = Record<string, number | string | null>;
 
 const SHARED = ['openSeconds', 'minStake', 'maxStake'] as const;
 const SHAPES = {
@@ -13,6 +13,7 @@ const SHAPES = {
   crash: ['houseEdge', 'growthRate', ...SHARED],
   lucky: ['payoutMultiplier', ...SHARED],
   ludo: ['minEntry', 'maxEntry', 'turnSeconds', 'reconnectSeconds', 'prizeFirstPercent', 'prizeSecondPercent', 'prizeFirstPercent2p', 'botFillSeconds', 'botMatchPaid', 'botPrizePercent'],
+  ayo: ['minEntry', 'maxEntry', 'turnSeconds', 'prizePercent', 'captureMode'],
 } as const;
 
 type Shape = keyof typeof SHAPES;
@@ -22,6 +23,7 @@ export function shapeOf(rules: any): Shape | null {
   if (typeof rules.houseEdge === 'number' && typeof rules.growthRate === 'number') return 'crash';
   if (rules.diceCount && rules.diceSides) return 'dice';
   if (typeof rules.payoutMultiplier === 'number') return 'lucky';
+  if (typeof rules.turnSeconds === 'number' && typeof rules.prizePercent === 'number') return 'ayo';
   if (typeof rules.turnSeconds === 'number' && typeof rules.prizeFirstPercent === 'number') return 'ludo';
   return null;
 }
@@ -116,6 +118,16 @@ export function validateGameRules(existing: any, incoming: any): GameRules {
     if (!isNum(incoming.growthRate) || incoming.growthRate < 0.01 || incoming.growthRate > 1) errors.push('growthRate must be a number from 0.01 to 1');
     out.houseEdge = incoming.houseEdge;
     out.growthRate = incoming.growthRate;
+  } else if (shape === 'ayo') {
+    const ints: Array<[string, number, number]> = [['minEntry', 1, 1_000_000_000], ['maxEntry', 1, 1_000_000_000], ['turnSeconds', 10, 180]];
+    for (const [key, min, max] of ints) if (!isInt(incoming[key], min, max)) errors.push(`${key} must be a whole number from ${min} to ${max}`);
+    if (isInt(incoming.minEntry, 1, 1_000_000_000) && isInt(incoming.maxEntry, 1, 1_000_000_000) && incoming.maxEntry < incoming.minEntry) errors.push('maxEntry cannot be below minEntry');
+    if (!isNum(incoming.prizePercent) || incoming.prizePercent < 50 || incoming.prizePercent > 100) errors.push('prizePercent must be from 50 to 100');
+    if (incoming.captureMode !== 'FOUR' && incoming.captureMode !== 'TWO_THREE') errors.push('captureMode must be FOUR or TWO_THREE');
+    if (!errors.length) {
+      out.minEntry = incoming.minEntry; out.maxEntry = incoming.maxEntry; out.turnSeconds = incoming.turnSeconds;
+      out.prizePercent = incoming.prizePercent; (out as any).captureMode = incoming.captureMode;
+    }
   } else if (shape === 'ludo') {
     const ints: Array<[string, number, number]> = [['minEntry', 1, 1_000_000_000], ['maxEntry', 1, 1_000_000_000], ['turnSeconds', 5, 120], ['reconnectSeconds', 10, 900]];
     for (const [key, min, max] of ints) if (!isInt(incoming[key], min, max)) errors.push(`${key} must be a whole number from ${min} to ${max}`);
