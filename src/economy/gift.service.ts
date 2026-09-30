@@ -171,7 +171,7 @@ export class GiftService {
     return this.prisma.gift.findMany({
       where: { active: true },
       orderBy: { coinPrice: 'asc' },
-      select: { id: true, code: true, name: true, coinPrice: true, category: true, icon: true, luckyEnabled: true, luckyType: true },
+      select: { id: true, code: true, name: true, coinPrice: true, category: true, icon: true, luckyEnabled: true, luckyType: true, luckyRewards: true },
     });
   }
 
