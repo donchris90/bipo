@@ -8,9 +8,10 @@ import { WalletService } from '../economy/wallet.service';
 import { RoundService } from './round.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
 import { AyoCaptureMode, AyoState, createInitialAyoState, legalPits, makeMove } from './ayo.rules';
+import { calculateSpectatorPoolSplit, calculateWinningSpectatorReward } from './ludo-payout';
 
 type WaitingPlayer = { userId: string; displayName: string; entryFee: number; ticket: string };
-type AyoRoom = { matchId: string; roomCode: string; entryFee: number; players: WaitingPlayer[]; createdAt: number };
+type AyoRoom = { matchId: string; roomCode: string; entryFee: number; players: WaitingPlayer[]; createdAt: number; partyRoomId?: string };
 
 const QUEUE_KEY = 'ayo:quick-queue';
 const ROOM_PREFIX = 'ayo:room:';
@@ -154,7 +155,29 @@ export class AyoService implements OnModuleDestroy {
       matchId, roomCode: room.roomCode, entryFee: room.entryFee,
       players: state.players.map(p => ({ userId: p.userId, displayName: p.displayName })),
     });
+    if (room.partyRoomId) {
+      await this.redis.set(`ayo:party:${room.partyRoomId}`, room.roomCode, 'EX', 3600).catch(() => undefined);
+      this.broadcastPartyAyo(room, 'STARTED');
+    }
     return state;
+  }
+
+  // Same shape as Ludo's own broadcastPartyLudo, deliberately — the Party Room client already
+  // knows how to render one game-table banner per game; this just gives it Ayo's version of the
+  // same event under its own action name.
+  private broadcastPartyAyo(room: AyoRoom | undefined, action: 'STARTED' | 'WAITING' | 'UPDATED' | 'FINISHED') {
+    if (!room?.partyRoomId) return;
+    this.realtime.broadcastRoomState(room.partyRoomId, {
+      roomId: room.partyRoomId,
+      action: `AYO_${action}`,
+      ayo: {
+        status: action === 'FINISHED' ? 'NONE' : (action === 'STARTED' ? 'STARTED' : 'WAITING'),
+        matchId: room.matchId,
+        roomCode: room.roomCode,
+        players: room.players.length,
+        partyRoomId: room.partyRoomId,
+      },
+    });
   }
 
   async quickMatch(userId: string, displayName: string, entryFee: number, countryCode = 'NG') {
@@ -232,14 +255,18 @@ export class AyoService implements OnModuleDestroy {
     return t;
   }
 
-  async createRoom(userId: string, displayName: string, entryFee: number, countryCode = 'NG') {
+  async createRoom(userId: string, displayName: string, entryFee: number, countryCode = 'NG', partyRoomId?: string) {
     await this.rounds.assertGameAvailable('AYO', countryCode);
     const rules = (await this.config()) as any;
     if (!Number.isInteger(entryFee) || entryFee < Number(rules.minEntry ?? 100) || entryFee > Number(rules.maxEntry ?? 500000)) throw new BadRequestException('Invalid Ayo entry amount');
     await this.requireBalance(userId, entryFee);
-    const room: AyoRoom = { matchId: uuid(), roomCode: this.makeRoomCode(), entryFee, players: [{ userId, displayName, entryFee, ticket: uuid() }], createdAt: Date.now() };
+    const room: AyoRoom = { matchId: uuid(), roomCode: this.makeRoomCode(), entryFee, players: [{ userId, displayName, entryFee, ticket: uuid() }], createdAt: Date.now(), partyRoomId };
     await this.writeRoom(room);
-    return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: 1, entryFee };
+    if (partyRoomId) {
+      await this.redis.set(`ayo:party:${partyRoomId}`, room.roomCode, 'EX', 3600).catch(() => undefined);
+      this.broadcastPartyAyo(room, 'WAITING');
+    }
+    return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: 1, entryFee, partyRoomId };
   }
 
   async joinRoom(userId: string, displayName: string, roomCode: string, countryCode = 'NG') {
@@ -391,6 +418,19 @@ export class AyoService implements OnModuleDestroy {
     const prizePercent = Math.max(0, Math.min(100, Number(rules.prizePercent ?? 95)));
     const pool = state.entryFee * state.players.length;
     const prize = state.winnerUserId ? Math.floor(pool * prizePercent / 100) : 0;
+
+    // Spectator bets settle in the SAME transaction as the players' own payouts, so a crash
+    // partway through can never leave one side paid and the other not. Ayo only ever has a
+    // single winner (or a refunded draw) — no second-place split like Ludo's 4-player mode — so
+    // this is simpler than LudoService's equivalent: exactly one winner-take-pool payout, or
+    // nothing at all on a draw.
+    const spectatorBets = state.winnerUserId ? await this.prisma.ayoSpectatorBet.findMany({ where: { matchId: state.matchId, status: 'PLACED' } }) : [];
+    const spectatorPool = spectatorBets.reduce((sum, bet) => sum + bet.coinAmount, 0);
+    const spectatorSplit = spectatorPool > 0 ? calculateSpectatorPoolSplit(spectatorPool) : null;
+    const winningSpectatorStake = state.winnerUserId
+      ? spectatorBets.filter(bet => bet.playerUserId === state.winnerUserId).reduce((sum, bet) => sum + bet.coinAmount, 0)
+      : 0;
+
     await this.prisma.$transaction(async tx => {
       await tx.gameRound.update({
         where: { id: state.matchId },
@@ -417,8 +457,38 @@ export class AyoService implements OnModuleDestroy {
           }, tx);
         }
       }
+
+      if (state.winnerUserId && spectatorSplit && spectatorBets.length > 0) {
+        // A bonus to the winning PLAYER themself for having backers — same 20% share Ludo pays.
+        if (spectatorSplit.winner > 0) {
+          const winnerEntry = entries.find(e => e.userId === state.winnerUserId);
+          if (winnerEntry) {
+            await this.wallet.credit({ userId: state.winnerUserId, walletType: WalletType.COIN, amount: BigInt(spectatorSplit.winner), ledgerType: LedgerEntryType.GAME_REWARD, reference: winnerEntry.id, idempotencyKey: `ayo_spectator_winner:${state.matchId}` }, tx);
+          }
+        }
+        for (const bet of spectatorBets) {
+          const reward = bet.playerUserId === state.winnerUserId && winningSpectatorStake > 0
+            ? calculateWinningSpectatorReward(spectatorSplit.spectators, bet.coinAmount, winningSpectatorStake)
+            : 0;
+          if (reward > 0) {
+            await this.wallet.credit({ userId: bet.userId, walletType: WalletType.COIN, amount: BigInt(reward), ledgerType: LedgerEntryType.GAME_REWARD, reference: bet.id, idempotencyKey: `ayo_spectator_reward:${bet.id}` }, tx);
+          }
+          await tx.ayoSpectatorBet.update({ where: { id: bet.id }, data: { status: reward > 0 ? 'WON' : 'LOST', rewardAmount: reward, settledAt: new Date() } });
+        }
+      } else if (spectatorBets.length > 0) {
+        await tx.ayoSpectatorBet.updateMany({ where: { matchId: state.matchId, status: 'PLACED' }, data: { status: 'LOST', rewardAmount: 0, settledAt: new Date() } });
+      }
     });
+
     this.broadcast(state);
+    // Stop advertising a live table the instant the match ends — the completed result stays
+    // available through the normal match/history endpoints, but Party Room must not keep
+    // showing a game that is actually over.
+    const partyRoomId = await this.partyRoomIdForMatch(state.roomCode);
+    if (partyRoomId) {
+      this.broadcastPartyAyo({ matchId: state.matchId, roomCode: state.roomCode, entryFee: state.entryFee, players: [], createdAt: 0, partyRoomId }, 'FINISHED');
+      await this.redis.del(`ayo:party:${partyRoomId}`).catch(() => undefined);
+    }
   }
 
   private broadcast(state: AyoState) {
@@ -433,6 +503,122 @@ export class AyoService implements OnModuleDestroy {
       const state = JSON.parse(raw) as AyoState;
       if (state.status === 'ACTIVE') { await this.withLock(`tick:${state.matchId}`, async () => { const fresh = await this.readState(state.matchId); if (!fresh || fresh.status !== 'ACTIVE') return; if (fresh.disconnectedAt?.some(v => v != null && Date.now() - Number(v) >= (fresh.reconnectGraceSeconds || DISCONNECT_GRACE_SECONDS) * 1000)) { await this.forfeitDisconnected(fresh); return; } if (Date.parse(fresh.turnExpiresAt) <= Date.now()) await this.advanceExpired(fresh); }).catch(() => undefined); }
     }
+  }
+
+  // ── Party Room hosting + spectator betting (mirrors LudoService exactly) ─────────────
+
+  // What a Party Room's own screen polls to know whether an Ayo table is currently running in
+  // it, and to get an "Ayo" button in front of the host and every seated guest. Named to match
+  // LudoService's partyRoomStatus exactly, not just its behavior.
+  async partyRoomStatus(userId: string, roomId: string) {
+    const seat = await this.prisma.roomSeat.findFirst({ where: { roomId, userId }, select: { id: true } });
+    const party = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { hostId: true, status: true, privacy: true } });
+    if (!party) throw new NotFoundException('Party room not found');
+    // Public Party viewers may observe an active Ayo table without occupying a seat. Private
+    // rooms still require the host or a seated member — same rule as LudoService.
+    if (party.hostId !== userId && !seat && party.privacy !== 'PUBLIC') {
+      throw new BadRequestException('Join this Party Room before viewing its Ayo game');
+    }
+    const isHost = party.hostId === userId;
+    const canJoin = isHost || !!seat || party.privacy === 'PUBLIC';
+    const code = await this.redis.get(`ayo:party:${roomId}`).catch(() => null);
+    if (!code) return { status: 'NONE', partyRoomId: roomId, isHost, canJoin };
+    const room = await this.readRoom(code);
+    if (room) return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, partyRoomId: roomId, isHost, canJoin };
+    const state = await this.findStateByRoom(code);
+    if (!state) {
+      await this.redis.del(`ayo:party:${roomId}`).catch(() => undefined);
+      return { status: 'NONE', partyRoomId: roomId, isHost, canJoin };
+    }
+    return { status: state.status === 'ACTIVE' ? 'STARTED' : 'NONE', matchId: state.matchId, roomCode: state.roomCode, players: state.players.length, partyRoomId: roomId, isHost, canJoin, state };
+  }
+
+  // Host-only, same rule as LudoService.createPartyRoom. If a table is already running in this
+  // room, returns it instead of starting a second one.
+  async createPartyRoom(userId: string, roomId: string, entryFee: number, countryCode = 'NG') {
+    const party = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { id: true, hostId: true, status: true } });
+    if (!party) throw new NotFoundException('Party room not found');
+    if (party.hostId !== userId) throw new BadRequestException('Only the Party Room host can start Ayo');
+    if (party.status !== 'OPEN') throw new BadRequestException('Party room is closed');
+    const existingCode = await this.redis.get(`ayo:party:${roomId}`).catch(() => null);
+    if (existingCode) {
+      const existing = await this.readRoom(existingCode);
+      if (existing) return { status: 'WAITING', matchId: existing.matchId, roomCode: existing.roomCode, players: existing.players.length, partyRoomId: roomId };
+    }
+    const host = await this.prisma.user.findUnique({ where: { id: userId }, select: { displayName: true } });
+    return this.createRoom(userId, host?.displayName?.trim() || 'Host', entryFee, countryCode, roomId);
+  }
+
+  async joinPartyRoom(userId: string, roomId: string, displayName: string, countryCode = 'NG') {
+    const party = await this.prisma.partyRoom.findUnique({ where: { id: roomId }, select: { id: true, hostId: true, status: true, privacy: true } });
+    if (!party) throw new NotFoundException('Party room not found');
+    if (party.status !== 'OPEN') throw new BadRequestException('Party room is closed');
+    const seat = await this.prisma.roomSeat.findFirst({ where: { roomId, userId }, select: { id: true } });
+    if (party.hostId !== userId && !seat && party.privacy !== 'PUBLIC') {
+      throw new BadRequestException('Join the Party Room before joining its Ayo game');
+    }
+    const code = await this.redis.get(`ayo:party:${roomId}`).catch(() => null);
+    if (!code) throw new NotFoundException('The Party Room has not started Ayo');
+    return this.joinRoom(userId, displayName, code, countryCode);
+  }
+
+  private async assertPartyAyoViewer(userId: string, partyRoomId: string) {
+    const party = await this.prisma.partyRoom.findUnique({ where: { id: partyRoomId }, select: { hostId: true, status: true, privacy: true } });
+    if (!party || party.status !== 'OPEN') throw new BadRequestException('Party room is closed');
+    if (party.hostId === userId || party.privacy === 'PUBLIC') return;
+    const seat = await this.prisma.roomSeat.findFirst({ where: { roomId: partyRoomId, userId }, select: { id: true } });
+    if (!seat) throw new BadRequestException('Join this Party Room before betting on its Ayo game');
+  }
+
+  async spectatorBetStatus(userId: string, matchId: string) {
+    const state = await this.getState(matchId);
+    const partyRoomId = await this.partyRoomIdForMatch(state.roomCode);
+    if (!partyRoomId) throw new NotFoundException('This Ayo match is not in a Party Room');
+    await this.assertPartyAyoViewer(userId, partyRoomId);
+    const [myBet, aggregate] = await Promise.all([
+      this.prisma.ayoSpectatorBet.findUnique({ where: { matchId_userId: { matchId, userId } }, select: { id: true, playerUserId: true, coinAmount: true, rewardAmount: true, status: true } }),
+      this.prisma.ayoSpectatorBet.groupBy({ by: ['playerUserId'], where: { matchId }, _sum: { coinAmount: true } }),
+    ]);
+    const playerPool = aggregate.reduce((sum, row) => sum + (row._sum.coinAmount ?? 0), 0);
+    const playerBets = Object.fromEntries(aggregate.map(row => [row.playerUserId, row._sum.coinAmount ?? 0]));
+    return { matchId, status: state.status, playerPool, playerBets, myBet };
+  }
+
+  async placeSpectatorBet(userId: string, matchId: string, playerUserId: string, amount: number) {
+    const state = await this.getState(matchId);
+    const partyRoomId = await this.partyRoomIdForMatch(state.roomCode);
+    if (!partyRoomId) throw new NotFoundException('This Ayo match is not in a Party Room');
+    await this.assertPartyAyoViewer(userId, partyRoomId);
+    if (state.status !== 'ACTIVE') throw new BadRequestException('Spectator betting is closed for this match');
+    if (!Number.isInteger(amount) || amount < 10 || amount > 500000) throw new BadRequestException('Bet must be between 10 and 500000 coins');
+    const player = state.players.find(p => p.userId === playerUserId);
+    if (!player) throw new BadRequestException('That player is not in this match');
+    if (state.players.some(p => p.userId === userId)) throw new BadRequestException('Players cannot bet on the match as spectators');
+
+    const idempotencyKey = `ayo_spectator_bet:${matchId}:${userId}`;
+    const bet = await this.prisma.$transaction(async tx => {
+      const existing = await tx.ayoSpectatorBet.findUnique({ where: { matchId_userId: { matchId, userId } } });
+      if (existing) throw new BadRequestException('You already placed a spectator bet on this match');
+      const created = await tx.ayoSpectatorBet.create({ data: { matchId, userId, playerUserId, coinAmount: amount, idempotencyKey } });
+      await this.wallet.debit({ userId, walletType: WalletType.COIN, amount: BigInt(amount), ledgerType: LedgerEntryType.GAME_ENTRY, reference: created.id, idempotencyKey: `ayo_spectator_debit:${created.id}` }, tx);
+      return created;
+    });
+
+    const status = await this.spectatorBetStatus(userId, matchId);
+    return { bet: { id: bet.id, playerUserId: bet.playerUserId, coinAmount: bet.coinAmount, status: bet.status }, ...status };
+  }
+
+  // The Redis party mapping is keyed by partyRoomId -> roomCode (see startMatch/createRoom), so
+  // recovering the direction this needs (roomCode -> partyRoomId) means a short reverse scan —
+  // cheap and rare, since it only runs when a spectator actually opens the betting panel, not on
+  // every move.
+  private async partyRoomIdForMatch(roomCode: string): Promise<string | null> {
+    const keys = await this.redis.keys('ayo:party:*').catch(() => []);
+    for (const key of keys) {
+      const code = await this.redis.get(key).catch(() => null);
+      if (code === roomCode) return key.replace('ayo:party:', '');
+    }
+    return null;
   }
 
   async quickLobby() {

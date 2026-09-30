@@ -1133,6 +1133,48 @@ model GameRegionConfig {
   @@unique([gameCode, countryCode])
 }
 
+// A viewer's coin bet on which player wins a Party-Room-hosted match — real Ludo code already
+// referenced this model extensively (ludo.service.ts) despite it never actually existing in the
+// schema, meaning spectator betting has been throwing a Prisma error on every call. Fixed here,
+// and the identical shape reused for Ayo below.
+enum SpectatorBetStatus {
+  PLACED
+  WON
+  LOST
+}
+
+model LudoSpectatorBet {
+  id             String              @id @default(uuid())
+  matchId        String
+  userId         String
+  playerUserId   String
+  coinAmount     Int
+  rewardAmount   Int                 @default(0)
+  status         SpectatorBetStatus  @default(PLACED)
+  idempotencyKey String              @unique
+  createdAt      DateTime            @default(now())
+  settledAt      DateTime?
+
+  @@unique([matchId, userId])
+  @@index([matchId, status])
+}
+
+model AyoSpectatorBet {
+  id             String              @id @default(uuid())
+  matchId        String
+  userId         String
+  playerUserId   String
+  coinAmount     Int
+  rewardAmount   Int                 @default(0)
+  status         SpectatorBetStatus  @default(PLACED)
+  idempotencyKey String              @unique
+  createdAt      DateTime            @default(now())
+  settledAt      DateTime?
+
+  @@unique([matchId, userId])
+  @@index([matchId, status])
+}
+
 model GameRound {
   id             String      @id @default(uuid())
   gameCode       String

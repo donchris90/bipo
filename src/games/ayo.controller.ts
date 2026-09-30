@@ -36,6 +36,21 @@ export class AyoController {
     return this.ayo.createRoom(req.user.userId, body.displayName?.trim() || 'Player', Number(body.entryFee), req.user.countryCode || 'NG');
   }
 
+  @Post('party/:roomId')
+  createParty(@Req() req: AuthedRequest, @Param('roomId') roomId: string, @Body() body: { entryFee: number }) {
+    return this.ayo.createPartyRoom(req.user.userId, roomId, Number(body.entryFee), req.user.countryCode || 'NG');
+  }
+
+  @Get('party/:roomId/status')
+  partyStatus(@Req() req: AuthedRequest, @Param('roomId') roomId: string) {
+    return this.ayo.partyRoomStatus(req.user.userId, roomId);
+  }
+
+  @Post('party/:roomId/join')
+  joinParty(@Req() req: AuthedRequest, @Param('roomId') roomId: string, @Body() body: { displayName?: string }) {
+    return this.ayo.joinPartyRoom(req.user.userId, roomId, body.displayName?.trim() || 'Player', req.user.countryCode || 'NG');
+  }
+
   @Get('rooms/:roomCode/status')
   roomStatus(@Req() req: AuthedRequest, @Param('roomCode') code: string) {
     return this.ayo.roomStatus(req.user.userId, code);
@@ -52,5 +67,15 @@ export class AyoController {
   @Post('matches/:matchId/move')
   move(@Req() req: AuthedRequest, @Param('matchId') matchId: string, @Body() body: { pit: number }) {
     return this.ayo.move(req.user.userId, matchId, Number(body.pit));
+  }
+
+  @Get('matches/:matchId/spectator-bets')
+  spectatorBets(@Req() req: AuthedRequest, @Param('matchId') matchId: string) {
+    return this.ayo.spectatorBetStatus(req.user.userId, matchId);
+  }
+
+  @Post('matches/:matchId/spectator-bets')
+  spectatorBet(@Req() req: AuthedRequest, @Param('matchId') matchId: string, @Body() body: { playerUserId: string; amount: number }) {
+    return this.ayo.placeSpectatorBet(req.user.userId, matchId, body.playerUserId, Number(body.amount));
   }
 }
