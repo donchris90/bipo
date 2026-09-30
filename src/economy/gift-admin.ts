@@ -2,16 +2,20 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { RoleName } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
+import { validateLuckyRewards, luckyGameType } from './lucky-gift';
 
 export function cleanGiftInput(body: any, creating: boolean) {
   if (!body || typeof body !== 'object') throw new BadRequestException('Body is required');
   const errors: string[] = [];
-  const out: { code?: string; name: string; coinPrice: number; icon: string; category: string | null; active: boolean } = {
+  const out: { code?: string; name: string; coinPrice: number; icon: string; category: string | null; active: boolean; luckyEnabled: boolean; luckyType: string | null; luckyRewards: any } = {
     name: typeof body.name === 'string' ? body.name.trim() : '',
     coinPrice: body.coinPrice,
     icon: typeof body.icon === 'string' ? body.icon.trim() : '',
     category: typeof body.category === 'string' && body.category.trim() ? body.category.trim() : null,
     active: body.active === undefined ? true : body.active,
+    luckyEnabled: body.luckyEnabled === true,
+    luckyType: body.luckyEnabled === true ? luckyGameType(body.luckyType) : null,
+    luckyRewards: null,
   };
   if (creating) {
     const code = typeof body.code === 'string' ? body.code.trim().toUpperCase() : '';
@@ -23,6 +27,9 @@ export function cleanGiftInput(body: any, creating: boolean) {
   if (out.icon.length < 1 || out.icon.length > 12) errors.push('icon must be an emoji (1 to 12 characters)');
   if (out.category && out.category.length > 20) errors.push('category can be at most 20 characters');
   if (typeof out.active !== 'boolean') errors.push('active must be true or false');
+  if (out.luckyEnabled) {
+    try { out.luckyRewards = validateLuckyRewards(body.luckyRewards); } catch (e: any) { errors.push(e?.message ?? 'Invalid Lucky Gift rewards'); }
+  }
   if (errors.length) throw new BadRequestException(errors.join('; '));
   return out;
 }
@@ -44,6 +51,27 @@ export class GiftAdminService {
     const gift = await this.prisma.gift.create({ data });
     await this.audit.record({ actorId, actorRole: roles[0], action: 'gift.create', targetType: 'gift', targetId: gift.id, metadata: { code: gift.code, coinPrice: gift.coinPrice } as any });
     return gift;
+  }
+
+  async luckyStats() {
+    const gifts = await this.prisma.gift.findMany({
+      where: { luckyEnabled: true },
+      select: { id: true, name: true, code: true, icon: true, coinPrice: true, luckyEnabled: true, luckyType: true },
+      orderBy: { coinPrice: 'asc' },
+    });
+    if (!gifts.length) return [];
+    const rows = await this.prisma.giftTransaction.groupBy({
+      by: ['giftId'],
+      where: { giftId: { in: gifts.map(g => g.id) } },
+      _count: { _all: true },
+      _sum: { coinAmount: true, luckyRewardCoins: true },
+    });
+    const byId = new Map(gifts.map(g => [g.id, g]));
+    const stats = new Map(rows.map(r => [r.giftId, r]));
+    return gifts.map(g => {
+      const r = stats.get(g.id);
+      return { giftId: g.id, gift: g, sends: r?._count._all ?? 0, coinsSpent: r?._sum.coinAmount ?? 0, bonusPaid: r?._sum.luckyRewardCoins ?? 0 };
+    });
   }
 
   // A price change only affects gifts sent from then on: every sent gift keeps the

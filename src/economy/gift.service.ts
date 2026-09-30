@@ -15,6 +15,7 @@ import { RoomCommunityService } from '../rooms/room-community.service';
 import { SeasonsService } from '../seasons/seasons.service';
 import { createMoment } from '../experience/experience.moments';
 import { applyRoomPkScore } from './room-pk-score';
+import { drawLuckyReward, luckyGameType } from './lucky-gift';
 
 // Pure and exported for the same reason as games/settlement.service.ts's
 // isWinningSelection: this is money math, so it gets a direct unit test
@@ -170,7 +171,7 @@ export class GiftService {
     return this.prisma.gift.findMany({
       where: { active: true },
       orderBy: { coinPrice: 'asc' },
-      select: { id: true, code: true, name: true, coinPrice: true, category: true, icon: true },
+      select: { id: true, code: true, name: true, coinPrice: true, category: true, icon: true, luckyEnabled: true, luckyType: true },
     });
   }
 
@@ -192,6 +193,9 @@ export class GiftService {
 
     const split = await this.revenueSplit.resolve(sender.countryCode);
     const coinAmount = gift.coinPrice;
+    const lucky = gift.luckyEnabled && gift.luckyRewards ? drawLuckyReward(gift.luckyRewards) : null;
+    const luckyCoins = lucky?.coins ?? 0;
+    const luckyType = lucky ? luckyGameType(gift.luckyType) : null;
 
     // Which PK (if any) this gift counts towards, decided here from the
     // recipient — never trusted from the client.
@@ -276,6 +280,23 @@ export class GiftService {
         );
       }
 
+      // Lucky Gifts return bonus coins to the SENDER. The reward is selected
+      // server-side and credited in the same transaction as the gift debit,
+      // so a retry can never create a second bonus.
+      if (luckyCoins > 0) {
+        await this.wallet.credit(
+          {
+            userId: params.senderId,
+            walletType: WalletType.COIN,
+            amount: BigInt(luckyCoins),
+            ledgerType: LedgerEntryType.BONUS,
+            reference: params.idempotencyKey,
+            idempotencyKey: `gift_lucky_bonus:${params.idempotencyKey}`,
+          },
+          tx,
+        );
+      }
+
       // Party seats display the gift value received during the current seat
       // session. The RoomSeat row is deleted when the guest leaves, so the
       // next visit starts from zero while the room-wide gift total remains
@@ -304,6 +325,9 @@ export class GiftService {
           agencyCommissionBps: membership?.commissionBps ?? 0,
           agencyId: agency?.id ?? null,
           agencyOwnerId: agency?.ownerId ?? null,
+          luckyRewardCoins: luckyCoins,
+          luckyRewardLabel: lucky?.label ?? null,
+          luckyType,
           idempotencyKey: params.idempotencyKey,
         },
       });

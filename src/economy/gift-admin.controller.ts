@@ -18,6 +18,9 @@ interface AuthedRequest extends Request {
 export class GiftAdminController {
   constructor(private readonly admin: GiftAdminService) {}
 
+  @Get('lucky/stats')
+  luckyStats() { return this.admin.luckyStats(); }
+
   @Get()
   list() {
     return this.admin.list();

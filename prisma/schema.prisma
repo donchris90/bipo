@@ -789,8 +789,11 @@ model Gift {
   category  String?
   // What the app draws for this gift (an emoji). Editable in the admin.
   icon      String?
-  active    Boolean  @default(true)
-  createdAt DateTime @default(now())
+  active       Boolean  @default(true)
+  luckyEnabled Boolean  @default(false)
+  luckyType    String?
+  luckyRewards Json?
+  createdAt    DateTime @default(now())
 }
 
 model Chargeback {

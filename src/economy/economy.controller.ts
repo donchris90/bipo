@@ -221,6 +221,9 @@ export class GiftController {
         giftName: gift?.name ?? null,
         giftIcon: gift?.icon ?? null,
         coinAmount: transaction.coinAmount,
+        luckyRewardCoins: (transaction as any).luckyRewardCoins ?? 0,
+        luckyRewardLabel: (transaction as any).luckyRewardLabel ?? null,
+        luckyType: (transaction as any).luckyType ?? null,
       });
     }
 
