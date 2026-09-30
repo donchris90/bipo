@@ -85,4 +85,27 @@ describe('lucky gifts', () => {
       }
     });
   });
+  describe('payout-lowering migration', () => {
+    const dir = join(__dirname, '../../prisma/migrations/20261008090000_lucky_gift_lower_payout');
+    const sql = readFileSync(join(dir, 'migration.sql'), 'utf8');
+    const rows = [...sql.matchAll(/\('(RRYDA_[A-Z_]+)', '(\[.*?\])'\)/g)];
+    it('covers all six bundled gifts', () => {
+      expect(rows.length).toBe(6);
+    });
+    it('keeps every gift valid and at about 36% payout with a 10x jackpot', () => {
+      const prices: Record<string, number> = { RRYDA_LUCKY_CLOVER: 10, RRYDA_MYSTERY_BOX: 50, RRYDA_DIAMOND_CHEST: 100, RRYDA_GOLDEN_CHEST: 500, RRYDA_FORTUNE: 1000, RRYDA_JACKPOT: 5000 };
+      for (const [, code, json] of rows) {
+        const price = prices[code];
+        const tiers = validateLuckyRewards(JSON.parse(json), price);
+        expect(luckyPayoutRate(tiers, price)).toBeCloseTo(0.36, 3);
+        expect(Math.max(...tiers.map(t => t.coins))).toBe(price * 10);
+        expect(tiers.filter(t => t.coins === 0)[0].probability).toBe(64);
+      }
+    });
+    it('runs after the earlier lucky migrations', () => {
+      const dirs = require('node:fs').readdirSync(join(__dirname, '../../prisma/migrations')) as string[];
+      const mine = '20261008090000_lucky_gift_lower_payout';
+      for (const d of dirs.filter(d => d.includes('lucky'))) if (d !== mine) expect(d < mine).toBe(true);
+    });
+  });
 });
