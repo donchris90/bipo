@@ -150,7 +150,7 @@ async function main() {
       code: 'AYO',
       name: 'Ayo',
       status: 'DISABLED',
-      rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 30, prizePercent: 95, captureMode: 'FOUR' },
+      rulesJson: { minEntry: 100, maxEntry: 500000, turnSeconds: 30, prizePercent: 95, captureMode: 'TWO_THREE' },
     },
   });
 

@@ -24,6 +24,13 @@ export type AyoState = {
 
 const INITIAL = 4;
 const PITS = 12;
+const TOTAL_SEEDS = 48;
+const WIN_SEEDS = 25;
+/**
+ * A game that is still going after this many turns is ended: each player keeps the seeds on
+ * their own side. Late-game positions with a handful of seeds can otherwise circle forever.
+ */
+export const AYO_MAX_TURNS = 300;
 
 export function initialAyoBoard(): number[] {
   return Array(PITS).fill(INITIAL);
@@ -43,83 +50,80 @@ export function legalPits(board: number[], seat: 0 | 1): number[] {
     .filter((i) => i >= 0);
 }
 
-function hasSeedsOnSide(board: number[], seat: 0 | 1): boolean {
-  return legalPits(board, seat).length > 0;
+function seedsOnSide(board: number[], seat: 0 | 1): number {
+  let n = 0;
+  for (let i = 0; i < PITS; i++) if (sideOfPit(i) === seat) n += board[i];
+  return n;
 }
 
-function wouldFeedOpponent(board: number[], seat: 0 | 1, pit: number): boolean {
-  const next = simulateSow(board, seat, pit, 'FOUR', false);
-  return hasSeedsOnSide(next.board, seat === 0 ? 1 : 0);
+function wouldFeedOpponent(board: number[], seat: 0 | 1, pit: number, captureMode: AyoCaptureMode): boolean {
+  const next = simulateSow(board, seat, pit, captureMode, false);
+  return seedsOnSide(next.board, seat === 0 ? 1 : 0) > 0;
+}
+
+function isCapturable(seeds: number, captureMode: AyoCaptureMode) {
+  return captureMode === 'FOUR' ? seeds === 4 : seeds === 2 || seeds === 3;
 }
 
 /**
- * Lagos Ayo/Ayò Ọlọ́pón default used by Rryda:
- * 12 pits, four seeds each, counter-clockwise relay sowing.
- * A house that reaches four is captured; relay continues when the last
- * seed lands in an occupied house. Feeding is mandatory when the opponent
- * has no seeds. A match is won when a player captures 25+ seeds or the
- * board can no longer be legally continued.
- *
- * The engine also exposes TWO_THREE for variants that use the Oware-style
- * two/three capture rule.
+ * Ayò Ọlọ́pón, as played in Yorubaland (the same family as Oware abápa):
+ *  - 12 pits, 4 seeds each; a player owns the six pits on their side.
+ *  - Pick up every seed in one of your pits and sow one per pit, counter-clockwise, in a SINGLE
+ *    lap. There is no relay sowing: the move always ends when the hand is empty. (The previous
+ *    engine relayed from any occupied pit and never terminated, which froze the whole server.)
+ *  - With 12+ seeds the starting pit is skipped on the way round.
+ *  - Capture: if the last seed lands on the OPPONENT's side and makes that pit 2 or 3, those
+ *    seeds are captured, and so are the pits just before it on the opponent's side while they
+ *    also hold 2 or 3. (captureMode 'FOUR' is a house variant: the same, but on exactly 4.)
+ *  - A move that would capture every seed the opponent has captures nothing (no "grand slam").
+ *  - If the opponent has no seeds you must feed them when you can.
+ *  - First to 25 wins.
  */
 export function simulateSow(
   input: number[],
   seat: 0 | 1,
   pit: number,
-  captureMode: AyoCaptureMode = 'FOUR',
+  captureMode: AyoCaptureMode = 'TWO_THREE',
   enforceFeeding = true,
 ): { board: number[]; captured: number; path: number[] } {
   const board = input.slice();
   if (board.length !== PITS) throw new Error('Ayo board must have 12 pits');
+  if (!Number.isInteger(pit) || pit < 0 || pit >= PITS) throw new Error('Choose a pit on your side');
   if (!pitOwnedBySeat(pit, seat) || board[pit] <= 0) throw new Error('Choose a non-empty pit on your side');
 
-  const opponent = seat === 0 ? 1 : 0;
-  if (enforceFeeding && !hasSeedsOnSide(board, opponent)) {
-    const moves = legalPits(board, seat).filter((p) => wouldFeedOpponent(board, seat, p));
-    if (moves.length > 0 && !wouldFeedOpponent(board, seat, pit)) {
-      throw new Error('You must feed your opponent');
-    }
+  const opponent: 0 | 1 = seat === 0 ? 1 : 0;
+  if (enforceFeeding && seedsOnSide(board, opponent) === 0) {
+    const feeding = legalPits(board, seat).filter((p) => wouldFeedOpponent(board, seat, p, captureMode));
+    if (feeding.length > 0 && !feeding.includes(pit)) throw new Error('You must give your opponent seeds');
   }
 
+  let hand = board[pit];
+  board[pit] = 0;
   let current = pit;
-  let hand = board[current];
-  board[current] = 0;
   const path: number[] = [];
-  let captured = 0;
-
+  // Single lap. Bounded by the number of seeds in hand (plus at most a few skipped origin pits).
   while (hand > 0) {
-    let next = (current + 1) % PITS; // counter-clockwise around the indexed board
-    current = next;
+    current = (current + 1) % PITS;
+    if (current === pit) continue; // 12+ seeds: skip the pit the seeds came from
     board[current] += 1;
     hand -= 1;
     path.push(current);
-
-    if (captureMode === 'FOUR') {
-      // In the Lagos four-seed variant, completing a house to four wins that house.
-      if (board[current] === 4) {
-        board[current] = 0;
-        captured += 4;
-      }
-    }
-
-    // Relay sowing: if the final seed landed in an occupied house, pick it up
-    // and continue. A newly captured empty house ends the sow.
-    if (hand === 0 && board[current] > 0) {
-      hand = board[current];
-      board[current] = 0;
-      continue;
-    }
   }
 
-  if (captureMode === 'TWO_THREE') {
-    // Oware-style capture is applied only to the opponent's side, walking
-    // backwards from the final pit.
+  let captured = 0;
+  if (sideOfPit(current) === opponent && isCapturable(board[current], captureMode)) {
+    const after = board.slice();
+    let take = 0;
     let p = current;
-    while (sideOfPit(p) === opponent && (board[p] === 2 || board[p] === 3)) {
-      captured += board[p];
-      board[p] = 0;
+    while (sideOfPit(p) === opponent && isCapturable(after[p], captureMode)) {
+      take += after[p];
+      after[p] = 0;
       p = (p - 1 + PITS) % PITS;
+    }
+    // No grand slam: wiping out the opponent's whole side captures nothing.
+    if (seedsOnSide(after, opponent) > 0) {
+      for (let i = 0; i < PITS; i++) board[i] = after[i];
+      captured = take;
     }
   }
 
@@ -127,9 +131,9 @@ export function simulateSow(
 }
 
 export function makeMove(
-  state: Pick<AyoState, 'board' | 'captured' | 'currentSeat'>,
+  state: Pick<AyoState, 'board' | 'captured' | 'currentSeat'> & { turnNumber?: number },
   pit: number,
-  captureMode: AyoCaptureMode = 'FOUR',
+  captureMode: AyoCaptureMode = 'TWO_THREE',
 ) {
   const seat = state.currentSeat;
   const legal = legalPits(state.board, seat);
@@ -138,37 +142,43 @@ export function makeMove(
   const captured: [number, number] = [...state.captured] as [number, number];
   captured[seat] += result.captured;
 
-  const nextSeat = seat === 0 ? 1 : 0;
-  const opponentHasMove = legalPits(result.board, nextSeat).length > 0;
-  const currentHasMove = legalPits(result.board, seat).length > 0;
+  const nextSeat: 0 | 1 = seat === 0 ? 1 : 0;
+  let finished = false;
+  let winnerSeat: 0 | 1 | null = null;
 
-  let finished = captured[seat] >= 25;
-  let winnerSeat: 0 | 1 | null = finished ? seat : null;
-
-  if (!finished && !opponentHasMove) {
-    // If the opponent has no seeds, the current player must feed them where
-    // possible. If no legal feed exists, the remaining seeds are awarded and
-    // the match ends.
-    const feedMoves = legalPits(result.board, seat).filter((p) => wouldFeedOpponent(result.board, seat, p));
-    if (feedMoves.length === 0) {
-      let remaining = 0;
-      for (const n of result.board) remaining += n;
-      captured[seat] += remaining;
-      const other = captured[nextSeat];
-      winnerSeat = captured[seat] === other ? null : (captured[seat] > other ? seat : nextSeat);
-      finished = true;
-    }
-  }
-
-  if (!finished && !currentHasMove && !opponentHasMove) {
-    const remaining = result.board.reduce((a, b) => a + b, 0);
-    captured[0] += Math.floor(remaining / 2);
-    captured[1] += remaining - Math.floor(remaining / 2);
+  const settleBySides = () => {
+    // Each player keeps what is on their own side, then compare totals.
+    captured[0] += seedsOnSide(result.board, 0);
+    captured[1] += seedsOnSide(result.board, 1);
+    for (let i = 0; i < PITS; i++) result.board[i] = 0;
     winnerSeat = captured[0] === captured[1] ? null : (captured[0] > captured[1] ? 0 : 1);
     finished = true;
+  };
+
+  if (captured[seat] >= WIN_SEEDS) {
+    finished = true;
+    winnerSeat = seat;
+  } else if (captured[nextSeat] >= WIN_SEEDS) {
+    finished = true;
+    winnerSeat = nextSeat;
+  } else if (seedsOnSide(result.board, nextSeat) === 0) {
+    // Opponent has nothing to play. If we can never feed them, the game ends and the remaining
+    // seeds go to the player who still has them.
+    const canFeed = legalPits(result.board, seat).some((p) => wouldFeedOpponent(result.board, seat, p, captureMode));
+    if (!canFeed) settleBySides();
+  } else if ((state.turnNumber ?? 0) + 1 >= AYO_MAX_TURNS) {
+    settleBySides();
+  } else if (captured[0] === TOTAL_SEEDS / 2 && captured[1] === TOTAL_SEEDS / 2) {
+    finished = true;
+    winnerSeat = null;
   }
 
-  return { ...result, captured, nextSeat, finished, winnerSeat };
+  // If the game isn't finished but the next player has no move (can only happen when they were
+  // just emptied and we CAN feed), play passes back — the service handles that via nextSeat.
+  const opponentHasMove = legalPits(result.board, nextSeat).length > 0;
+  const resolvedNext: 0 | 1 = !finished && !opponentHasMove ? seat : nextSeat;
+
+  return { ...result, captured, nextSeat: resolvedNext, finished, winnerSeat };
 }
 
 export function createInitialAyoState(params: {

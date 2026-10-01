@@ -78,7 +78,7 @@ export class AyoService implements OnModuleDestroy {
         code: 'AYO', name: 'Ayo', status: 'DISABLED', version: 1,
         rulesJson: {
           minEntry: 100, maxEntry: 500000, turnSeconds: 30,
-          prizePercent: 95, captureMode: 'FOUR',
+          prizePercent: 95, captureMode: 'TWO_THREE',
         },
       },
     });
@@ -444,7 +444,7 @@ export class AyoService implements OnModuleDestroy {
     const beforeCaptured = state.captured[state.currentSeat];
     let result;
     try {
-      result = makeMove(state, Number(pit), (rules.captureMode ?? 'FOUR') as AyoCaptureMode);
+      result = makeMove(state, Number(pit), (rules.captureMode === 'FOUR' ? 'FOUR' : 'TWO_THREE') as AyoCaptureMode);
     } catch (e: any) {
       throw new BadRequestException(e?.message ?? 'Invalid Ayo move');
     }
@@ -624,11 +624,17 @@ export class AyoService implements OnModuleDestroy {
         if (current?.userId.startsWith('bot:')) {
           const game = await this.ensureDefinition();
           const rules = (game.rulesJson ?? {}) as any;
-          const moves = legalPits(fresh.board, fresh.currentSeat);
-          if (!moves.length) { await this.advanceExpired(fresh); return; }
-          const pit = moves[randomInt(moves.length)];
+          const mode = (rules.captureMode === 'FOUR' ? 'FOUR' : 'TWO_THREE') as AyoCaptureMode;
+          // Only consider moves the rules accept (e.g. mandatory feeding); prefer captures a bit.
+          const options = legalPits(fresh.board, fresh.currentSeat).flatMap(p => {
+            try { return [{ pit: p, gain: makeMove(fresh, p, mode).captured[fresh.currentSeat] - fresh.captured[fresh.currentSeat] }]; } catch { return []; }
+          });
+          if (!options.length) { await this.advanceExpired(fresh); return; }
+          const best = Math.max(...options.map(o => o.gain));
+          const pool = best > 0 && randomInt(100) < 70 ? options.filter(o => o.gain === best) : options;
+          const pit = pool[randomInt(pool.length)].pit;
           try {
-            const result = makeMove(fresh, pit, (rules.captureMode ?? 'FOUR') as AyoCaptureMode);
+            const result = makeMove(fresh, pit, (rules.captureMode === 'FOUR' ? 'FOUR' : 'TWO_THREE') as AyoCaptureMode);
             const before = fresh.captured[fresh.currentSeat];
             fresh.board = result.board;
             fresh.captured = result.captured;
