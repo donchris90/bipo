@@ -13,7 +13,7 @@ const SHAPES = {
   crash: ['houseEdge', 'growthRate', ...SHARED],
   lucky: ['payoutMultiplier', ...SHARED],
   ludo: ['minEntry', 'maxEntry', 'turnSeconds', 'reconnectSeconds', 'prizeFirstPercent', 'prizeSecondPercent', 'prizeFirstPercent2p', 'botFillSeconds', 'botMatchPaid', 'botPrizePercent'],
-  ayo: ['minEntry', 'maxEntry', 'turnSeconds', 'prizePercent', 'captureMode'],
+  ayo: ['minEntry', 'maxEntry', 'turnSeconds', 'prizePercent', 'captureMode', 'maxRounds'],
 } as const;
 
 type Shape = keyof typeof SHAPES;
@@ -123,10 +123,14 @@ export function validateGameRules(existing: any, incoming: any): GameRules {
     for (const [key, min, max] of ints) if (!isInt(incoming[key], min, max)) errors.push(`${key} must be a whole number from ${min} to ${max}`);
     if (isInt(incoming.minEntry, 1, 1_000_000_000) && isInt(incoming.maxEntry, 1, 1_000_000_000) && incoming.maxEntry < incoming.minEntry) errors.push('maxEntry cannot be below minEntry');
     if (!isNum(incoming.prizePercent) || incoming.prizePercent < 50 || incoming.prizePercent > 100) errors.push('prizePercent must be from 50 to 100');
-    if (incoming.captureMode !== 'FOUR' && incoming.captureMode !== 'TWO_THREE') errors.push('captureMode must be FOUR or TWO_THREE');
+    // captureMode is legacy: the house rules always pack 4s. Accepted if sent, never required.
+    if (incoming.captureMode !== undefined && incoming.captureMode !== 'FOUR' && incoming.captureMode !== 'TWO_THREE') errors.push('captureMode must be FOUR or TWO_THREE');
+    if (incoming.maxRounds !== undefined && !isInt(incoming.maxRounds, 1, 30)) errors.push('maxRounds must be a whole number from 1 to 30');
     if (!errors.length) {
       out.minEntry = incoming.minEntry; out.maxEntry = incoming.maxEntry; out.turnSeconds = incoming.turnSeconds;
-      out.prizePercent = incoming.prizePercent; (out as any).captureMode = incoming.captureMode;
+      out.prizePercent = incoming.prizePercent;
+      if (incoming.captureMode !== undefined) (out as any).captureMode = incoming.captureMode;
+      (out as any).maxRounds = incoming.maxRounds ?? 30;
     }
   } else if (shape === 'ludo') {
     const ints: Array<[string, number, number]> = [['minEntry', 1, 1_000_000_000], ['maxEntry', 1, 1_000_000_000], ['turnSeconds', 5, 120], ['reconnectSeconds', 10, 900]];

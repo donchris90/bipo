@@ -220,7 +220,9 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   }
 
   broadcastAyo(matchId: string, payload: unknown) {
-    this.server.to(`AYO:${matchId}`).emit('ayo:state', payload);
+    // Players and spectators join `AYO:<id>` on the /ayo namespace (AyoGateway), not on this
+    // default namespace — emitting here reached nobody, so opponents never saw each other's moves.
+    this.server.of('/ayo').to(`AYO:${matchId}`).emit('ayo:state', payload);
   }
 
   // Called by GiftService's controller layer to broadcast a gift event —

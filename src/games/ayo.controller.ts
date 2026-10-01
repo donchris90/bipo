@@ -69,6 +69,11 @@ export class AyoController {
     return this.ayo.move(req.user.userId, matchId, Number(body.pit));
   }
 
+  @Post('matches/:matchId/decide')
+  decide(@Req() req: AuthedRequest, @Param('matchId') matchId: string, @Body() body: { quit: boolean }) {
+    return this.ayo.decide(req.user.userId, matchId, body?.quit === true);
+  }
+
   @Get('matches/:matchId/spectator-bets')
   spectatorBets(@Req() req: AuthedRequest, @Param('matchId') matchId: string) {
     return this.ayo.spectatorBetStatus(req.user.userId, matchId);

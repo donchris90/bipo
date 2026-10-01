@@ -103,4 +103,17 @@ export class AyoGateway implements OnGatewayConnection, OnModuleDestroy {
       return { error: e?.response?.message ?? e?.message ?? 'That move is not allowed.' };
     }
   }
+
+  @SubscribeMessage('ayo:decide')
+  async decide(@MessageBody() data: { quit: boolean; matchId?: string }, @ConnectedSocket() client: AyoSocket) {
+    if (!client.data.userId) return { error: 'unauthenticated' };
+    const matchId = client.data.matchId ?? data?.matchId;
+    if (!matchId || client.data.spectator) return { error: 'Not joined to this match' };
+    try {
+      const state = await this.ayo.decide(client.data.userId, matchId, !!data?.quit);
+      return { ok: true, state };
+    } catch (e: any) {
+      return { error: e?.response?.message ?? e?.message ?? 'Could not record your choice' };
+    }
+  }
 }

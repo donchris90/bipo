@@ -9,7 +9,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
 import { RoundService } from './round.service';
 import { RealtimeGateway } from '../realtime/realtime.gateway';
-import { AyoCaptureMode, AyoState, createInitialAyoState, legalPits, makeMove } from './ayo.rules';
+import { AyoState, applyAyoDecision, applyAyoMove, chooseBotPit, createInitialAyoState, DECISION_SECONDS, legalPits, MAX_ROUNDS, normalizeAyoState } from './ayo.rules';
 import { calculateSpectatorPoolSplit, calculateWinningSpectatorReward } from './ludo-payout';
 
 type WaitingPlayer = { userId: string; displayName: string; entryFee: number; ticket: string; partyRoomId?: string; matchId?: string; roomCode?: string };
@@ -78,7 +78,7 @@ export class AyoService implements OnModuleDestroy {
         code: 'AYO', name: 'Ayo', status: 'DISABLED', version: 1,
         rulesJson: {
           minEntry: 100, maxEntry: 500000, turnSeconds: 30,
-          prizePercent: 95, captureMode: 'TWO_THREE',
+          prizePercent: 95, captureMode: 'TWO_THREE', maxRounds: MAX_ROUNDS,
         },
       },
     });
@@ -91,8 +91,8 @@ export class AyoService implements OnModuleDestroy {
 
   private async readState(matchId: string): Promise<AyoState | null> {
     const raw = await this.redis.get(`${STATE_PREFIX}${matchId}`).catch(() => null);
-    if (raw) return JSON.parse(raw);
-    return this.localStates.get(matchId) ?? null;
+    const st = raw ? JSON.parse(raw) : this.localStates.get(matchId) ?? null;
+    return st ? normalizeAyoState(st) : null;
   }
 
   private async writeState(state: AyoState) {
@@ -187,6 +187,7 @@ export class AyoService implements OnModuleDestroy {
       players: room.players.map((p, i) => ({ userId: p.userId, displayName: p.displayName, seat: i as 0 | 1 })),
       turnSeconds,
     });
+    state.maxRounds = Math.max(1, Math.min(MAX_ROUNDS, Number(rules.maxRounds) || MAX_ROUNDS));
     state.prizePool = room.entryFee * room.players.length;
     state.prizePayout = Math.floor(state.prizePool * Math.max(0, Math.min(100, Number(rules.prizePercent ?? 95))) / 100);
     await this.writeState(state);
@@ -426,52 +427,70 @@ export class AyoService implements OnModuleDestroy {
     return this.withLock(`match:${matchId}`, () => this.moveLocked(userId, matchId, pit));
   }
 
+  private async prizePercent() {
+    const game = await this.ensureDefinition();
+    return Math.max(0, Math.min(100, Number(((game.rulesJson ?? {}) as any).prizePercent ?? 95)));
+  }
+
+  /**
+   * Saves a state produced by the rules engine and starts the next timer. The next player's clock
+   * only starts after everyone has watched the move's seed-by-seed animation (animMs).
+   */
+  private async commit(next: AyoState, animMs = 0) {
+    const now = Date.now();
+    next.serverNow = now;
+    if (next.status === 'FINISHED') {
+      next.prizePool = next.entryFee * next.players.length;
+      next.prizePayout = next.winnerUserId ? Math.floor(next.prizePool * (await this.prizePercent()) / 100) : next.entryFee;
+      next.decision = null;
+      await this.writeState(next);
+      await this.settle(next);
+      return next;
+    }
+    const startAt = now + animMs;
+    next.turnStartedAt = new Date(startAt).toISOString();
+    if (next.decision) {
+      // One-pit player: 30s to choose quit/continue (counted after the animation). No moves meanwhile.
+      next.decision.expiresAt = new Date(startAt + DECISION_SECONDS * 1000).toISOString();
+      next.turnExpiresAt = next.decision.expiresAt;
+    } else {
+      next.turnExpiresAt = new Date(startAt + next.turnSeconds * 1000).toISOString();
+    }
+    await this.writeState(next);
+    this.broadcast(next);
+    return next;
+  }
+
   private async moveLocked(userId: string, matchId: string, pit: number) {
     const state = await this.readState(matchId);
     if (!state) throw new NotFoundException('Ayo match not found');
     if (state.status !== 'ACTIVE') throw new BadRequestException('Ayo match is not active');
-    const player = state.players[state.currentSeat];
     const seat = state.players.findIndex(p => p.userId === userId);
-    if (seat >= 0 && !state.players[seat].connected) { state.players[seat].connected = true; if (state.disconnectedAt) state.disconnectedAt[seat as 0 | 1] = null; }
-    if (!player || player.userId !== userId) throw new BadRequestException('It is not your turn');
+    if (seat < 0) throw new BadRequestException('You are not a player in this match');
+    if (!state.players[seat].connected) { state.players[seat].connected = true; if (state.disconnectedAt) state.disconnectedAt[seat as 0 | 1] = null; }
+    if (state.decision) throw new BadRequestException('Waiting for a player to choose quit or continue');
+    if (state.players[state.currentSeat]?.userId !== userId) throw new BadRequestException('It is not your turn');
+    if (Date.now() < Date.parse(state.turnStartedAt) - 400) throw new BadRequestException('Wait for the last move to finish');
     if (Date.parse(state.turnExpiresAt) <= Date.now()) {
       await this.advanceExpired(state);
-      throw new BadRequestException('Your turn expired');
+      throw new BadRequestException('Your turn expired — a move was played for you');
     }
-
-    const game = await this.ensureDefinition();
-    const rules = (game.rulesJson ?? {}) as any;
-    const beforeCaptured = state.captured[state.currentSeat];
     let result;
-    try {
-      result = makeMove(state, Number(pit), (rules.captureMode === 'FOUR' ? 'FOUR' : 'TWO_THREE') as AyoCaptureMode);
-    } catch (e: any) {
-      throw new BadRequestException(e?.message ?? 'Invalid Ayo move');
-    }
+    try { result = applyAyoMove(state, Number(pit)); } catch (e: any) { throw new BadRequestException(e?.message ?? 'Invalid Ayo move'); }
+    return this.commit(result.state, result.animMs);
+  }
 
-    const now = Date.now();
-    state.board = result.board;
-    state.captured = result.captured;
-    state.lastMove = { seat: state.currentSeat, pit: Number(pit), captured: result.captured[state.currentSeat] - beforeCaptured, path: result.path };
-    state.turnNumber += 1;
-    if (result.finished) {
-      state.status = 'FINISHED';
-      const gameRules = (rules ?? {}) as any;
-      state.prizePool = state.entryFee * state.players.length;
-      state.winnerUserId = result.winnerSeat === null ? undefined : state.players[result.winnerSeat!].userId;
-      state.prizePayout = state.winnerUserId ? Math.floor(state.prizePool * Math.max(0, Math.min(100, Number(gameRules.prizePercent ?? 95))) / 100) : state.entryFee;
-      state.serverNow = now;
-      await this.writeState(state);
-      await this.settle(state);
-      return state;
-    }
-    state.currentSeat = result.nextSeat as 0 | 1;
-    state.turnStartedAt = new Date(now).toISOString();
-    state.turnExpiresAt = new Date(now + state.turnSeconds * 1000).toISOString();
-    state.serverNow = now;
-    await this.writeState(state);
-    this.broadcast(state);
-    return state;
+  /** One-pit player chooses to quit (loses) or continue. */
+  async decide(userId: string, matchId: string, quit: boolean) {
+    return this.withLock(`match:${matchId}`, async () => {
+      const state = await this.readState(matchId);
+      if (!state) throw new NotFoundException('Ayo match not found');
+      const seat = state.players.findIndex(p => p.userId === userId);
+      if (seat < 0) throw new BadRequestException('You are not a player in this match');
+      let next;
+      try { next = applyAyoDecision(state, seat as 0 | 1, !!quit); } catch (e: any) { throw new BadRequestException(e?.message ?? 'Nothing to decide'); }
+      return this.commit(next, 0);
+    });
   }
 
   async forfeitDisconnected(state: AyoState) {
@@ -482,30 +501,26 @@ export class AyoService implements OnModuleDestroy {
     if (expiredSeat < 0) return state;
     const winnerSeat = expiredSeat === 0 ? 1 : 0;
     state.status = 'FINISHED';
+    state.endReason = 'DISCONNECT';
     state.winnerUserId = state.players[winnerSeat].userId;
-    const game = await this.ensureDefinition();
-    const rules = (game.rulesJson ?? {}) as any;
-    state.prizePool = state.entryFee * state.players.length;
-    state.prizePayout = Math.floor(state.prizePool * Math.max(0, Math.min(100, Number(rules.prizePercent ?? 95))) / 100);
-    state.serverNow = now;
-    await this.writeState(state);
-    await this.settle(state);
-    return state;
+    return this.commit(state, 0);
   }
 
+  /**
+   * Time ran out. Decision pending -> the player continues. Otherwise a move is played for the
+   * player whose turn it is, so the game never stalls (agreed rule).
+   */
   async advanceExpired(state: AyoState) {
     if (state.status !== 'ACTIVE' || Date.parse(state.turnExpiresAt) > Date.now()) return state;
-    // Ayo should never stall because a player disappeared. For a timed game,
-    // an expired turn simply passes to the opponent; no seeds are moved.
-    state.currentSeat = state.currentSeat === 0 ? 1 : 0;
-    const now = Date.now();
-    state.turnNumber += 1;
-    state.turnStartedAt = new Date(now).toISOString();
-    state.turnExpiresAt = new Date(now + state.turnSeconds * 1000).toISOString();
-    state.serverNow = now;
-    await this.writeState(state);
-    this.broadcast(state);
-    return state;
+    if (state.decision) return this.commit(applyAyoDecision(state, state.decision.seat, false), 0);
+    const pit = chooseBotPit(state, n => randomInt(n));
+    if (pit === null) {
+      // Defensive: nothing to play (shouldn't happen — the engine skips empty players).
+      state.currentSeat = state.currentSeat === 0 ? 1 : 0;
+      return this.commit(state, 0);
+    }
+    const r = applyAyoMove(state, pit);
+    return this.commit(r.state, r.animMs);
   }
 
   private async settle(state: AyoState) {
@@ -620,43 +635,19 @@ export class AyoService implements OnModuleDestroy {
       await this.withLock(`match:${state.matchId}`, async () => {
         const fresh = await this.readState(state.matchId);
         if (!fresh || fresh.status !== 'ACTIVE') return;
+        const now = Date.now();
+        if (now < Date.parse(fresh.turnStartedAt)) return; // everyone is still watching the last move
         const current = fresh.players[fresh.currentSeat];
-        if (current?.userId.startsWith('bot:')) {
-          const game = await this.ensureDefinition();
-          const rules = (game.rulesJson ?? {}) as any;
-          const mode = (rules.captureMode === 'FOUR' ? 'FOUR' : 'TWO_THREE') as AyoCaptureMode;
-          // Only consider moves the rules accept (e.g. mandatory feeding); prefer captures a bit.
-          const options = legalPits(fresh.board, fresh.currentSeat).flatMap(p => {
-            try { return [{ pit: p, gain: makeMove(fresh, p, mode).captured[fresh.currentSeat] - fresh.captured[fresh.currentSeat] }]; } catch { return []; }
-          });
-          if (!options.length) { await this.advanceExpired(fresh); return; }
-          const best = Math.max(...options.map(o => o.gain));
-          const pool = best > 0 && randomInt(100) < 70 ? options.filter(o => o.gain === best) : options;
-          const pit = pool[randomInt(pool.length)].pit;
-          try {
-            const result = makeMove(fresh, pit, (rules.captureMode === 'FOUR' ? 'FOUR' : 'TWO_THREE') as AyoCaptureMode);
-            const before = fresh.captured[fresh.currentSeat];
-            fresh.board = result.board;
-            fresh.captured = result.captured;
-            fresh.lastMove = { seat: fresh.currentSeat, pit, captured: result.captured[fresh.currentSeat] - before, path: result.path };
-            fresh.turnNumber += 1;
-            if (result.finished) {
-              fresh.status = 'FINISHED';
-              fresh.winnerUserId = result.winnerSeat === null ? undefined : fresh.players[result.winnerSeat!].userId;
-              fresh.prizePayout = fresh.winnerUserId && !fresh.winnerUserId.startsWith('bot:') ? Math.floor(fresh.prizePool * Number(rules.prizePercent ?? 95) / 100) : 0;
-              fresh.serverNow = Date.now();
-              await this.writeState(fresh);
-              await this.settle(fresh);
-            } else {
-              fresh.currentSeat = result.nextSeat as 0 | 1;
-              const now2 = Date.now();
-              fresh.turnStartedAt = new Date(now2).toISOString();
-              fresh.turnExpiresAt = new Date(now2 + fresh.turnSeconds * 1000).toISOString();
-              fresh.serverNow = now2;
-              await this.writeState(fresh);
-              this.broadcast(fresh);
-            }
-          } catch { await this.advanceExpired(fresh); }
+        // Bot: decides instantly (always continues), moves after a short, human-looking pause.
+        if (fresh.decision && fresh.players[fresh.decision.seat]?.userId.startsWith('bot:')) {
+          await this.commit(applyAyoDecision(fresh, fresh.decision.seat, false), 0);
+          return;
+        }
+        if (!fresh.decision && current?.userId.startsWith('bot:') && now - Date.parse(fresh.turnStartedAt) >= 900 + randomInt(900)) {
+          const pit = chooseBotPit(fresh, n => randomInt(n));
+          if (pit === null) { await this.advanceExpired(fresh); return; }
+          const r = applyAyoMove(fresh, pit);
+          await this.commit(r.state, r.animMs);
           return;
         }
         if (Date.parse(fresh.turnExpiresAt) <= Date.now()) await this.advanceExpired(fresh);
