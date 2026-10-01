@@ -78,7 +78,7 @@ export class LiveController {
   @Post(':id/media')
   @UseGuards(UserThrottlerGuard)
   @Throttle({ default: { limit: 60, ttl: 60_000 } })
-  controlMedia(@Param('id') id: string, @Body() body: { action?: unknown; videoId?: unknown; positionMs?: unknown }, @Req() req: AuthedRequest) {
+  controlMedia(@Param('id') id: string, @Body() body: { action?: unknown; videoId?: unknown; youtubeUrl?: unknown; positionMs?: unknown }, @Req() req: AuthedRequest) {
     return this.media.act(id, req.user.userId, body ?? {});
   }
 

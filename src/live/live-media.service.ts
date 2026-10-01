@@ -6,8 +6,36 @@ export type MediaAction = 'load' | 'play' | 'pause' | 'seek' | 'sync' | 'stop';
 export const MEDIA_ACTIONS: MediaAction[] = ['load', 'play', 'pause', 'seek', 'sync', 'stop'];
 const MAX_POSITION_MS = 24 * 60 * 60 * 1000;
 
+// Pulls the 11-character video id out of the usual YouTube link shapes (watch, youtu.be, shorts,
+// embed, live) or a bare id. Anything else is rejected, so only real YouTube videos ever load.
+export function parseYouTubeId(input: unknown): string | null {
+  if (typeof input !== 'string') return null;
+  const text = input.trim();
+  if (/^[A-Za-z0-9_-]{11}$/.test(text)) return text;
+  let url: URL;
+  try {
+    url = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/^(www\.|m\.|music\.)/, '');
+  let id: string | null = null;
+  if (host === 'youtu.be') id = url.pathname.split('/')[1] ?? null;
+  else if (host === 'youtube.com' || host === 'youtube-nocookie.com') {
+    if (url.pathname === '/watch') id = url.searchParams.get('v');
+    else {
+      const m = url.pathname.match(/^\/(?:shorts|embed|live|v)\/([^/?]+)/);
+      id = m ? m[1] : null;
+    }
+  }
+  return id && /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
+}
+
 interface State {
   sessionId: string;
+  // 'upload' = one of the host's published videos (url); 'youtube' = a YouTube video (youtubeId).
+  kind: 'upload' | 'youtube';
+  youtubeId?: string;
   videoId: string;
   title: string;
   url: string;
@@ -58,21 +86,25 @@ export class LiveMediaService {
   async act(
     sessionId: string,
     hostId: string,
-    input: { action?: unknown; videoId?: unknown; positionMs?: unknown },
+    input: { action?: unknown; videoId?: unknown; youtubeUrl?: unknown; positionMs?: unknown },
     now = Date.now(),
   ): Promise<MediaPayload | MediaStopped> {
     const action = input.action as MediaAction;
     if (!MEDIA_ACTIONS.includes(action)) throw new BadRequestException(`action must be one of: ${MEDIA_ACTIONS.join(', ')}`);
 
-    const session = await this.prisma.liveSession.findUnique({ where: { id: sessionId }, select: { hostId: true, status: true } });
+    // The id is either a solo live session or a party room: the same video feature serves both.
+    const live = await this.prisma.liveSession.findUnique({ where: { id: sessionId }, select: { hostId: true, status: true } });
+    const partyRoom = live ? null : await (this.prisma as any).partyRoom?.findUnique({ where: { id: sessionId }, select: { hostId: true, status: true } });
+    const session = live ?? partyRoom;
     if (!session) throw new NotFoundException('Live session not found');
     if (session.hostId !== hostId) throw new ForbiddenException('Only the host can control the video');
-    if (session.status !== 'LIVE') throw new BadRequestException('This live has ended');
+    const isRoom = !live;
+    if (isRoom ? session.status !== 'OPEN' : session.status !== 'LIVE') throw new BadRequestException(isRoom ? 'This room has closed' : 'This live has ended');
 
     if (action === 'stop') {
       this.states.delete(sessionId);
       const stopped: MediaStopped = { sessionId, active: false, serverNow: now };
-      this.realtime.broadcastLiveMedia(sessionId, stopped);
+      this.broadcast(sessionId, stopped, isRoom);
       return stopped;
     }
 
@@ -83,14 +115,22 @@ export class LiveMediaService {
       position = Math.floor(p);
     }
 
+    if (action === 'load' && input.youtubeUrl !== undefined) {
+      const youtubeId = parseYouTubeId(input.youtubeUrl);
+      if (!youtubeId) throw new BadRequestException('That is not a YouTube link');
+      const state: State = { sessionId, kind: 'youtube', youtubeId, videoId: `yt:${youtubeId}`, title: 'YouTube', url: '', status: 'PLAYING', positionMs: 0, updatedAt: now };
+      this.states.set(sessionId, state);
+      return this.publish(state, now, isRoom);
+    }
+
     if (action === 'load') {
       if (typeof input.videoId !== 'string' || !input.videoId) throw new BadRequestException('videoId is required');
       const video = await this.prisma.video.findUnique({ where: { id: input.videoId }, select: { id: true, creatorId: true, title: true, videoUrl: true, status: true } });
       // Only your own published videos: the address has to work for everyone watching.
       if (!video || video.creatorId !== hostId || video.status !== 'PUBLISHED') throw new BadRequestException('Choose one of your published videos');
-      const state: State = { sessionId, videoId: video.id, title: video.title, url: video.videoUrl, status: 'PLAYING', positionMs: 0, updatedAt: now };
+      const state: State = { sessionId, kind: 'upload', videoId: video.id, title: video.title, url: video.videoUrl, status: 'PLAYING', positionMs: 0, updatedAt: now };
       this.states.set(sessionId, state);
-      return this.publish(state, now);
+      return this.publish(state, now, isRoom);
     }
 
     const current = this.states.get(sessionId);
@@ -103,12 +143,18 @@ export class LiveMediaService {
     else if (action === 'sync' && current.status !== 'PLAYING') return this.payload(current, now); // nothing to correct while paused
     // 'seek' and 'sync' keep the current status and just move the position
     this.states.set(sessionId, next);
-    return this.publish(next, now);
+    return this.publish(next, now, isRoom);
   }
 
-  private publish(state: State, now: number): MediaPayload {
+  private broadcast(id: string, payload: unknown, isRoom: boolean) {
+    this.realtime.broadcastLiveMedia(id, payload);
+    // Party-room members listen on the room channel, not the live-session one.
+    if (isRoom) (this.realtime as any).broadcastRoomMedia?.(id, payload);
+  }
+
+  private publish(state: State, now: number, isRoom = false): MediaPayload {
     const payload = this.payload(state, now);
-    this.realtime.broadcastLiveMedia(state.sessionId, payload);
+    this.broadcast(state.sessionId, payload, isRoom);
     return payload;
   }
 

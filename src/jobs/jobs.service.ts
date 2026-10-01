@@ -36,6 +36,25 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
     @Inject(C2C_QUEUE) private readonly c2cQueue: Queue,
   ) {}
 
+  // The round scheduler (database) and the job queue (Redis) both advance rounds.
+  // When the scheduler gets there first, the queued job finds the round already
+  // opened/locked/settled. That is not a failure, so finish the job quietly instead of
+  // logging an error and retrying it four times.
+  private skipStaleRoundJob<J extends { name?: string; id?: string }>(fn: (job: J) => Promise<unknown>) {
+    return async (job: J) => {
+      try {
+        return await fn(job);
+      } catch (err: any) {
+        const msg = String(err?.message ?? '');
+        if (/is not OPEN|is not in SCHEDULED state/i.test(msg)) {
+          this.logger.debug(`Skipped stale game round job ${job?.name} (${job?.id}): ${msg}`);
+          return { skipped: true };
+        }
+        throw err;
+      }
+    };
+  }
+
   onModuleInit() {
     this.deadLetter = this.deadLetterQueue;
 
@@ -55,7 +74,7 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
 
     this.gameWorker = new Worker(
       GAME_QUEUE_NAME,
-      async (job) => {
+      this.skipStaleRoundJob(async (job: any) => {
         const { roundId } = job.data as { roundId: string };
         if (job.name === 'open') return this.rounds.open(roundId);
         if (job.name === 'lock') {
@@ -71,7 +90,7 @@ export class JobsService implements OnModuleInit, OnModuleDestroy {
         if (job.name === 'crash') {
           return this.crash.settleCrash(roundId);
         }
-      },
+      }),
       { connection: createRedisConnection(this.config) },
     );
     this.gameWorker.on('failed', (job, err) => {

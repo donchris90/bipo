@@ -1,5 +1,5 @@
 import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
-import { LiveMediaService } from './live-media.service';
+import { LiveMediaService, parseYouTubeId } from './live-media.service';
 
 const T0 = 1_000_000;
 
@@ -86,5 +86,59 @@ describe('LiveMediaService — sharing a video in a live', () => {
     realtime.broadcastLiveMedia.mockClear();
     svc.clear('s1'); // nothing left: no second broadcast
     expect(realtime.broadcastLiveMedia).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('LiveMediaService — sharing a video in a party room', () => {
+  function buildRoom(status = 'OPEN') {
+    const prisma: any = {
+      liveSession: { findUnique: jest.fn().mockResolvedValue(null) },
+      partyRoom: { findUnique: jest.fn().mockResolvedValue({ hostId: 'host', status }) },
+      video: { findUnique: jest.fn().mockResolvedValue({ id: 'v1', creatorId: 'host', title: 'My clip', videoUrl: 'https://cdn/v1.mp4', status: 'PUBLISHED' }) },
+    };
+    const realtime: any = { broadcastLiveMedia: jest.fn(), broadcastRoomMedia: jest.fn() };
+    return { svc: new LiveMediaService(prisma, realtime), realtime };
+  }
+
+  it('lets the room host share a video and tells the room', async () => {
+    const { svc, realtime } = buildRoom();
+    const out: any = await svc.act('r1', 'host', { action: 'load', videoId: 'v1' }, T0);
+    expect(out).toMatchObject({ active: true, videoId: 'v1', status: 'PLAYING' });
+    expect(realtime.broadcastRoomMedia).toHaveBeenCalledWith('r1', expect.objectContaining({ videoId: 'v1' }));
+  });
+
+  it('refuses non-hosts and closed rooms', async () => {
+    await expect(buildRoom().svc.act('r1', 'guest', { action: 'load', videoId: 'v1' })).rejects.toBeInstanceOf(ForbiddenException);
+    await expect(buildRoom('CLOSED').svc.act('r1', 'host', { action: 'load', videoId: 'v1' })).rejects.toThrow(/closed/);
+  });
+});
+
+
+describe('YouTube links', () => {
+  it('reads the video id from the usual link shapes', () => {
+    const id = 'dQw4w9WgXcQ';
+    for (const link of [
+      `https://www.youtube.com/watch?v=${id}`,
+      `https://youtu.be/${id}?si=abc`,
+      `https://m.youtube.com/watch?v=${id}&t=30s`,
+      `https://www.youtube.com/shorts/${id}`,
+      `https://www.youtube.com/embed/${id}`,
+      `youtube.com/watch?v=${id}`,
+      id,
+    ]) expect(parseYouTubeId(link)).toBe(id);
+  });
+
+  it('rejects anything that is not a YouTube video', () => {
+    for (const bad of ['https://evil.com/watch?v=dQw4w9WgXcQ', 'https://www.youtube.com/', 'hello', '', null, 42, 'https://youtube.com.evil.com/watch?v=dQw4w9WgXcQ'])
+      expect(parseYouTubeId(bad)).toBeNull();
+  });
+
+  it('lets the host load a YouTube video into a live and tells everyone', async () => {
+    const { svc, realtime } = build();
+    const out: any = await svc.act('s1', 'host', { action: 'load', youtubeUrl: 'https://youtu.be/dQw4w9WgXcQ' }, T0);
+    expect(out).toMatchObject({ active: true, kind: 'youtube', youtubeId: 'dQw4w9WgXcQ', status: 'PLAYING', positionMs: 0 });
+    expect(realtime.broadcastLiveMedia).toHaveBeenCalled();
+    await expect(svc.act('s1', 'host', { action: 'load', youtubeUrl: 'https://vimeo.com/123' })).rejects.toThrow(/YouTube/);
   });
 });

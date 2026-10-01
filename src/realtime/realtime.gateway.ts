@@ -256,6 +256,11 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(`LIVE:${sessionId}`).emit('live:media', payload);
   }
 
+  // Same, for a video shared inside a party room.
+  broadcastRoomMedia(roomId: string, payload: unknown) {
+    this.server.to(`ROOM:${roomId}`).emit('live:media', payload);
+  }
+
   broadcastLiveViewerCount(sessionId: string, payload: unknown) {
     this.server.to(`LIVE:${sessionId}`).emit('live:viewer_count', payload);
   }
