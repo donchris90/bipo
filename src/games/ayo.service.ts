@@ -1,9 +1,10 @@
-import { BadRequestException, Injectable, NotFoundException, OnModuleDestroy } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { LedgerEntryType, WalletType } from '@prisma/client';
 import IORedis from 'ioredis';
 import { v4 as uuid } from 'uuid';
 import { randomInt } from 'node:crypto';
+import { randomPlayerName } from './bot-names';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
 import { RoundService } from './round.service';
@@ -12,14 +13,14 @@ import { AyoCaptureMode, AyoState, createInitialAyoState, legalPits, makeMove } 
 import { calculateSpectatorPoolSplit, calculateWinningSpectatorReward } from './ludo-payout';
 
 type WaitingPlayer = { userId: string; displayName: string; entryFee: number; ticket: string; partyRoomId?: string; matchId?: string; roomCode?: string };
-type AyoRoom = { matchId: string; roomCode: string; entryFee: number; players: WaitingPlayer[]; createdAt: number; partyRoomId?: string; globalInviteSentAt?: number };
+type AyoRoom = { matchId: string; roomCode: string; entryFee: number; players: WaitingPlayer[]; createdAt: number; partyRoomId?: string; globalInviteSentAt?: number; startAttempts?: number };
 
 const QUICK_BROADCAST_AFTER_MS = 10_000;
 const QUICK_AI_FILL_AFTER_MS = 20_000;
 const PARTY_BROADCAST_AFTER_MS = 60_000;
 const PARTY_AI_FILL_AFTER_MS = 120_000;
 const PARTY_LOBBY_INDEX = 'ayo:party:lobbies';
-const BOT_FIRST_NAMES = ['Daniel', 'Maya', 'Chris', 'Sophia', 'Jayden', 'Amara', 'Kevin', 'Lina', 'Marcus', 'Zoe', 'Ryan', 'Nora', 'Ethan', 'Aisha', 'Noah', 'Ella'];
+const PARTY_START_MAX_ATTEMPTS = 20; // a lobby whose start keeps failing is closed after this many one-second retries
 
 const QUEUE_KEY = 'ayo:quick-queue';
 const ROOM_PREFIX = 'ayo:room:';
@@ -34,6 +35,8 @@ export class AyoService implements OnModuleDestroy {
   private readonly localRooms = new Map<string, AyoRoom>();
   private readonly localStates = new Map<string, AyoState>();
   private readonly localTickets = new Map<string, any>();
+  private readonly logger = new Logger(AyoService.name);
+  private readonly warned = new Map<string, number>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -682,8 +685,7 @@ export class AyoService implements OnModuleDestroy {
   }
 
   private randomBotName(): string {
-    const first = BOT_FIRST_NAMES[randomInt(BOT_FIRST_NAMES.length)];
-    return `${first} ${BOT_FIRST_NAMES[randomInt(BOT_FIRST_NAMES.length)]}`;
+    return randomPlayerName();
   }
 
   private async startAyoWithAi(room: AyoRoom) {
@@ -697,68 +699,129 @@ export class AyoService implements OnModuleDestroy {
     return this.startMatch({ ...room, players: [...room.players, ai] });
   }
 
+  private warnThrottled(key: string, message: string) {
+    const now = Date.now();
+    if (now - (this.warned.get(key) ?? 0) < 30_000) return;
+    this.warned.set(key, now);
+    this.logger.warn(message);
+  }
+
   private async processAyoWaiting() {
     const now = Date.now();
     const queue = await this.readQueue();
     const keep: WaitingPlayer[] = [];
     for (const item of queue) {
-      const ticket = await this.readTicket(item.ticket);
-      if (!ticket || ticket.status !== 'WAITING') continue;
-      const createdAt = Date.parse(ticket.createdAt ?? '') || now;
-      if (!ticket.globalInviteSentAt && now - createdAt >= QUICK_BROADCAST_AFTER_MS) {
-        ticket.globalInviteSentAt = now;
-        await this.writeTicket(ticket);
-        this.realtime.broadcastGlobal('ayo:global-invite', {
-          type: 'QUICK_AYO_OPEN', entryFee: item.entryFee, players: 1, playerCount: 2,
-          expiresAt: new Date(createdAt + QUICK_AI_FILL_AFTER_MS).toISOString(),
-        });
+      // One search that cannot start (the player spent their coins, a database blip) must not stop the
+      // other searches, and above all must not stop the Party Room lobbies handled further down.
+      try {
+        const ticket = await this.readTicket(item.ticket);
+        if (!ticket || ticket.status !== 'WAITING') continue;
+        const createdAt = Date.parse(ticket.createdAt ?? '') || now;
+        if (!ticket.globalInviteSentAt && now - createdAt >= QUICK_BROADCAST_AFTER_MS) {
+          ticket.globalInviteSentAt = now;
+          await this.writeTicket(ticket);
+          this.realtime.broadcastGlobal('ayo:global-invite', {
+            type: 'QUICK_AYO_OPEN', entryFee: item.entryFee, players: 1, playerCount: 2,
+            expiresAt: new Date(createdAt + QUICK_AI_FILL_AFTER_MS).toISOString(),
+          });
+        }
+        if (now - createdAt >= QUICK_AI_FILL_AFTER_MS) {
+          const room: AyoRoom = { matchId: item.matchId ?? uuid(), roomCode: this.makeRoomCode(), entryFee: item.entryFee, players: [item], createdAt, partyRoomId: item.partyRoomId };
+          const state = await this.startAyoWithAi(room);
+          await this.writeTicket({ ...ticket, status: 'STARTED', matchId: state.matchId, roomCode: state.roomCode, players: 2, state });
+          await this.redis.del(`ayo:user-ticket:${item.userId}`).catch(() => undefined);
+          continue;
+        }
+        keep.push(item);
+      } catch (e) {
+        const permanent = e instanceof BadRequestException || e instanceof NotFoundException;
+        this.warnThrottled(`quick-${item.ticket}`, `Ayo quick-match search ${item.ticket} could not start: ${(e as Error)?.message}`);
+        if (permanent) {
+          // E.g. not enough coins any more: end this search so it stops failing every second.
+          const t = await this.readTicket(item.ticket).catch(() => null);
+          if (t) await this.writeTicket({ ...t, status: 'CANCELLED' }).catch(() => undefined);
+          await this.redis.del(`ayo:user-ticket:${item.userId}`).catch(() => undefined);
+        } else {
+          keep.push(item); // transient (database/Redis): try again next second
+        }
       }
-      if (now - createdAt >= QUICK_AI_FILL_AFTER_MS) {
-        const room: AyoRoom = { matchId: item.matchId ?? uuid(), roomCode: this.makeRoomCode(), entryFee: item.entryFee, players: [item], createdAt, partyRoomId: item.partyRoomId };
-        const state = await this.startAyoWithAi(room);
-        await this.writeTicket({ ...ticket, status: 'STARTED', matchId: state.matchId, roomCode: state.roomCode, players: 2, state });
-        await this.redis.del(`ayo:user-ticket:${item.userId}`).catch(() => undefined);
-        continue;
-      }
-      keep.push(item);
     }
     await this.writeQueue(keep);
 
     let codes: string[] = [];
     try { codes = await this.redis.zrangebyscore(PARTY_LOBBY_INDEX, 0, now); } catch { return; }
     for (const code of codes) {
-      const room = await this.readRoom(code);
-      if (!room?.partyRoomId) { await this.redis.zrem(PARTY_LOBBY_INDEX, code).catch(() => undefined); continue; }
-      const age = now - room.createdAt;
-      if (room.players.length >= 2) { await this.redis.zrem(PARTY_LOBBY_INDEX, code).catch(() => undefined); continue; }
-      if (age >= PARTY_BROADCAST_AFTER_MS && !room.globalInviteSentAt) {
-        room.globalInviteSentAt = now;
-        await this.writeRoom(room);
-        this.realtime.broadcastGlobal('ayo:global-invite', {
-          type: 'PARTY_AYO_OPEN', partyRoomId: room.partyRoomId, matchId: room.matchId, roomCode: room.roomCode,
-          entryFee: room.entryFee, players: room.players.length, playerCount: 2,
-          expiresAt: new Date(room.createdAt + PARTY_AI_FILL_AFTER_MS).toISOString(),
-        });
-        const host = room.players[0];
-        const alreadyQueued = (await this.readQueue()).some(p => p.partyRoomId === room.partyRoomId || p.userId === host.userId);
-        if (!alreadyQueued) {
-          const t = host.ticket || uuid();
-          await this.writeTicket({ status: 'WAITING', ticket: t, userId: host.userId, players: 1, entryFee: room.entryFee, createdAt: new Date(room.createdAt).toISOString(), globalInviteSentAt: now, partyRoomId: room.partyRoomId });
-          await this.writeQueue([...(await this.readQueue()), { ...host, ticket: t, partyRoomId: room.partyRoomId, matchId: room.matchId, roomCode: room.roomCode }]);
-          await this.redis.set(`ayo:user-ticket:${host.userId}`, t, 'EX', 900).catch(() => undefined);
-        }
-      }
-      if (age >= PARTY_AI_FILL_AFTER_MS) {
-        const current = await this.readRoom(code);
-        if (current?.players.length === 1) {
-          const state = await this.startAyoWithAi(current);
-          const t = await this.readTicket(current.players[0].ticket);
-          if (t) await this.writeTicket({ ...t, status: 'STARTED', matchId: state.matchId, roomCode: state.roomCode, players: 2, state });
-          await this.redis.del(`ayo:user-ticket:${current.players[0].userId}`).catch(() => undefined);
-        }
-        await this.redis.zrem(PARTY_LOBBY_INDEX, code).catch(() => undefined);
+      try { await this.tickPartyLobby(code, now); } catch (e) {
+        this.warnThrottled(`lobby-${code}`, `Party Ayo lobby ${code} tick failed: ${(e as Error)?.message}`);
       }
     }
+  }
+
+  /**
+   * A Party Room lobby keeps its own clock: a global invite at 60 seconds, and at 120 seconds an ordinary-looking
+   * player takes the empty seat. The host is deliberately NOT put into the quick-match queue any more; that second
+   * clock filled the same table with a different room code and the two raced each other.
+   */
+  private async tickPartyLobby(code: string, now: number) {
+    const room = await this.readRoom(code);
+    if (!room?.partyRoomId || room.players.length >= 2) {
+      await this.redis.zrem(PARTY_LOBBY_INDEX, code).catch(() => undefined);
+      return;
+    }
+    const age = now - room.createdAt;
+    if (age >= PARTY_BROADCAST_AFTER_MS && age < PARTY_AI_FILL_AFTER_MS && !room.globalInviteSentAt) {
+      room.globalInviteSentAt = now;
+      await this.writeRoom(room);
+      this.realtime.broadcastGlobal('ayo:global-invite', {
+        type: 'PARTY_AYO_OPEN', partyRoomId: room.partyRoomId, matchId: room.matchId, roomCode: room.roomCode,
+        hostId: room.players[0]?.userId, entryFee: room.entryFee, players: room.players.length, playerCount: 2,
+        expiresAt: new Date(room.createdAt + PARTY_AI_FILL_AFTER_MS).toISOString(),
+      });
+    }
+    if (age >= PARTY_AI_FILL_AFTER_MS) await this.fillPartyLobbyWithPlayer(code);
+  }
+
+  private async fillPartyLobbyWithPlayer(code: string) {
+    try {
+      // Same lock as joining, so a real person joining at the very same moment cannot double-start the table.
+      await this.withLock(`room:${code}`, async () => {
+        const current = await this.readRoom(code);
+        if (!current?.partyRoomId || current.players.length >= 2) {
+          await this.redis.zrem(PARTY_LOBBY_INDEX, code).catch(() => undefined);
+          return;
+        }
+        try {
+          // startMatch removes the lobby from the index and announces the started table.
+          await this.startAyoWithAi(current);
+        } catch (e) {
+          await this.onPartyStartFailed(current, e);
+        }
+      });
+    } catch (e) {
+      if (!(e instanceof BadRequestException)) throw e; // BadRequest here only means "busy": the next tick retries
+    }
+  }
+
+  private async onPartyStartFailed(room: AyoRoom, e: unknown) {
+    const message = (e as Error)?.message ?? String(e);
+    this.logger.error(`Ayo ${room.roomCode}: could not start: ${message}`);
+    const attempts = (room.startAttempts ?? 0) + 1;
+    const permanent = e instanceof BadRequestException || e instanceof NotFoundException;
+    if (!permanent && attempts < PARTY_START_MAX_ATTEMPTS) {
+      room.startAttempts = attempts;
+      await this.writeRoom(room); // transient failure: keep the lobby, retry next second
+      return;
+    }
+    // Cannot start (e.g. the host no longer has the entry fee). Nobody was charged; close the lobby.
+    this.logger.warn(`Closing Party Ayo lobby ${room.roomCode}: ${message}`);
+    if (room.partyRoomId) {
+      const mapped = await this.redis.get(`ayo:party:${room.partyRoomId}`).catch(() => null);
+      if (mapped === room.roomCode) await this.redis.del(`ayo:party:${room.partyRoomId}`).catch(() => undefined);
+    }
+    await this.redis.zrem(PARTY_LOBBY_INDEX, room.roomCode).catch(() => undefined);
+    await this.redis.del(`${ROOM_PREFIX}${room.roomCode}`).catch(() => undefined);
+    this.localRooms.delete(room.roomCode);
+    this.broadcastPartyAyo(room, 'FINISHED');
   }
 
   async quickLobby() {

@@ -1,5 +1,5 @@
 import { RealtimeGateway } from '../realtime/realtime.gateway';
-import { BadRequestException, Injectable, NotFoundException, OnModuleDestroy } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, OnModuleDestroy } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
 import { RoundService } from './round.service';
@@ -9,6 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import IORedis from 'ioredis';
 import { randomInt } from 'node:crypto';
 import { calculateSpectatorPoolSplit, calculateWinningSpectatorReward } from './ludo-payout';
+import { randomPlayerNames } from './bot-names';
 import { AUTOPILOT_AFTER_MISSED_TURNS, createLudoState, LudoPlayerState, LudoState, TURN_MS, advanceTurn, applyMove, giveControlBack, handToAi, isAiControlled, legalMoves, pickBotMove, recordFinish, rollForTurn, serverActsAt } from './ludo.rules';
 
 // A search whose app has not checked in for this long is treated as abandoned (the app polls every 2 s).
@@ -19,11 +20,11 @@ const DEFAULT_BOT_FILL_SECONDS = 20;
 const PARTY_BROADCAST_AFTER_MS = 60_000;
 const PARTY_BOT_FILL_AFTER_MS = 120_000;
 const PARTY_LOBBY_INDEX = 'ludo:party:lobbies';
-const BOT_FIRST_NAMES = ['Daniel', 'Maya', 'Chris', 'Sophia', 'Jayden', 'Amara', 'Kevin', 'Lina', 'Marcus', 'Zoe', 'Ryan', 'Nora', 'Ethan', 'Aisha', 'Noah', 'Ella'];
+const PARTY_START_MAX_ATTEMPTS = 20; // a lobby whose start keeps failing is closed after this many one-second retries
 
 interface QueueItem { userId: string; displayName: string; entryFee: number; playerCount: 2 | 4; ticket?: string; synthetic?: boolean; }
 interface QuickTicket { ticket: string; userId: string; entryFee: number; playerCount: 2 | 4; status: 'WAITING' | 'STARTED' | 'CANCELLED'; matchId?: string; roomCode?: string; players?: number; state?: LudoState; createdAt: string; lastSeenAt?: number; }
-interface Room { matchId: string; roomCode: string; entryFee: number; playerCount: 2 | 4; players: QueueItem[]; creatorId: string; started: boolean; partyRoomId?: string; createdAt?: number; globalInviteSentAt?: number; }
+interface Room { matchId: string; roomCode: string; entryFee: number; playerCount: 2 | 4; players: QueueItem[]; creatorId: string; started: boolean; partyRoomId?: string; createdAt?: number; globalInviteSentAt?: number; startAttempts?: number; }
 interface LudoInvite {
   id: string; matchId: string; roomCode: string; fromUserId: string; toUserId: string; createdAt: string; expiresAt: string;
   // So the invite can say how much is staked and by whom without the client having to look the room up separately.
@@ -44,6 +45,9 @@ export class LudoService implements OnModuleDestroy {
   private readonly localInviteIds = new Map<string, Set<string>>();
   private readonly localQuickLocks = new Set<string>();
   private readonly redis: IORedis;
+  private readonly logger = new Logger(LudoService.name);
+  private rulesCache?: { at: number; rules: any };
+  private readonly warned = new Map<string, number>();
 
   constructor(private readonly prisma: PrismaService, private readonly wallet: WalletService, private readonly rounds: RoundService, private readonly config: ConfigService,
     private readonly realtime: RealtimeGateway) {
@@ -153,15 +157,39 @@ export class LudoService implements OnModuleDestroy {
     return raw ? JSON.parse(raw) as QuickTicket : this.localTickets.get(ticket);
   }
 
+  /**
+   * The game's rules, cached for a few seconds. The bot-fill checks run on every poll and every tick; reading
+   * them from Postgres each time meant a brief database outage also stopped bots from joining. During an
+   * outage the last known rules are used instead.
+   */
+  private async ludoRules(): Promise<any> {
+    const now = Date.now();
+    if (this.rulesCache && now - this.rulesCache.at < 15_000) return this.rulesCache.rules;
+    try {
+      const game = await this.prisma.gameDefinition.findUnique({ where: { code: 'LUDO' }, select: { rulesJson: true } });
+      const rules = (game?.rulesJson ?? {}) as any;
+      this.rulesCache = { at: now, rules };
+      return rules;
+    } catch (e) {
+      if (this.rulesCache) return this.rulesCache.rules;
+      throw e;
+    }
+  }
+
+  private warnThrottled(key: string, message: string) {
+    const now = Date.now();
+    if (now - (this.warned.get(key) ?? 0) < 30_000) return;
+    this.warned.set(key, now);
+    this.logger.warn(message);
+  }
+
   private async botFillSeconds(): Promise<number> {
-    const game = await this.prisma.gameDefinition.findUnique({ where: { code: 'LUDO' }, select: { rulesJson: true } });
-    const value = Number(((game?.rulesJson ?? {}) as any).botFillSeconds ?? DEFAULT_BOT_FILL_SECONDS);
+    const value = Number((await this.ludoRules()).botFillSeconds ?? DEFAULT_BOT_FILL_SECONDS);
     return Number.isFinite(value) && value >= 0 ? value : DEFAULT_BOT_FILL_SECONDS;
   }
 
   private async botMatchesPaid(): Promise<boolean> {
-    const game = await this.prisma.gameDefinition.findUnique({ where: { code: 'LUDO' }, select: { rulesJson: true } });
-    const v = ((game?.rulesJson ?? {}) as any).botMatchPaid;
+    const v = (await this.ludoRules()).botMatchPaid;
     return !(v === 0 || v === false); // paid unless an admin switches it off
   }
 
@@ -250,8 +278,9 @@ export class LudoService implements OnModuleDestroy {
       await this.writeQueue(key, queue.filter(x => !humans.includes(x) && !broke.includes(x)));
       if (!humans.some(h => h.userId === userId)) throw new BadRequestException('Insufficient balance');
 
-      const bots: QueueItem[] = Array.from({ length: data.playerCount - humans.length }, (_, i) => ({
-        userId: `bot:${uuid()}`, displayName: `${BOT_FIRST_NAMES[(i + Math.floor(Math.random() * BOT_FIRST_NAMES.length)) % BOT_FIRST_NAMES.length]}_${randomInt(10, 100)}`,
+      const botNames = randomPlayerNames(data.playerCount - humans.length, humans.map(h => h.displayName));
+      const bots: QueueItem[] = botNames.map((displayName) => ({
+        userId: `bot:${uuid()}`, displayName,
         entryFee: paid ? data.entryFee : 0, playerCount: data.playerCount, synthetic: true,
       }));
       const started = await this.startMatch([...humans, ...bots], undefined, { practice: !paid });
@@ -349,77 +378,151 @@ export class LudoService implements OnModuleDestroy {
   async tickPartyLobbies() {
     const now = Date.now();
     let codes: string[] = [];
-    try { codes = await this.redis.zrangebyscore(PARTY_LOBBY_INDEX, 0, now); } catch { return; }
-
+    try { codes = await this.redis.zrangebyscore(PARTY_LOBBY_INDEX, 0, now); } catch (e) {
+      this.warnThrottled('lobby-index', `Party Ludo lobby clock cannot read Redis: ${(e as Error)?.message}`);
+      return;
+    }
     for (const code of codes) {
-      const room = await this.readRoom(code);
-      if (!room?.partyRoomId || room.started) {
-        await this.redis.zrem(PARTY_LOBBY_INDEX, code).catch(() => undefined);
-        continue;
-      }
-
-      const createdAt = room.createdAt ?? now;
-      const age = now - createdAt;
-
-      if (age >= PARTY_BROADCAST_AFTER_MS && age < PARTY_BOT_FILL_AFTER_MS && room.players.length === 1 && !room.globalInviteSentAt) {
-        room.globalInviteSentAt = now;
-        await this.writeRoom(room);
-        this.realtime.broadcastGlobal('ludo:global-invite', {
-          type: 'PARTY_LUDO_OPEN',
-          partyRoomId: room.partyRoomId,
-          matchId: room.matchId,
-          roomCode: room.roomCode,
-          entryFee: room.entryFee,
-          playerCount: room.playerCount,
-          players: room.players.length,
-          expiresAt: new Date(createdAt + PARTY_BOT_FILL_AFTER_MS).toISOString(),
-        });
-      }
-
-      if (age >= PARTY_BOT_FILL_AFTER_MS && room.players.length < room.playerCount) {
-        await this.fillPartyLobbyWithBots(room);
+      // One broken lobby (a failed debit, a database blip) must never stop the others from being served.
+      try { await this.tickPartyLobby(code, now); } catch (e) {
+        this.warnThrottled(`lobby-${code}`, `Party Ludo lobby ${code} tick failed: ${(e as Error)?.message}`);
       }
     }
   }
 
-  private randomBotDisplayNames(count: number): string[] {
-    const used = new Set<string>();
-    while (used.size < count) {
-      const first = BOT_FIRST_NAMES[randomInt(BOT_FIRST_NAMES.length)];
-      const name = `${first}_${randomInt(10, 100)}`;
-      if (!used.has(name)) used.add(name);
+  private async tickPartyLobby(code: string, now: number) {
+    const room = await this.readRoom(code);
+    if (!room?.partyRoomId || room.started) {
+      await this.redis.zrem(PARTY_LOBBY_INDEX, code).catch(() => undefined);
+      return;
     }
-    return [...used];
+    const age = now - (room.createdAt ?? now);
+    const full = room.players.length >= room.playerCount;
+
+    // Still short of players after a minute: tell the whole app (once).
+    if (age >= PARTY_BROADCAST_AFTER_MS && age < PARTY_BOT_FILL_AFTER_MS && !full && !room.globalInviteSentAt) {
+      room.globalInviteSentAt = now;
+      await this.writeRoom(room);
+      this.realtime.broadcastGlobal('ludo:global-invite', {
+        type: 'PARTY_LUDO_OPEN',
+        partyRoomId: room.partyRoomId,
+        matchId: room.matchId,
+        roomCode: room.roomCode,
+        hostId: room.creatorId,
+        entryFee: room.entryFee,
+        playerCount: room.playerCount,
+        players: room.players.length,
+        expiresAt: new Date((room.createdAt ?? now) + PARTY_BOT_FILL_AFTER_MS).toISOString(),
+      });
+    }
+
+    // Two minutes and still short: the empty seats are filled with ordinary-looking players and the match
+    // starts. A table that is already full but never managed to start is retried every second as well.
+    if (full || age >= PARTY_BOT_FILL_AFTER_MS) await this.fillPartyLobbyWithBots(room);
+  }
+
+  /** Only people who can still pay go into a match. Returns who was removed from the table. */
+  private async dropUnfunded(room: Room): Promise<QueueItem[]> {
+    const keep: QueueItem[] = [];
+    const dropped: QueueItem[] = [];
+    for (const p of room.players) {
+      if (p.synthetic) { keep.push(p); continue; }
+      const balance = await this.wallet.getBalance(p.userId, WalletType.COIN).catch(() => null);
+      if (balance !== null && balance < BigInt(room.entryFee)) dropped.push(p); else keep.push(p);
+    }
+    room.players = keep;
+    return dropped;
   }
 
   private async fillPartyLobbyWithBots(room: Room) {
-    const lockKey = `ludo:party-fill:${room.matchId}`;
-    const lockToken = uuid();
-    const locked = await this.redis.set(lockKey, lockToken, 'PX', 8000, 'NX').catch(() => null);
-    if (!locked) return;
+    const token = await this.lockRoom(room.roomCode, 0);
+    if (!token) return; // someone is joining this very second; the next tick tries again
     try {
       const current = await this.readRoom(room.roomCode);
-      if (!current || current.started || current.players.length >= current.playerCount) {
-        if (!current || current.started || current.players.length >= current.playerCount) await this.redis.zrem(PARTY_LOBBY_INDEX, room.roomCode).catch(() => undefined);
+      if (!current || current.started) {
+        await this.redis.zrem(PARTY_LOBBY_INDEX, room.roomCode).catch(() => undefined);
         return;
       }
-      const names = this.randomBotDisplayNames(current.playerCount - current.players.length);
+      const dropped = await this.dropUnfunded(current);
+      if (dropped.length) {
+        if (dropped.some(p => p.userId === current.creatorId)) { await this.cancelPartyLobby(current, 'the host no longer has the entry fee'); return; }
+        this.rooms.set(current.roomCode, current);
+        await this.writeRoom(current);
+        this.broadcastPartyLudo(current, 'WAITING');
+      }
+      const names = randomPlayerNames(Math.max(0, current.playerCount - current.players.length), current.players.map(p => p.displayName));
       const bots: QueueItem[] = names.map((displayName) => ({
-        userId: `bot:${uuid()}`,
-        displayName,
-        entryFee: current.entryFee,
-        playerCount: current.playerCount,
-        synthetic: true,
+        userId: `bot:${uuid()}`, displayName, entryFee: current.entryFee, playerCount: current.playerCount, synthetic: true,
       }));
-      current.players.push(...bots);
-      current.started = true;
-      await this.writeRoom(current);
-      this.broadcastPartyLudo(current, 'STARTED');
-      await this.startMatch(current.players, current);
+      const players = [...current.players, ...bots];
+      const startRoom: Room = { ...current, players, started: true };
+      try {
+        await this.startMatch(players, startRoom);
+        this.rooms.set(startRoom.roomCode, startRoom);
+        this.broadcastPartyLudo(startRoom, 'STARTED');
+      } catch (e) {
+        await this.onStartFailed(current, startRoom, e);
+      }
     } finally {
-      const currentLock = await this.redis.get(lockKey).catch(() => null);
-      if (currentLock === lockToken) await this.redis.del(lockKey).catch(() => undefined);
+      await this.unlockRoom(room.roomCode, token);
     }
+  }
+
+  /**
+   * A start that failed (database unreachable, a joiner who spent their coins) must not strand the table.
+   * The entry debits are one transaction, so a failed start charged nobody. Returns true when the match
+   * turned out to exist after all.
+   */
+  private async onStartFailed(room: Room, startRoom: Room, e: unknown): Promise<boolean> {
+    const message = (e as Error)?.message ?? String(e);
+    const created = await this.prisma.gameRound.findUnique({ where: { id: room.matchId }, select: { id: true } }).catch(() => null);
+    if (created) {
+      await this.writeRoom(startRoom);
+      this.rooms.set(startRoom.roomCode, startRoom);
+      this.broadcastPartyLudo(startRoom, 'STARTED');
+      this.logger.warn(`Ludo ${room.roomCode}: start reported "${message}" but the match exists; marked as started.`);
+      return true;
+    }
+    this.logger.error(`Ludo ${room.roomCode}: could not start: ${message}`);
+    if (!room.partyRoomId) return false;
+    const attempts = (room.startAttempts ?? 0) + 1;
+    const permanent = e instanceof BadRequestException || e instanceof NotFoundException;
+    if (permanent || attempts >= PARTY_START_MAX_ATTEMPTS) { await this.cancelPartyLobby(room, message); return false; }
+    room.startAttempts = attempts;
+    this.rooms.set(room.roomCode, room);
+    await this.writeRoom(room);
+    return false;
+  }
+
+  /** Closes a Party Room lobby that cannot start. Nobody was charged, and the room's game chip goes away. */
+  private async cancelPartyLobby(room: Room, reason: string) {
+    this.logger.warn(`Closing Party Ludo lobby ${room.roomCode}: ${reason}`);
+    if (room.partyRoomId) {
+      const mapped = await this.redis.get(`ludo:party:${room.partyRoomId}`).catch(() => null);
+      if (mapped === room.roomCode) await this.redis.del(`ludo:party:${room.partyRoomId}`).catch(() => undefined);
+    }
+    await this.redis.zrem(PARTY_LOBBY_INDEX, room.roomCode).catch(() => undefined);
+    await this.redis.del(this.roomKey(room.roomCode)).catch(() => undefined);
+    this.rooms.delete(room.roomCode);
+    this.broadcastPartyLudo(room, 'FINISHED');
+  }
+
+  /** Joining, the lobby clock's bot fill and the start itself all change one room record, so they take turns. */
+  private async lockRoom(code: string, waitMs: number): Promise<string | null> {
+    const key = `ludo:room-lock:${code}`;
+    const token = uuid();
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+      try {
+        if ((await this.redis.set(key, token, 'PX', 10_000, 'NX')) === 'OK') return token;
+      } catch { return token; } // Redis unavailable: carry on without the lock rather than block the table
+      if (Date.now() >= deadline) return null;
+      await new Promise((resolve) => setTimeout(resolve, 75));
+    }
+  }
+
+  private async unlockRoom(code: string, token: string) {
+    await this.redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", 1, `ludo:room-lock:${code}`, token).catch(() => undefined);
   }
 
   async createRoom(userId: string, displayName: string, entryFee: number, playerCount: 2 | 4, countryCode = 'NG', partyRoomId?: string) {
@@ -503,7 +606,7 @@ export class LudoService implements OnModuleDestroy {
   async roomStatus(userId: string, roomCode: string) {
     const room = this.rooms.get(roomCode.toUpperCase()) ?? await this.readRoom(roomCode.toUpperCase());
     if (!room) throw new NotFoundException('Ludo room not found');
-    if (!room.players.some(p => p.userId === userId)) throw new BadRequestException('You are not in this Ludo room');
+    if (!room.players.some(p => p.userId === userId)) throw new NotFoundException('You are not in this Ludo room');
     if (room.started) {
       return { status: 'STARTED', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount, state: await this.getState(room.matchId) };
     }
@@ -512,27 +615,56 @@ export class LudoService implements OnModuleDestroy {
 
   async joinRoom(userId: string, displayName: string, roomCode: string, countryCode = 'NG') {
     const normalizedCode = roomCode.toUpperCase();
-    const room = this.rooms.get(normalizedCode) ?? await this.readRoom(normalizedCode);
-    if (!room) throw new NotFoundException('Ludo room not found');
-    await this.rounds.assertGameAvailable('LUDO', countryCode);
-    if (room.started) throw new BadRequestException('Match already started');
-    if (room.players.some(p => p.userId === userId)) return this.startIfReady(room);
-    if (room.players.length >= room.playerCount) throw new BadRequestException('Room is full');
-    await this.requireBalance(userId, room.entryFee);
-    room.players.push({ userId, displayName, entryFee: room.entryFee, playerCount: room.playerCount });
-    this.rooms.set(room.roomCode, room);
-    await this.writeRoom(room);
-    this.broadcastPartyLudo(room, 'WAITING');
-    return this.startIfReady(room);
+    const token = await this.lockRoom(normalizedCode, 3000);
+    if (!token) throw new BadRequestException('This table is busy. Please try again.');
+    try {
+      const room = (await this.readRoom(normalizedCode)) ?? this.rooms.get(normalizedCode);
+      if (!room) throw new NotFoundException('Ludo room not found');
+      await this.rounds.assertGameAvailable('LUDO', countryCode);
+      if (room.started) throw new BadRequestException('Match already started');
+      if (room.players.some(p => p.userId === userId)) return await this.startIfReady(room, userId);
+      if (room.players.length >= room.playerCount) throw new BadRequestException('Room is full');
+      await this.requireBalance(userId, room.entryFee);
+      room.players.push({ userId, displayName, entryFee: room.entryFee, playerCount: room.playerCount });
+      this.rooms.set(room.roomCode, room);
+      await this.writeRoom(room);
+      this.broadcastPartyLudo(room, 'WAITING');
+      return await this.startIfReady(room, userId);
+    } finally {
+      await this.unlockRoom(normalizedCode, token);
+    }
   }
 
-  private async startIfReady(room: Room) {
-    if (room.players.length < room.playerCount) return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount };
-    room.started = true;
-    this.rooms.set(room.roomCode, room);
-    await this.writeRoom(room);
-    this.broadcastPartyLudo(room, 'STARTED');
-    return this.startMatch(room.players, room);
+  private async startIfReady(room: Room, callerId?: string) {
+    const waiting = () => ({ status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, playerCount: room.playerCount });
+    if (room.players.length < room.playerCount) return waiting();
+
+    // Someone may have spent their coins since joining: they leave the table instead of blocking it.
+    const dropped = await this.dropUnfunded(room);
+    if (dropped.length) {
+      this.rooms.set(room.roomCode, room);
+      await this.writeRoom(room);
+      if (room.partyRoomId && dropped.some(p => p.userId === room.creatorId)) {
+        await this.cancelPartyLobby(room, 'the host no longer has the entry fee');
+        throw new BadRequestException('This table was closed');
+      }
+      this.broadcastPartyLudo(room, 'WAITING');
+      if (callerId && dropped.some(p => p.userId === callerId)) throw new BadRequestException('Insufficient balance');
+      return waiting();
+    }
+
+    const startRoom: Room = { ...room, started: true };
+    try {
+      const result = await this.startMatch(room.players, startRoom);
+      this.rooms.set(room.roomCode, startRoom);
+      this.broadcastPartyLudo(startRoom, 'STARTED');
+      return result;
+    } catch (e) {
+      if (await this.onStartFailed(room, startRoom, e)) {
+        return { status: 'STARTED', matchId: room.matchId, roomCode: room.roomCode, state: await this.getState(room.matchId).catch(() => undefined) };
+      }
+      throw e;
+    }
   }
 
   private async startMatch(players: QueueItem[], room?: Room, opts: { practice?: boolean } = {}) {

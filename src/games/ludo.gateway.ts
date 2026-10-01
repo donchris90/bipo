@@ -24,10 +24,13 @@ export class LudoGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       if (this.ticking) return; // never let slow ticks pile up
       this.ticking = true;
       try {
-        const states = await this.ludo.tickActiveMatches();
-        for (const state of states) this.server?.to(`LUDO:${state.matchId}`).emit('ludo:state', state);
-        await this.ludo.tickPartyLobbies();
-      } catch { /* try again next second */ } finally { this.ticking = false; }
+        // Separate try blocks: a failure while ticking matches must never stop the Party Room lobby clock.
+        try {
+          const states = await this.ludo.tickActiveMatches();
+          for (const state of states) this.server?.to(`LUDO:${state.matchId}`).emit('ludo:state', state);
+        } catch { /* try again next second */ }
+        try { await this.ludo.tickPartyLobbies(); } catch { /* try again next second */ }
+      } finally { this.ticking = false; }
     }, 1000);
   }
 
