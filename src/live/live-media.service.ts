@@ -31,6 +31,32 @@ export function parseYouTubeId(input: unknown): string | null {
   return id && /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
 }
 
+// Asks YouTube whether a video can be played outside youtube.com before the room commits to it.
+// YouTube's oEmbed answers 200 (with the title) for embeddable videos, 401/403 when the owner
+// disabled embedding, and 404 when the video is private or removed. Network trouble or any other
+// answer lets the video through: the player reports a clear error if it really can't play.
+export type YouTubeCheck = { ok: true; title?: string } | { ok: false; reason: string };
+export async function checkYouTube(id: string, fetchFn: typeof fetch = fetch, timeoutMs = 4000): Promise<YouTubeCheck> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetchFn(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(`https://www.youtube.com/watch?v=${id}`)}`, { signal: ctrl.signal });
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, reason: "The owner of this video doesn't allow it to be played outside YouTube. Please pick another video." };
+    }
+    if (res.status === 404) return { ok: false, reason: 'This video is private or has been removed. Please pick another video.' };
+    if (res.ok) {
+      const body: any = await res.json().catch(() => null);
+      return { ok: true, title: typeof body?.title === 'string' ? body.title.slice(0, 120) : undefined };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: true };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 interface State {
   sessionId: string;
   // 'upload' = one of the host's published videos (url); 'youtube' = a YouTube video (youtubeId).
@@ -118,7 +144,9 @@ export class LiveMediaService {
     if (action === 'load' && input.youtubeUrl !== undefined) {
       const youtubeId = parseYouTubeId(input.youtubeUrl);
       if (!youtubeId) throw new BadRequestException('That is not a YouTube link');
-      const state: State = { sessionId, kind: 'youtube', youtubeId, videoId: `yt:${youtubeId}`, title: 'YouTube', url: '', status: 'PLAYING', positionMs: 0, updatedAt: now };
+      const check = await checkYouTube(youtubeId);
+      if (!check.ok) throw new BadRequestException(check.reason);
+      const state: State = { sessionId, kind: 'youtube', youtubeId, videoId: `yt:${youtubeId}`, title: check.title ?? 'YouTube', url: '', status: 'PLAYING', positionMs: 0, updatedAt: now };
       this.states.set(sessionId, state);
       return this.publish(state, now, isRoom);
     }

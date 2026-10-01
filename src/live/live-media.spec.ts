@@ -1,5 +1,5 @@
 import { BadRequestException, ForbiddenException, NotFoundException } from '@nestjs/common';
-import { LiveMediaService, parseYouTubeId } from './live-media.service';
+import { LiveMediaService, parseYouTubeId, checkYouTube } from './live-media.service';
 
 const T0 = 1_000_000;
 
@@ -135,10 +135,28 @@ describe('YouTube links', () => {
   });
 
   it('lets the host load a YouTube video into a live and tells everyone', async () => {
+    (global as any).fetch = jest.fn(async () => ({ status: 200, ok: true, json: async () => ({ title: 'Nice clip' }) }));
     const { svc, realtime } = build();
     const out: any = await svc.act('s1', 'host', { action: 'load', youtubeUrl: 'https://youtu.be/dQw4w9WgXcQ' }, T0);
-    expect(out).toMatchObject({ active: true, kind: 'youtube', youtubeId: 'dQw4w9WgXcQ', status: 'PLAYING', positionMs: 0 });
+    expect(out).toMatchObject({ active: true, kind: 'youtube', youtubeId: 'dQw4w9WgXcQ', title: 'Nice clip', status: 'PLAYING', positionMs: 0 });
     expect(realtime.broadcastLiveMedia).toHaveBeenCalled();
     await expect(svc.act('s1', 'host', { action: 'load', youtubeUrl: 'https://vimeo.com/123' })).rejects.toThrow(/YouTube/);
+  });
+});
+
+
+describe('checkYouTube (can this video play outside YouTube?)', () => {
+  const reply = (status: number, body?: unknown) => (async () => ({ status, ok: status >= 200 && status < 300, json: async () => body })) as any;
+
+  it('accepts an embeddable video and returns its title', async () => {
+    expect(await checkYouTube('dQw4w9WgXcQ', reply(200, { title: 'A song' }))).toEqual({ ok: true, title: 'A song' });
+  });
+  it('rejects videos whose owner disabled embedding, and removed ones', async () => {
+    expect(await checkYouTube('dQw4w9WgXcQ', reply(401))).toMatchObject({ ok: false, reason: expect.stringContaining('outside YouTube') });
+    expect(await checkYouTube('dQw4w9WgXcQ', reply(404))).toMatchObject({ ok: false, reason: expect.stringContaining('private') });
+  });
+  it('does not block on network trouble or odd answers', async () => {
+    expect(await checkYouTube('dQw4w9WgXcQ', (async () => { throw new Error('offline'); }) as any)).toEqual({ ok: true });
+    expect(await checkYouTube('dQw4w9WgXcQ', reply(500))).toEqual({ ok: true });
   });
 });
