@@ -693,7 +693,7 @@ export class LudoService implements OnModuleDestroy {
         await tx.gameEntry.create({ data: { roundId: created.id, userId: p.userId, selection: { roomCode }, coinAmount: entryFee, idempotencyKey: `ludo_entry_record:${created.id}:${p.userId}` } });
       }
       return created;
-    });
+    }, { maxWait: 15000, timeout: 60000 });
 
     const turnSeconds = Math.max(5, Number(rules.turnSeconds ?? TURN_MS / 1000));
     const state = createLudoState({ matchId, roomCode, entryFee, playerCount, players, prizeFirst, prizeSecond, turnSeconds, practice });

@@ -13,6 +13,6 @@
 // ... }` again — that's exactly the class of mistake that caused the
 // regression.
 export const EXTENDED_TX_OPTIONS: { timeout: number; maxWait: number } = {
-  timeout: 15000,
-  maxWait: 5000,
+  timeout: 60000,
+  maxWait: 15000,
 };

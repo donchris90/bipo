@@ -27,6 +27,9 @@ const ROOM_PREFIX = 'ayo:room:';
 const STATE_PREFIX = 'ayo:state:';
 const TICKET_PREFIX = 'ayo:ticket:';
 const LOCK_PREFIX = 'ayo:lock:';
+const ACTIVE_SET = 'ayo:active';
+const ROOM_MATCH_PREFIX = 'ayo:room-match:';
+const DEFINITION_CACHE_MS = 15_000;
 const DISCONNECT_GRACE_SECONDS = 60;
 
 @Injectable()
@@ -35,6 +38,10 @@ export class AyoService implements OnModuleDestroy {
   private readonly localRooms = new Map<string, AyoRoom>();
   private readonly localStates = new Map<string, AyoState>();
   private readonly localTickets = new Map<string, any>();
+  private readonly localLocks = new Set<string>();
+  private localQueue: WaitingPlayer[] = [];
+  private definitionCache: { at: number; game: any } | null = null;
+  private activeSetMigrated = false;
   private readonly logger = new Logger(AyoService.name);
   private readonly warned = new Map<string, number>();
 
@@ -54,6 +61,16 @@ export class AyoService implements OnModuleDestroy {
   async onModuleDestroy() { await this.redis.quit().catch(() => undefined); }
 
   async ensureDefinition() {
+    // Cached: this used to be a DB upsert on every request and on every bot move every second,
+    // which alone kept the small connection pool busy. Admin rule changes apply within 15s.
+    if (this.definitionCache && Date.now() - this.definitionCache.at < DEFINITION_CACHE_MS) return this.definitionCache.game;
+    const found = await this.prisma.gameDefinition.findUnique({ where: { code: 'AYO' } });
+    const game = found ?? await this.createDefinition();
+    this.definitionCache = { at: Date.now(), game };
+    return game;
+  }
+
+  private async createDefinition() {
     return this.prisma.gameDefinition.upsert({
       where: { code: 'AYO' },
       update: {},
@@ -81,6 +98,13 @@ export class AyoService implements OnModuleDestroy {
   private async writeState(state: AyoState) {
     this.localStates.set(state.matchId, state);
     await this.redis.set(`${STATE_PREFIX}${state.matchId}`, JSON.stringify(state), 'EX', 86400).catch(() => undefined);
+    await this.redis.set(`${ROOM_MATCH_PREFIX}${state.roomCode}`, state.matchId, 'EX', 86400).catch(() => undefined);
+    if (state.status === 'ACTIVE') await this.redis.sadd(ACTIVE_SET, state.matchId).catch(() => undefined);
+    else {
+      await this.redis.srem(ACTIVE_SET, state.matchId).catch(() => undefined);
+      // keep memory bounded on the in-process fallback
+      if (this.localStates.size > 500) this.localStates.delete(state.matchId);
+    }
   }
 
   private async readRoom(code: string): Promise<AyoRoom | null> {
@@ -110,7 +134,13 @@ export class AyoService implements OnModuleDestroy {
 
   private async withLock<T>(key: string, fn: () => Promise<T>, ttlMs = 12000): Promise<T> {
     const token = uuid();
-    const acquired = await this.redis.set(`${LOCK_PREFIX}${key}`, token, 'PX', ttlMs, 'NX').catch(() => null);
+    const acquired = await this.redis.set(`${LOCK_PREFIX}${key}`, token, 'PX', ttlMs, 'NX').catch(() => 'REDIS_DOWN' as const);
+    if (acquired === 'REDIS_DOWN') {
+      // Redis unreachable: use a process-local lock so single-instance play still works.
+      if (this.localLocks.has(key)) throw new BadRequestException('Ayo matchmaking is busy. Please try again.');
+      this.localLocks.add(key);
+      try { return await fn(); } finally { this.localLocks.delete(key); }
+    }
     if (acquired !== 'OK') throw new BadRequestException('Ayo matchmaking is busy. Please try again.');
     try { return await fn(); } finally {
       await this.redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", 1, `${LOCK_PREFIX}${key}`, token).catch(() => undefined);
@@ -150,7 +180,7 @@ export class AyoService implements OnModuleDestroy {
           },
         });
       }
-    });
+    }, { maxWait: 15000, timeout: 60000 });
 
     const state = createInitialAyoState({
       matchId, roomCode: room.roomCode, entryFee: room.entryFee,
@@ -167,10 +197,10 @@ export class AyoService implements OnModuleDestroy {
       await this.writeQueue((await this.readQueue()).filter(p => !room.players.some(rp => rp.ticket === p.ticket || rp.userId === p.userId)));
       for (const p of room.players.filter(p => !p.userId.startsWith('bot:'))) await this.redis.del(`ayo:user-ticket:${p.userId}`).catch(() => undefined);
     }
-    this.realtime.broadcastAyo(matchId, {
-      matchId, roomCode: room.roomCode, entryFee: room.entryFee,
-      players: state.players.map(p => ({ userId: p.userId, displayName: p.displayName })),
-    });
+    // Push the FULL state to anyone already listening on this match (e.g. the room creator who
+    // has been waiting on the socket). A partial payload here used to overwrite the client's state
+    // with no board/pot and leave the creator stuck.
+    this.broadcast(state);
     if (room.partyRoomId) {
       await this.redis.set(`ayo:party:${room.partyRoomId}`, room.roomCode, 'EX', 3600).catch(() => undefined);
       this.broadcastPartyAyo(room, 'STARTED');
@@ -197,6 +227,16 @@ export class AyoService implements OnModuleDestroy {
   }
 
   async quickMatch(userId: string, displayName: string, entryFee: number, countryCode = 'NG') {
+    const t0 = Date.now();
+    try {
+      return await this.quickMatchInner(userId, displayName, entryFee, countryCode);
+    } finally {
+      const ms = Date.now() - t0;
+      if (ms > 3000) this.logger.warn(`Ayo quick-match for ${userId} took ${ms}ms — check DB pool / Redis latency`);
+    }
+  }
+
+  private async quickMatchInner(userId: string, displayName: string, entryFee: number, countryCode = 'NG') {
     const game = await this.ensureDefinition();
     await this.rounds.assertGameAvailable('AYO', countryCode);
     const rules = (game.rulesJson ?? {}) as any;
@@ -207,7 +247,19 @@ export class AyoService implements OnModuleDestroy {
     const existing = await this.redis.get(`ayo:user-ticket:${userId}`).catch(() => null);
     if (existing) {
       const t = await this.readTicket(existing);
-      if (t?.status === 'WAITING') return { ...t, queueAhead: Math.max(0, (await this.readQueue()).filter(p => p.entryFee === t.entryFee && p.ticket !== t.ticket).length) };
+      if (t?.status === 'WAITING' && Number(t.entryFee) === entryFee) {
+        const queue = await this.readQueue();
+        // Ticket survived but its queue entry was lost (expired/overwritten): put it back, otherwise
+        // the player waits forever and neither a human nor the AI fill ever picks them up.
+        if (!queue.some(p => p.ticket === t.ticket)) {
+          await this.writeQueue([...queue.filter(p => p.userId !== userId), { userId, displayName, entryFee, ticket: t.ticket }]);
+        }
+        return { ...t, queueAhead: Math.max(0, queue.filter(p => p.entryFee === t.entryFee && p.ticket !== t.ticket).length) };
+      }
+      if (t?.status === 'WAITING') {
+        // Searching at a different fee now: drop the old search first.
+        await this.cancelQuick(userId, t.ticket).catch(() => undefined);
+      }
     }
     return this.withLock(`queue:${entryFee}`, async () => {
       const ticket = uuid();
@@ -241,11 +293,13 @@ export class AyoService implements OnModuleDestroy {
   }
 
   private async readQueue(): Promise<WaitingPlayer[]> {
-    const raw = await this.redis.get(QUEUE_KEY).catch(() => null);
+    const raw = await this.redis.get(QUEUE_KEY).catch(() => undefined);
+    if (raw === undefined) return this.localQueue.slice();
     return raw ? JSON.parse(raw) : [];
   }
 
   private async writeQueue(queue: WaitingPlayer[]) {
+    this.localQueue = queue.slice();
     await this.redis.set(QUEUE_KEY, JSON.stringify(queue), 'EX', 900).catch(() => undefined);
   }
 
@@ -295,8 +349,17 @@ export class AyoService implements OnModuleDestroy {
     await this.rounds.assertGameAvailable('AYO', countryCode);
     return this.withLock(`room:${roomCode.toUpperCase()}`, async () => {
       const room = await this.readRoom(roomCode);
-      if (!room) throw new NotFoundException('Ayo room not found');
-      if (room.players.some(p => p.userId === userId)) return { status: 'WAITING', ...room, players: room.players.length };
+      if (!room) {
+        // Room already started (or the code was typed for a running match): if this user is one
+        // of the seated players, hand them the live match instead of a confusing "not found".
+        const live = await this.findStateByRoom(roomCode);
+        if (live && live.status === 'ACTIVE' && live.players.some(p => p.userId === userId)) {
+          return { status: 'STARTED', matchId: live.matchId, roomCode: live.roomCode, players: 2, entryFee: live.entryFee, state: { ...live, serverNow: Date.now() } };
+        }
+        if (live) throw new BadRequestException('This Ayo match has already started');
+        throw new NotFoundException('Ayo room not found');
+      }
+      if (room.players.some(p => p.userId === userId)) return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, entryFee: room.entryFee };
       if (room.players.length >= 2) throw new BadRequestException('Ayo room is full');
       await this.requireBalance(userId, room.entryFee);
       room.players.push({ userId, displayName, entryFee: room.entryFee, ticket: uuid() });
@@ -310,21 +373,32 @@ export class AyoService implements OnModuleDestroy {
     if (!room) {
       const state = await this.findStateByRoom(roomCode);
       if (!state) throw new NotFoundException('Ayo room not found');
-      return { status: state.status, matchId: state.matchId, roomCode: state.roomCode, players: state.players.length, state };
+      // Clients poll this while waiting for an opponent and look for 'STARTED' — report a live
+      // match as STARTED (not the raw 'ACTIVE') so the room creator actually enters the game.
+      const status = state.status === 'ACTIVE' ? 'STARTED' : state.status;
+      return { status, matchId: state.matchId, roomCode: state.roomCode, players: state.players.length, entryFee: state.entryFee, state: { ...state, serverNow: Date.now() } };
     }
     if (!room.players.some(p => p.userId === userId)) throw new BadRequestException('You are not in this Ayo room');
     return { status: 'WAITING', matchId: room.matchId, roomCode: room.roomCode, players: room.players.length, entryFee: room.entryFee };
   }
 
   private async findStateByRoom(roomCode: string) {
+    const code = roomCode.toUpperCase();
+    const indexed = await this.redis.get(`${ROOM_MATCH_PREFIX}${code}`).catch(() => null);
+    if (indexed) {
+      const st = await this.readState(indexed);
+      if (st) return st;
+    }
+    for (const state of this.localStates.values()) if (state.roomCode === code) return state;
     const keys = await this.redis.keys(`${STATE_PREFIX}*`).catch(() => []);
     for (const key of keys) {
       const raw = await this.redis.get(key).catch(() => null);
       if (raw) {
         const state = JSON.parse(raw) as AyoState;
-        if (state.roomCode === roomCode) return state;
+        if (state.roomCode === code) return state;
       }
     }
+    for (const state of this.localStates.values()) if (state.roomCode === code) return state;
     return null;
   }
 
@@ -517,15 +591,33 @@ export class AyoService implements OnModuleDestroy {
     this.realtime.broadcastAyo(state.matchId, { ...state, serverNow: Date.now() });
   }
 
+  private async activeMatchIds(): Promise<string[]> {
+    if (!this.activeSetMigrated) {
+      // One-time: index matches that were already running before this version was deployed.
+      const keys = await this.redis.keys(`${STATE_PREFIX}*`).catch(() => null);
+      if (keys) {
+        for (const key of keys) {
+          const raw = await this.redis.get(key).catch(() => null);
+          if (!raw) continue;
+          const st = JSON.parse(raw) as AyoState;
+          if (st.status === 'ACTIVE') await this.redis.sadd(ACTIVE_SET, st.matchId).catch(() => undefined);
+        }
+        this.activeSetMigrated = true;
+      }
+    }
+    const ids = await this.redis.smembers(ACTIVE_SET).catch(() => null);
+    if (ids) return ids;
+    return [...this.localStates.values()].filter(s => s.status === 'ACTIVE').map(s => s.matchId);
+  }
+
   async tick() {
     await this.processAyoWaiting().catch(() => undefined);
-    const keys = await this.redis.keys(`${STATE_PREFIX}*`).catch(() => []);
-    for (const key of keys) {
-      const raw = await this.redis.get(key).catch(() => null);
-      if (!raw) continue;
-      const state = JSON.parse(raw) as AyoState;
-      if (state.status !== 'ACTIVE') continue;
-      await this.withLock(`tick:${state.matchId}`, async () => {
+    const ids = await this.activeMatchIds();
+    for (const id of ids) {
+      const state = await this.readState(id);
+      if (!state) { await this.redis.srem(ACTIVE_SET, id).catch(() => undefined); continue; }
+      if (state.status !== 'ACTIVE') { await this.redis.srem(ACTIVE_SET, id).catch(() => undefined); continue; }
+      await this.withLock(`match:${state.matchId}`, async () => {
         const fresh = await this.readState(state.matchId);
         if (!fresh || fresh.status !== 'ACTIVE') return;
         const current = fresh.players[fresh.currentSeat];
@@ -621,6 +713,7 @@ export class AyoService implements OnModuleDestroy {
     }
     const code = await this.redis.get(`ayo:party:${roomId}`).catch(() => null);
     if (!code) throw new NotFoundException('The Party Room has not started Ayo');
+    // joinRoom also handles "already started and you are a player" by returning the live state.
     return this.joinRoom(userId, displayName, code, countryCode);
   }
 
@@ -726,11 +819,21 @@ export class AyoService implements OnModuleDestroy {
           });
         }
         if (now - createdAt >= QUICK_AI_FILL_AFTER_MS) {
-          const room: AyoRoom = { matchId: item.matchId ?? uuid(), roomCode: this.makeRoomCode(), entryFee: item.entryFee, players: [item], createdAt, partyRoomId: item.partyRoomId };
-          const state = await this.startAyoWithAi(room);
-          await this.writeTicket({ ...ticket, status: 'STARTED', matchId: state.matchId, roomCode: state.roomCode, players: 2, state });
-          await this.redis.del(`ayo:user-ticket:${item.userId}`).catch(() => undefined);
-          continue;
+          // Same lock as quickMatch(): a real player joining at this exact second can't also
+          // start a match with this player (that used to double-start and double-charge).
+          const started = await this.withLock(`queue:${item.entryFee}`, async () => {
+            const fresh = await this.readTicket(item.ticket);
+            if (!fresh || fresh.status !== 'WAITING') return true; // a human got them first
+            const stillQueued = (await this.readQueue()).some(p => p.ticket === item.ticket);
+            if (!stillQueued) return true;
+            const room: AyoRoom = { matchId: item.matchId ?? uuid(), roomCode: this.makeRoomCode(), entryFee: item.entryFee, players: [item], createdAt, partyRoomId: item.partyRoomId };
+            const state = await this.startAyoWithAi(room);
+            await this.writeTicket({ ...fresh, status: 'STARTED', matchId: state.matchId, roomCode: state.roomCode, players: 2, state });
+            await this.redis.del(`ayo:user-ticket:${item.userId}`).catch(() => undefined);
+            await this.writeQueue((await this.readQueue()).filter(p => p.ticket !== item.ticket));
+            return true;
+          }).catch(e => { if (e instanceof BadRequestException && /busy/i.test(e.message)) return false; throw e; });
+          if (started) continue;
         }
         keep.push(item);
       } catch (e) {
@@ -746,7 +849,9 @@ export class AyoService implements OnModuleDestroy {
         }
       }
     }
-    await this.writeQueue(keep);
+    // Merge rather than overwrite: players may have joined/left the queue while we were working.
+    const removed = new Set(queue.filter(q => !keep.some(k => k.ticket === q.ticket)).map(q => q.ticket));
+    if (removed.size) await this.writeQueue((await this.readQueue()).filter(p => !removed.has(p.ticket)));
 
     let codes: string[] = [];
     try { codes = await this.redis.zrangebyscore(PARTY_LOBBY_INDEX, 0, now); } catch { return; }
