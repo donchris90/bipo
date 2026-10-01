@@ -33,6 +33,38 @@ describe('Ayo house rules', () => {
     expect(r.events.some(e => e.t === 'pack' && e.pit === 1 && e.seat === 0)).toBe(true);
   });
 
+  it('mid-sow 4 on the opponent side goes to the opponent', () => {
+    // seat 0 sows 2 seeds from pit 5: pit 6 (opp, 3 -> 4) mid-sow -> opponent packs; pit 7 empty -> stop
+    const board = [0, 0, 0, 0, 0, 2, 3, 0, 1, 1, 1, 1];
+    const r = simulateSow(board, 5, 0);
+    expect(r.packedBy).toEqual([0, 4]);
+    expect(r.packed).toBe(0);
+    expect(r.lastReceiver).toBe(1);
+    expect(r.events.some(e => e.t === 'pack' && e.pit === 6 && e.seat === 1)).toBe(true);
+  });
+
+  it('last seed making 4 on the opponent side goes to the sower', () => {
+    // seat 0 sows 1 seed from pit 5 into pit 6 (3 -> 4) as the LAST seed -> seat 0 packs
+    const board = [0, 0, 0, 0, 0, 1, 3, 0, 1, 1, 1, 1];
+    const r = simulateSow(board, 5, 0);
+    expect(r.packedBy).toEqual([4, 0]);
+    expect(r.lastReceiver).toBe(0);
+  });
+
+  it('mid-sow 4 on my own side is mine', () => {
+    // seat 0 sows 2 from pit 0: pit 1 (3 -> 4) mid-sow, own side -> seat 0; pit 2 empty -> stop
+    const board = [2, 3, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1];
+    expect(simulateSow(board, 0, 0).packedBy).toEqual([4, 0]);
+  });
+
+  it('a 4 received from the opponent sowing counts for the final-four rule', () => {
+    // seat 0 plays pit 5 (2 seeds): pit 6 -> 4 mid-sow for seat 1, pit 7 empty. 4 seeds left -> seat 1 gets them.
+    const s = normalizeAyoState({ ...fresh(), board: [0, 0, 0, 0, 0, 2, 3, 0, 1, 1, 1, 0], captured: [20, 20] as [number, number], lastPacker: 0 as const });
+    const { state } = applyAyoMove(s, 5);
+    expect(state.lastRound?.packed).toEqual([20, 28]);
+    expect(state.lastRound?.finalFourTo).toBe(1);
+  });
+
   it('every move terminates and conserves seeds', () => {
     for (let p = 0; p < 6; p++) {
       const r = simulateSow(initialAyoBoard(), p);

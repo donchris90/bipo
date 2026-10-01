@@ -6,11 +6,12 @@
  *    the whole board.
  *  - Relay: if the last seed lands in a pit that already had seeds, pick them all up and keep
  *    sowing. The turn ends when the last seed lands in an EMPTY pit.
- *  - Packing: whenever ANY pit (either side) reaches exactly 4 during your move, you pack those 4.
- *    If your last seed makes a pit 4, you pack it and your turn ends.
+ *  - Packing while sowing: when a pit reaches exactly 4 in the middle of your move, those 4 go to
+ *    the pit's OWNER — on your side you pack them, on your opponent's side THEY pack them.
+ *  - Last seed: if your last seed makes a pit 4 (on either side) YOU pack it and your turn ends.
  *  - A player whose pits are all empty skips their turn.
- *  - When only the last 4 seeds remain on the board, they go to the player who packed the 4
- *    before them, and the round ends. (Also when the board is empty.)
+ *  - When only the last 4 seeds remain on the board, they go to the player who received the 4
+ *    before them (whether they packed it by sowing or it was packed for them on their side), and the round ends. (Also when the board is empty.)
  *  - Next round: each player fills pits with 4 seeds from what they packed — 28 seeds = 7 pits,
  *    the opponent then has 5. Totals are always multiples of 4. Rounds alternate who starts
  *    (A starts round 1, B round 2, A round 3, ...).
@@ -31,7 +32,7 @@ export type AyoRoundResult = { round: number; packed: [number, number]; pits: [n
 export type AyoMoveEvent =
   | { t: 'pick'; pit: number; count: number }   // seeds lifted from a pit (start or relay)
   | { t: 'drop'; pit: number }                  // one seed dropped into a pit
-  | { t: 'pack'; pit: number; seat: 0 | 1 }     // a pit reached 4 and was packed by the sower
+  | { t: 'pack'; pit: number; seat: 0 | 1 }     // a pit reached 4; `seat` is who receives it
   | { t: 'final'; seat: 0 | 1; seeds: number }  // last seeds of the round go to the previous packer
   | { t: 'round'; round: number };              // a new round was set up (board refilled)
 
@@ -139,14 +140,16 @@ export function pitCount(owners: (0 | 1)[], seat: 0 | 1) {
 }
 
 /** Pure sowing of one move. Never loops forever (MAX_SOW_STEPS). */
-export function simulateSow(input: number[], pit: number, seat: 0 | 1 = 0) {
+export function simulateSow(input: number[], pit: number, seat: 0 | 1 = 0, owners: (0 | 1)[] = defaultOwners()) {
   const board = input.slice();
   if (board.length !== PITS) throw new Error('Ayo board must have 12 pits');
   if (!Number.isInteger(pit) || pit < 0 || pit >= PITS || board[pit] <= 0) throw new Error('Choose one of your pits that has seeds');
   let hand = board[pit];
   board[pit] = 0;
   let cur = pit;
-  let packed = 0;
+  let packed = 0; // seeds the SOWER received this move
+  const packedBy: [number, number] = [0, 0];
+  let lastReceiver: 0 | 1 | null = null;
   const path: number[] = [];
   const packedAt: number[] = [];
   const events: AyoMoveEvent[] = [{ t: 'pick', pit, count: hand }];
@@ -159,10 +162,14 @@ export function simulateSow(input: number[], pit: number, seat: 0 | 1 = 0) {
     path.push(cur);
     events.push({ t: 'drop', pit: cur });
     if (board[cur] === 4) {
+      // Last seed -> the sower takes it (even on the opponent's side). Mid-sow -> the pit's owner.
+      const to: 0 | 1 = hand === 0 ? seat : owners[cur];
       board[cur] = 0;
-      packed += 4;
+      packedBy[to] += 4;
+      if (to === seat) packed += 4;
+      lastReceiver = to;
       packedAt.push(cur);
-      events.push({ t: 'pack', pit: cur, seat });
+      events.push({ t: 'pack', pit: cur, seat: to });
       continue; // a packed last seed leaves an empty pit -> turn ends
     }
     if (hand === 0 && board[cur] > 1) {
@@ -176,7 +183,7 @@ export function simulateSow(input: number[], pit: number, seat: 0 | 1 = 0) {
       hand = 0;
     }
   }
-  return { board, packed, path, packedAt, events };
+  return { board, packed, packedBy, lastReceiver, path, packedAt, events };
 }
 
 function boardTotal(board: number[]) {
@@ -249,11 +256,12 @@ export function applyAyoMove(input: AyoState, pit: number, now = Date.now()): { 
   const before = st.board.slice();
   const ownersBefore = st.owners.slice();
   const capturedBefore: [number, number] = [st.captured[0], st.captured[1]];
-  const r = simulateSow(st.board, pit, seat);
+  const r = simulateSow(st.board, pit, seat, st.owners);
   const events = r.events;
   st.board = r.board;
-  st.captured[seat] += r.packed;
-  if (r.packed > 0) st.lastPacker = seat;
+  st.captured[0] += r.packedBy[0];
+  st.captured[1] += r.packedBy[1];
+  if (r.lastReceiver !== null) st.lastPacker = r.lastReceiver;
   st.roundTurns += 1;
   st.turnNumber += 1;
 
@@ -292,9 +300,11 @@ export function chooseBotPit(state: AyoState, rand: (n: number) => number): numb
   const st = normalizeAyoState(state);
   const pits = legalPits(st.board, st.currentSeat, st.owners);
   if (!pits.length) return null;
-  const scored = pits.map(p => ({ p, gain: simulateSow(st.board, p, st.currentSeat).packed }));
+  const opp: 0 | 1 = st.currentSeat === 0 ? 1 : 0;
+  // Net gain: what I pack minus what my sowing hands to my opponent.
+  const scored = pits.map(p => { const r = simulateSow(st.board, p, st.currentSeat, st.owners); return { p, gain: r.packedBy[st.currentSeat] - r.packedBy[opp] }; });
   const best = Math.max(...scored.map(s => s.gain));
-  const pool = best > 0 && rand(100) < 75 ? scored.filter(s => s.gain === best) : scored;
+  const pool = rand(100) < 75 ? scored.filter(s => s.gain === best) : scored;
   return pool[rand(pool.length)].p;
 }
 
