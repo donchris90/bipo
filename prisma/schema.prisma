@@ -698,6 +698,54 @@ model UserReport {
   @@index([reporterId, createdAt])
 }
 
+model ModerationRule {
+  id          String   @id @default(uuid())
+  phrase      String
+  category    String
+  severity    Int      @default(1)
+  action      String   @default("BLOCK")
+  active      Boolean  @default(true)
+  enforceInPrivate Boolean @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([active, category])
+}
+
+model ModerationViolation {
+  id            String      @id @default(uuid())
+  userId        String
+  context       ChatContext
+  contextId     String
+  category      String
+  severity      Int
+  action        String
+  matchedRuleId String?
+  createdAt     DateTime    @default(now())
+
+  @@index([userId, createdAt])
+  @@index([context, contextId, createdAt])
+}
+
+model ModerationMediaEvent {
+  id             String   @id @default(uuid())
+  context        ChatContext
+  contextId      String
+  subjectUserId  String
+  source         String   // AUDIO_TRANSCRIPT | VIDEO_FRAME | VIDEO_STREAM
+  category       String
+  severity       Int      @default(1)
+  confidence     Float?
+  action         String   @default("FLAG")
+  provider       String?
+  providerEventId String?
+  createdAt      DateTime @default(now())
+
+  @@index([context, contextId, createdAt])
+  @@index([subjectUserId, createdAt])
+  @@index([category, createdAt])
+}
+
 model ModerationAction {
   id           String               @id @default(uuid())
   actorId      String

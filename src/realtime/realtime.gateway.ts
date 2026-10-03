@@ -7,6 +7,7 @@ import {
   OnGatewayConnection,
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
+import { Inject, forwardRef } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -52,7 +53,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
     private readonly prisma: PrismaService,
-    private readonly moderation: ModerationService,
+    @Inject(forwardRef(() => ModerationService)) private readonly moderation: ModerationService,
   ) {}
 
   async handleConnection(client: AuthedSocket) {
@@ -234,6 +235,15 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   // keeps GiftService itself transport-agnostic.
   broadcastGift(context: ChatContext, contextId: string, payload: unknown) {
     this.server.to(`${context}:${contextId}`).emit('gift:sent', payload);
+  }
+
+  // Server-authoritative moderation signal for Live/Party media. The target
+  // client uses this to mute/disable its local microphone/camera, while the
+  // persisted moderation action remains the source of truth for reconnects.
+  broadcastMediaModeration(context: ChatContext, contextId: string, payload: unknown) {
+    this.server.to(`${context}:${contextId}`).emit('media:moderation', payload);
+    const targetUserId = (payload as { targetUserId?: string })?.targetUserId;
+    if (targetUserId) this.server.to(`user:${targetUserId}`).emit('media:moderation', payload);
   }
 
   // Sent to everyone in the live session's socket room (clients enter it

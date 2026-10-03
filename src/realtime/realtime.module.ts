@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { RealtimeGateway } from './realtime.gateway';
@@ -7,7 +7,7 @@ import { ModerationModule } from '../moderation/moderation.module';
 @Module({
   imports: [
     ConfigModule,
-    ModerationModule,
+    forwardRef(() => ModerationModule),
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
