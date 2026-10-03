@@ -6,7 +6,7 @@ describe('SocialService.getStats', () => {
     const pKBattle = {
       count: jest.fn().mockImplementation(({ where }: any) => Promise.resolve(where.winnerId === 'u1' ? counts.pkWin : counts.pkLoss)),
     };
-    return { svc: new SocialService({ follow, pKBattle } as any, {} as any, {} as any), pKBattle };
+    return { svc: new (SocialService as any)({ follow, pKBattle } as any, {} as any, {} as any, { addXp: jest.fn() }, { contributeXp: jest.fn() }, { contributePoints: jest.fn() }), pKBattle };
   };
 
   it('reports followers, following, wins and losses', async () => {

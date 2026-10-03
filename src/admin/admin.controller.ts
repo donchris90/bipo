@@ -37,8 +37,14 @@ export class AdminController {
 
   @Put('users/:id/coins')
   @Roles(...FINANCE)
-  grantCoins(@Param('id') id: string, @Body() body: Record<string, unknown>) {
-    return this.admin.grantCoins(id, body);
+  grantCoins(@Param('id') id: string, @Body() body: Record<string, unknown>, @Req() req: AuthedRequest) {
+    return this.admin.grantCoins(id, body, req.user.userId);
+  }
+
+  @Get('platform-economics')
+  @Roles(...FINANCE)
+  platformEconomics(@Query('days') days?: string) {
+    return this.admin.platformEconomics(days ? Number(days) : 30);
   }
 
   @Get('users')

@@ -162,7 +162,7 @@ export class SettlementService {
             tx,
           );
         }
-        await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'REFUNDED', rewardAmount: 0, netAmount: -entry.coinAmount } });
+        await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'REFUNDED', rewardAmount: 0, netAmount: 0 } });
       }, EXTENDED_TX_OPTIONS);
       refunded++;
     }

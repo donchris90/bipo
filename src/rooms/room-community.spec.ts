@@ -84,7 +84,7 @@ function build(hostId = 'host1') {
   const audit: any = { record: jest.fn().mockResolvedValue(undefined) };
   const hostLevels: any = { awardRule: jest.fn().mockResolvedValue(undefined) };
 
-  return { svc: new RoomCommunityService(prisma, notifications, audit, hostLevels), members, notifications, hostLevels };
+  return { svc: new (RoomCommunityService as any)(prisma, notifications, audit, hostLevels), members, notifications, hostLevels };
 }
 
 describe('RoomCommunityService.roomLevelSummary', () => {
@@ -187,8 +187,8 @@ describe('RoomCommunityService.listAchievementsForHost', () => {
     await svc.recordVisit('room1', 'viewer1'); // earns FIRST_VISIT
     const list = await svc.listAchievementsForHost('host1', 'viewer1');
     expect(list).toHaveLength(4);
-    expect(list.find((a) => a.key === 'FIRST_VISIT')).toMatchObject({ earned: true });
-    expect(list.find((a) => a.key === 'WEEK_STREAK')).toMatchObject({ earned: false });
+    expect(list.find((a: any) => a.key === 'FIRST_VISIT')).toMatchObject({ earned: true });
+    expect(list.find((a: any) => a.key === 'WEEK_STREAK')).toMatchObject({ earned: false });
   });
 
   it('returns an empty list for an unknown host rather than throwing', async () => {

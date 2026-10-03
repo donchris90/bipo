@@ -54,6 +54,9 @@ export class WalletService {
   // GameEntry.create() after a successful debit.
   async credit(mv: Omit<LedgerMovement, 'amount'> & { amount: bigint }, tx?: Prisma.TransactionClient) {
     if (mv.amount <= 0n) throw new BadRequestException('Credit amount must be positive');
+    if (mv.ledgerType === LedgerEntryType.BONUS && mv.walletType !== WalletType.BONUS) {
+      throw new BadRequestException('BONUS rewards must be credited to the BONUS wallet');
+    }
     return this.applyMovement({ ...mv, amount: mv.amount }, false, tx);
   }
 

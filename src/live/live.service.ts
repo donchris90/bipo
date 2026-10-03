@@ -24,6 +24,15 @@ import { HostLevelsService } from '../host-levels/host-levels.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { SeasonsService } from '../seasons/seasons.service';
 import { announceToFollowersAndAgency } from '../common/friend-announce';
+import {
+  PRIVATE_ACCEPT_WINDOW_MS,
+  PRIVATE_HOST_SHARE_BPS,
+  PRIVATE_JOIN_WINDOW_MS,
+  PRIVATE_LIVE_UNLOCK,
+  PRIVATE_RATE_LIMITS,
+  settleBlock,
+  validateRateCard,
+} from './private-live.pricing';
 
 export const RTC_PROVIDER = 'RTC_PROVIDER';
 
@@ -82,8 +91,6 @@ export class LiveService {
     coverUrl?: string,
     dailyTargetCoins?: number,
     privacy: 'PUBLIC' | 'PRIVATE' = 'PUBLIC',
-    privatePriceCoins?: number,
-    privateDurationMinutes?: number,
   ) {
     if (await this.featureFlags.isEnabled('DISABLE_LIVE')) {
       throw new ForbiddenException('Live streaming is temporarily disabled');
@@ -106,20 +113,13 @@ export class LiveService {
     }
 
     const normalizedPrivacy = privacy === 'PRIVATE' ? 'PRIVATE' : 'PUBLIC';
-    let normalizedPrivatePrice: number | null = null;
-    let normalizedPrivateDuration: number | null = null;
     if (normalizedPrivacy === 'PRIVATE') {
-      if (this.hostLevels) await this.hostLevels.assertUnlock(hostId, 'ONE_ON_ONE_VIDEO');
+      if (this.hostLevels) await this.hostLevels.assertUnlock(hostId, PRIVATE_LIVE_UNLOCK, 'private 1-on-1 live');
       const host = await this.prisma.user.findUnique({ where: { id: hostId }, select: { oneOnOneEnabled: true } });
       if (!host?.oneOnOneEnabled) throw new ForbiddenException('Enable 1-on-1 availability in your profile before starting a private live');
-      normalizedPrivatePrice = Math.round(Number(privatePriceCoins));
-      normalizedPrivateDuration = Math.round(Number(privateDurationMinutes)) * 60;
-      if (!Number.isInteger(normalizedPrivatePrice) || normalizedPrivatePrice < 1 || normalizedPrivatePrice > 10_000_000) {
-        throw new BadRequestException('Private live price must be between 1 and 10,000,000 coins');
-      }
-      if (!Number.isInteger(normalizedPrivateDuration) || normalizedPrivateDuration < 60 || normalizedPrivateDuration > 2 * 60 * 60) {
-        throw new BadRequestException('Private live duration must be between 1 and 120 minutes');
-      }
+      // Prices come from the host's saved rate card, not from this request.
+      const packageCount = await this.prisma.privateRatePackage.count({ where: { hostId } });
+      if (packageCount === 0) throw new BadRequestException('Set up your private session rates before going live in private');
     }
 
     const { channelName } = await this.rtc.createChannel(sessionId);
@@ -138,8 +138,6 @@ export class LiveService {
         dailyTargetCoins: normalizedDailyTarget,
         coverUrl: LiveService.cleanCoverUrl(coverUrl),
         privacy: normalizedPrivacy,
-        privatePriceCoins: normalizedPrivatePrice,
-        privateDurationSeconds: normalizedPrivateDuration,
         providerChannel: channelName,
         status: 'LIVE',
         startedAt: new Date(),
@@ -181,14 +179,18 @@ export class LiveService {
       if (!request) throw new ForbiddenException('This is a paid private live. Request access and wait for the host to accept you.');
 
       if (request.endsAt && request.endsAt.getTime() <= Date.now()) {
-        await this.completePrivateRequest(request.id);
         await this.finish(session);
         throw new ForbiddenException('The paid private session has ended');
       }
 
+      if (request.status === 'ACCEPTED' && request.acceptedAt && Date.now() - request.acceptedAt.getTime() > PRIVATE_JOIN_WINDOW_MS) {
+        await this.refundPrivateRequest(request.id, request.viewerId, request.priceCoins, 'Viewer did not join in time', 'EXPIRED');
+        throw new ForbiddenException('You took too long to join. Your coins were refunded.');
+      }
+
       rtcRole = 'publisher'; // private 1-on-1 viewer must be able to publish video/audio
       if (request.status === 'ACCEPTED') {
-        await this.startAndSettlePrivateRequest(request.id, session);
+        await this.startPrivateRequest(request.id, session);
       }
     }
 
@@ -236,16 +238,71 @@ export class LiveService {
   }
 
 
-  async requestPrivateAccess(sessionId: string, viewerId: string) {
+  // ── Private session rates (the host's saved rate card) ──────────────────────
+
+  private async hostIsLive(hostId: string): Promise<boolean> {
+    const live = await this.prisma.liveSession.findFirst({
+      where: { hostId, status: { in: ['SCHEDULED', 'LIVE'] } },
+      select: { id: true },
+    });
+    return !!live;
+  }
+
+  async getMyRateCard(hostId: string) {
+    const [packages, live] = await Promise.all([
+      this.prisma.privateRatePackage.findMany({
+        where: { hostId },
+        orderBy: { minutes: 'asc' },
+        select: { id: true, minutes: true, priceCoins: true, description: true },
+      }),
+      this.hostIsLive(hostId),
+    ]);
+    return { packages, editable: !live, hostShareBps: PRIVATE_HOST_SHARE_BPS, limits: PRIVATE_RATE_LIMITS };
+  }
+
+  // What a viewer sees on the join sheet and on the host's profile.
+  async getHostRateCard(hostId: string) {
+    const packages = await this.prisma.privateRatePackage.findMany({
+      where: { hostId },
+      orderBy: { minutes: 'asc' },
+      select: { id: true, minutes: true, priceCoins: true, description: true },
+    });
+    return { hostId, packages };
+  }
+
+  // Replaces the host's whole card. Only allowed while the host is not live, so a viewer can never
+  // see a price change in the middle of a session.
+  async saveMyRateCard(hostId: string, input: unknown) {
+    if (await this.hostIsLive(hostId)) {
+      throw new ForbiddenException('You can only edit your private session rates when you are not live.');
+    }
+    if (this.hostLevels) await this.hostLevels.assertUnlock(hostId, PRIVATE_LIVE_UNLOCK, 'private 1-on-1 live');
+    const result = validateRateCard(input);
+    if (!result.ok) throw new BadRequestException(result.error);
+    await this.prisma.$transaction([
+      this.prisma.privateRatePackage.deleteMany({ where: { hostId } }),
+      ...result.packages.map((p) =>
+        this.prisma.privateRatePackage.create({ data: { hostId, minutes: p.minutes, priceCoins: p.priceCoins, description: p.description } }),
+      ),
+    ]);
+    return this.getMyRateCard(hostId);
+  }
+
+  // ── Paid private 1-on-1 live ────────────────────────────────────────────────
+  // Lifecycle of one purchase (PrivateLiveRequest):
+  //   PENDING  viewer paid the package price in full; host has 45s to accept
+  //   ACCEPTED host said yes; the viewer has 60s to join (otherwise refunded, slot reopens)
+  //   ACTIVE   viewer joined, the clock is running (renewals add more ACTIVE blocks)
+  //   COMPLETED settled when the session is over: host paid 60% of what was delivered
+  //   DECLINED / EXPIRED / REFUNDED  never started, viewer got everything back
+
+  async requestPrivateAccess(sessionId: string, viewerId: string, packageId?: string) {
     const session = await this.prisma.liveSession.findUnique({ where: { id: sessionId } });
     if (!session || session.status !== 'LIVE') throw new NotFoundException('Live session not found or not active');
     if (session.privacy !== 'PRIVATE') throw new BadRequestException('This live is not private');
     if (session.hostId === viewerId) throw new BadRequestException('The host cannot request their own private live');
     const host = await this.prisma.user.findUnique({ where: { id: session.hostId }, select: { oneOnOneEnabled: true } });
     if (!host?.oneOnOneEnabled) throw new ForbiddenException('This host is not currently accepting 1-on-1 requests');
-    if (!session.privatePriceCoins || !session.privateDurationSeconds) {
-      throw new BadRequestException('Private live pricing is not configured');
-    }
 
     const existing = await this.prisma.privateLiveRequest.findFirst({
       where: { sessionId, viewerId, status: { in: ['PENDING', 'ACCEPTED', 'ACTIVE'] } },
@@ -253,12 +310,23 @@ export class LiveService {
     });
     if (existing) return existing;
 
+    // Someone else is already in (or about to join) this private session. Say so before charging.
+    const occupied = await this.prisma.privateLiveRequest.findFirst({
+      where: { sessionId, viewerId: { not: viewerId }, status: { in: ['ACCEPTED', 'ACTIVE'] } },
+      select: { id: true },
+    });
+    if (occupied) throw new BadRequestException('The host is in a private session right now. Try again when it ends.');
+
+    if (!packageId) throw new BadRequestException('Choose a package first');
+    const pkg = await this.prisma.privateRatePackage.findFirst({ where: { id: packageId, hostId: session.hostId } });
+    if (!pkg) throw new BadRequestException('That package is no longer available. Please pick again.');
+
     const requestId = uuid();
     await this.prisma.$transaction(async (tx) => {
       await this.wallet.debit({
         userId: viewerId,
         walletType: WalletType.COIN,
-        amount: BigInt(session.privatePriceCoins!),
+        amount: BigInt(pkg.priceCoins),
         ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT,
         reference: requestId,
         idempotencyKey: `private_live_debit:${requestId}`,
@@ -269,14 +337,80 @@ export class LiveService {
           id: requestId,
           sessionId,
           viewerId,
-          priceCoins: session.privatePriceCoins!,
-          durationSeconds: session.privateDurationSeconds!,
+          // Price and length are copied onto the request: this is exactly what was charged.
+          priceCoins: pkg.priceCoins,
+          durationSeconds: pkg.minutes * 60,
+          packageId: pkg.id,
           status: 'PENDING',
         },
       });
     });
 
     return this.getPrivateRequest(requestId, viewerId);
+  }
+
+  // Viewer buys another block from the host's rate card while the session is running. The new
+  // time is added to the END of the current time, so nobody is kicked out and nothing is lost.
+  async renewPrivateSession(sessionId: string, viewerId: string, packageId?: string) {
+    if (!packageId) throw new BadRequestException('Choose a package first');
+    return this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT "id" FROM "LiveSession" WHERE "id" = ${sessionId} FOR UPDATE
+      `;
+      if (!locked[0]) throw new NotFoundException('Live session not found');
+      const session = await tx.liveSession.findUniqueOrThrow({ where: { id: sessionId } });
+      if (session.status !== 'LIVE' || session.privacy !== 'PRIVATE') {
+        throw new BadRequestException('This private session is no longer running');
+      }
+
+      const current = await tx.privateLiveRequest.findFirst({
+        where: { sessionId, viewerId, status: 'ACTIVE' },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (!current || !current.endsAt) throw new ForbiddenException('You do not have a running private session to extend');
+
+      const now = Date.now();
+      const endsAtMs = current.endsAt.getTime();
+      if (endsAtMs <= now) throw new BadRequestException('Your time has run out. The session is over.');
+
+      const pkg = await tx.privateRatePackage.findFirst({ where: { id: packageId, hostId: session.hostId } });
+      if (!pkg) throw new BadRequestException('That package is no longer available. Please pick again.');
+
+      const remainingSeconds = Math.ceil((endsAtMs - now) / 1000);
+      if (remainingSeconds + pkg.minutes * 60 > PRIVATE_RATE_LIMITS.maxSessionMinutes * 60) {
+        throw new BadRequestException(`A session can last at most ${PRIVATE_RATE_LIMITS.maxSessionMinutes / 60} hours`);
+      }
+
+      const requestId = uuid();
+      const newEndsAt = new Date(endsAtMs + pkg.minutes * 60_000);
+      await this.wallet.debit({
+        userId: viewerId,
+        walletType: WalletType.COIN,
+        amount: BigInt(pkg.priceCoins),
+        ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT,
+        reference: requestId,
+        idempotencyKey: `private_live_debit:${requestId}`,
+      }, tx);
+
+      const block = await tx.privateLiveRequest.create({
+        data: {
+          id: requestId,
+          sessionId,
+          viewerId,
+          priceCoins: pkg.priceCoins,
+          durationSeconds: pkg.minutes * 60,
+          packageId: pkg.id,
+          parentRequestId: current.parentRequestId ?? current.id,
+          status: 'ACTIVE',
+          acceptedAt: new Date(now),
+          startedAt: new Date(now),
+          blockStartsAt: current.endsAt,
+          endsAt: newEndsAt,
+        },
+      });
+      await tx.liveSession.update({ where: { id: sessionId }, data: { privateEndsAt: newEndsAt } });
+      return block;
+    });
   }
 
   async getPrivateRequest(requestId: string, actorId: string) {
@@ -324,6 +458,9 @@ export class LiveService {
       if (request.session.status !== 'LIVE') throw new BadRequestException('This live session is no longer active');
       if (request.session.privacy !== 'PRIVATE') throw new BadRequestException('This live is not private');
       if (request.status !== 'PENDING') throw new BadRequestException('This request is no longer pending');
+      if (Date.now() - request.createdAt.getTime() > PRIVATE_ACCEPT_WINDOW_MS) {
+        throw new BadRequestException('This request has expired and the viewer is being refunded');
+      }
 
       const occupied = await tx.privateLiveRequest.findFirst({
         where: {
@@ -352,68 +489,51 @@ export class LiveService {
       throw new BadRequestException('This request can no longer be declined');
     }
 
-    return this.refundPrivateRequest(request.id, request.viewerId, request.priceCoins, 'Host declined private live request');
+    return this.refundPrivateRequest(request.id, request.viewerId, request.priceCoins, 'Host declined private live request', 'DECLINED');
   }
 
-  private async startAndSettlePrivateRequest(requestId: string, session: any) {
+  // The viewer joined: the clock starts now. Nothing is paid out here; the host is paid when the
+  // session is over (settlePrivateBlocks).
+  private async startPrivateRequest(requestId: string, session: { id: string }) {
     const request = await this.prisma.privateLiveRequest.findUnique({ where: { id: requestId } });
     if (!request) throw new NotFoundException('Private live request not found');
     if (request.status === 'ACTIVE') return request;
     if (request.status !== 'ACCEPTED') throw new ForbiddenException('Private access has not been accepted');
 
-    const split = await this.revenueSplit.resolve(session.countryCode);
-    const creatorShare = Math.floor((request.priceCoins * split.creatorShareBps) / 10000);
-    const platformShare = request.priceCoins - creatorShare;
     const now = new Date();
     const endsAt = new Date(now.getTime() + request.durationSeconds * 1000);
 
     return this.prisma.$transaction(async (tx) => {
       const updated = await tx.privateLiveRequest.updateMany({
         where: { id: requestId, status: 'ACCEPTED' },
-        data: { status: 'ACTIVE', startedAt: now, endsAt, settledAt: now },
+        data: { status: 'ACTIVE', startedAt: now, blockStartsAt: now, endsAt },
       });
-      if (updated.count === 0) {
-        return tx.privateLiveRequest.findUniqueOrThrow({ where: { id: requestId } });
+      if (updated.count > 0) {
+        await tx.liveSession.update({
+          where: { id: session.id },
+          data: { privateStartedAt: now, privateEndsAt: endsAt },
+        });
       }
-
-      if (creatorShare > 0) {
-        await this.wallet.credit({
-          userId: session.hostId,
-          walletType: WalletType.CREATOR_EARNINGS,
-          amount: BigInt(creatorShare),
-          ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT,
-          reference: requestId,
-          idempotencyKey: `private_live_creator:${requestId}`,
-        }, tx);
-      }
-      if (platformShare > 0) {
-        await this.wallet.recordPlatformEntry({
-          ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT,
-          amount: BigInt(platformShare),
-          reference: requestId,
-          idempotencyKey: `private_live_platform:${requestId}`,
-        }, tx);
-      }
-
-      await tx.liveSession.update({
-        where: { id: session.id },
-        data: { privateStartedAt: now, privateEndsAt: endsAt },
-      });
-
       return tx.privateLiveRequest.findUniqueOrThrow({ where: { id: requestId } });
-    }).then(async (result) => {
-      if (this.hostLevels && result.status === 'ACTIVE') {
-        try { await this.hostLevels.awardRule(session.hostId, 'PRIVATE_MINUTE', Math.floor(result.durationSeconds / 60)); } catch { /* progression must never block private billing */ }
-      }
-      return result;
     });
   }
 
-  private async refundPrivateRequest(requestId: string, viewerId: string, priceCoins: number, reason: string) {
+  // Gives the viewer everything back for a request that never became a running session.
+  // Atomic: the status claim and the refund happen in one transaction, and only once.
+  private async refundPrivateRequest(
+    requestId: string,
+    viewerId: string,
+    priceCoins: number,
+    reason: string,
+    finalStatus: 'REFUNDED' | 'DECLINED' | 'EXPIRED' = 'REFUNDED',
+  ) {
     const now = new Date();
     return this.prisma.$transaction(async (tx) => {
-      const current = await tx.privateLiveRequest.findUnique({ where: { id: requestId } });
-      if (!current || ['REFUNDED', 'COMPLETED'].includes(current.status)) return current;
+      const claimed = await tx.privateLiveRequest.updateMany({
+        where: { id: requestId, status: { in: ['PENDING', 'ACCEPTED'] } },
+        data: { status: finalStatus, refundedAt: now, refundedCoins: priceCoins, settleReason: reason },
+      });
+      if (claimed.count === 0) return tx.privateLiveRequest.findUnique({ where: { id: requestId } });
       await this.wallet.credit({
         userId: viewerId,
         walletType: WalletType.COIN,
@@ -422,34 +542,110 @@ export class LiveService {
         reference: requestId,
         idempotencyKey: `private_live_refund:${requestId}`,
       }, tx);
-      return tx.privateLiveRequest.update({
-        where: { id: requestId },
-        data: { status: 'REFUNDED', refundedAt: now },
-      });
+      return tx.privateLiveRequest.findUnique({ where: { id: requestId } });
     });
   }
 
-  private async completePrivateRequest(requestId: string) {
-    return this.prisma.privateLiveRequest.updateMany({
-      where: { id: requestId, status: { in: ['ACCEPTED', 'ACTIVE'] } },
-      data: { status: 'COMPLETED' },
+  // Runs when a private session is over. Pays the host and refunds unused time, block by block:
+  //  - viewer ended it  -> no refund; the host is paid for every purchased block in full
+  //  - host ended it / dropped / time ran out -> unused minutes are refunded at each block's own
+  //    per-minute rate; the host gets 60% of what was actually delivered, the platform 40%
+  // Each block is claimed atomically, so running this twice can never pay anyone twice.
+  private async settlePrivateBlocks(sessionId: string, hostId: string, viewerLeft: boolean) {
+    const blocks = await this.prisma.privateLiveRequest.findMany({
+      where: { sessionId, status: 'ACTIVE', settledAt: null },
+      orderBy: { createdAt: 'asc' },
     });
+    if (blocks.length === 0) return;
+    const nowMs = Date.now();
+    let deliveredMinutes = 0;
+
+    for (const block of blocks) {
+      const start = block.blockStartsAt ?? block.startedAt;
+      if (!start) continue;
+      const result = settleBlock({
+        priceCoins: block.priceCoins,
+        durationSeconds: block.durationSeconds,
+        blockStartsAtMs: start.getTime(),
+        nowMs,
+        viewerLeft,
+      });
+      const settledAt = new Date();
+      await this.prisma.$transaction(async (tx) => {
+        const claimed = await tx.privateLiveRequest.updateMany({
+          where: { id: block.id, status: 'ACTIVE', settledAt: null },
+          data: {
+            status: 'COMPLETED',
+            settledAt,
+            hostCoins: result.hostCoins,
+            refundedCoins: result.refundCoins,
+            refundedAt: result.refundCoins > 0 ? settledAt : null,
+            settleReason: viewerLeft ? 'VIEWER_LEFT' : result.refundCoins > 0 ? 'ENDED_EARLY' : 'TIME_UP',
+          },
+        });
+        if (claimed.count === 0) return;
+
+        if (result.refundCoins > 0) {
+          await this.wallet.credit({
+            userId: block.viewerId,
+            walletType: WalletType.COIN,
+            amount: BigInt(result.refundCoins),
+            ledgerType: LedgerEntryType.REFUND,
+            reference: block.id,
+            idempotencyKey: `private_live_unused_refund:${block.id}`,
+          }, tx);
+        }
+        if (result.hostCoins > 0) {
+          await this.wallet.credit({
+            userId: hostId,
+            walletType: WalletType.CREATOR_EARNINGS,
+            amount: BigInt(result.hostCoins),
+            ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT,
+            reference: block.id,
+            idempotencyKey: `private_live_creator:${block.id}`,
+          }, tx);
+        }
+        if (result.platformCoins > 0) {
+          await this.wallet.recordPlatformEntry({
+            ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT,
+            amount: BigInt(result.platformCoins),
+            reference: block.id,
+            idempotencyKey: `private_live_platform:${block.id}`,
+          }, tx);
+        }
+      });
+      deliveredMinutes += Math.floor(result.deliveredSeconds / 60);
+    }
+
+    if (this.hostLevels && deliveredMinutes > 0) {
+      try { await this.hostLevels.awardRule(hostId, 'PRIVATE_MINUTE', deliveredMinutes); } catch { /* progression must never block private billing */ }
+    }
   }
 
   async sweepPrivateSessions() {
     const now = new Date();
-    // Requests are paid upfront, so a request that sits unanswered must not
-    // hold the viewer's coins forever. Expire and refund pending requests
-    // after 45 seconds.
-    const pendingCutoff = new Date(now.getTime() - 45_000);
+    // Requests are paid upfront, so a request that sits unanswered must not hold the viewer's
+    // coins: expire and refund pending requests after 45 seconds...
+    const pendingCutoff = new Date(now.getTime() - PRIVATE_ACCEPT_WINDOW_MS);
     const staleRequests = await this.prisma.privateLiveRequest.findMany({
       where: { status: 'PENDING', createdAt: { lte: pendingCutoff } },
       select: { id: true, viewerId: true, priceCoins: true },
       take: 100,
     });
     for (const request of staleRequests) {
-      await this.refundPrivateRequest(request.id, request.viewerId, request.priceCoins, 'Private live request expired');
-      await this.prisma.privateLiveRequest.updateMany({ where: { id: request.id, status: 'REFUNDED' }, data: { status: 'EXPIRED' } });
+      await this.refundPrivateRequest(request.id, request.viewerId, request.priceCoins, 'Private live request expired', 'EXPIRED');
+    }
+
+    // ...and an accepted viewer who never joins must not block the host's live for everyone else.
+    // After 60 seconds the slot reopens and they are refunded.
+    const joinCutoff = new Date(now.getTime() - PRIVATE_JOIN_WINDOW_MS);
+    const noShows = await this.prisma.privateLiveRequest.findMany({
+      where: { status: 'ACCEPTED', acceptedAt: { lte: joinCutoff } },
+      select: { id: true, viewerId: true, priceCoins: true },
+      take: 100,
+    });
+    for (const request of noShows) {
+      await this.refundPrivateRequest(request.id, request.viewerId, request.priceCoins, 'Viewer did not join in time', 'EXPIRED');
     }
 
     const expired = await this.prisma.liveSession.findMany({
@@ -464,24 +660,61 @@ export class LiveService {
   async privateStatus(sessionId: string, actorId: string) {
     const session = await this.prisma.liveSession.findUnique({ where: { id: sessionId } });
     if (!session) throw new NotFoundException('Live session not found');
+    const isHost = session.hostId === actorId;
     const request = await this.prisma.privateLiveRequest.findFirst({
       where: {
         sessionId,
-        OR: [{ viewerId: actorId }, { session: { hostId: actorId } }],
         status: { in: ['PENDING', 'ACCEPTED', 'ACTIVE'] },
+        ...(isHost ? {} : { viewerId: actorId }),
       },
       orderBy: { createdAt: 'desc' },
       include: { viewer: { select: { id: true, displayName: true, avatarUrl: true } } },
     });
+
+    let packages: { id: string; minutes: number; priceCoins: number; description: string | null }[] = [];
+    let occupied = false;
+    let outcome: { status: string; reason: string | null; refundedCoins: number } | null = null;
+    if (session.privacy === 'PRIVATE') {
+      packages = await this.prisma.privateRatePackage.findMany({
+        where: { hostId: session.hostId },
+        orderBy: { minutes: 'asc' },
+        select: { id: true, minutes: true, priceCoins: true, description: true },
+      });
+      if (!isHost) {
+        const other = await this.prisma.privateLiveRequest.findFirst({
+          where: { sessionId, viewerId: { not: actorId }, status: { in: ['ACCEPTED', 'ACTIVE'] } },
+          select: { id: true },
+        });
+        occupied = !!other;
+        if (!request) {
+          // Tell a viewer why their last request went nowhere (declined / timed out / no-show).
+          const last = await this.prisma.privateLiveRequest.findFirst({
+            where: {
+              sessionId,
+              viewerId: actorId,
+              status: { in: ['DECLINED', 'EXPIRED', 'REFUNDED'] },
+              createdAt: { gte: new Date(Date.now() - 5 * 60_000) },
+            },
+            orderBy: { createdAt: 'desc' },
+            select: { status: true, settleReason: true, refundedCoins: true },
+          });
+          if (last) outcome = { status: last.status, reason: last.settleReason, refundedCoins: last.refundedCoins };
+        }
+      }
+    }
+
     return {
       session: {
         id: session.id,
+        status: session.status,
         privacy: session.privacy,
-        privatePriceCoins: session.privatePriceCoins,
-        privateDurationSeconds: session.privateDurationSeconds,
         privateStartedAt: session.privateStartedAt,
         privateEndsAt: session.privateEndsAt,
       },
+      packages,
+      hostShareBps: PRIVATE_HOST_SHARE_BPS,
+      occupied,
+      outcome,
       request,
     };
   }
@@ -503,35 +736,36 @@ export class LiveService {
   // Idempotent: ending a session that already ended returns it untouched, so a
   // repeated tap (or the sweeper racing the host) can't overwrite the real end
   // time and duration.
-  private async finish(session: {
-    id: string;
-    hostId: string;
-    providerChannel: string;
-    status: string;
-    startedAt: Date | null;
-  }) {
+  private async finish(
+    session: {
+      id: string;
+      hostId: string;
+      providerChannel: string;
+      status: string;
+      startedAt: Date | null;
+    },
+    opts: { viewerLeft?: boolean } = {},
+  ) {
     if (session.status === 'ENDED') {
       return this.prisma.liveSession.findUniqueOrThrow({ where: { id: session.id } });
     }
     // A video being shared in this live ends with it.
     this.media?.clear(session.id);
 
+    // Pay the host / refund unused time for a running private session. This goes first: if it
+    // fails nothing else has changed, the live stays open and the next sweep retries it.
+    await this.settlePrivateBlocks(session.id, session.hostId, !!opts.viewerLeft);
+
     await this.rtc.destroyChannel(session.providerChannel);
 
-    // Paid requests that never became an active private session must be refunded
-    // when the host ends the live. Active requests have already settled to the host.
+    // Paid requests that never became a running private session are refunded in full.
     const unpaid = await this.prisma.privateLiveRequest.findMany({
       where: { sessionId: session.id, status: { in: ['PENDING', 'ACCEPTED'] } },
       select: { id: true, viewerId: true, priceCoins: true },
     });
     for (const request of unpaid) {
-      await this.refundPrivateRequest(request.id, request.viewerId, request.priceCoins, 'Private live ended before access started');
+      await this.refundPrivateRequest(request.id, request.viewerId, request.priceCoins, 'Private live ended before access started', 'REFUNDED');
     }
-    await this.prisma.privateLiveRequest.updateMany({
-      where: { sessionId: session.id, status: 'ACTIVE' },
-      data: { status: 'COMPLETED' },
-    });
-
     // Close all open viewer rows — the session is over.
     await this.prisma.liveViewer.updateMany({
       where: { sessionId: session.id, leftAt: null },
@@ -689,6 +923,20 @@ export class LiveService {
   }
 
   async trackViewerLeave(sessionId: string, userId: string) {
+    // In a paid private live the viewer leaving ends the session (no refund for unused time).
+    // A viewer who was accepted but has not joined yet is not "in session", so it stays open.
+    const live = await this.prisma.liveSession.findUnique({ where: { id: sessionId } });
+    if (live && live.status === 'LIVE' && live.privacy === 'PRIVATE' && live.hostId !== userId) {
+      const running = await this.prisma.privateLiveRequest.findFirst({
+        where: { sessionId, viewerId: userId, status: 'ACTIVE' },
+        select: { id: true },
+      });
+      if (running) {
+        await this.finish(live, { viewerLeft: true });
+        return null;
+      }
+    }
+
     const open = await this.prisma.liveViewer.findFirst({
       where: { sessionId, userId, leftAt: null },
     });
@@ -861,9 +1109,19 @@ export class LiveService {
     return session;
   }
 
+  private async assertLiveHostOrModerator(sessionId: string, actorId: string) {
+    const session = await this.prisma.liveSession.findUnique({ where: { id: sessionId } });
+    if (!session) throw new NotFoundException('Live session not found');
+    if (session.status !== 'LIVE') throw new BadRequestException('Live session is not active');
+    if (session.hostId === actorId) return session;
+    const mod = await this.prisma.liveModerator.findUnique({ where: { sessionId_userId: { sessionId, userId: actorId } } });
+    if (!mod) throw new ForbiddenException('Requires host or moderator');
+    return session;
+  }
+
   private async logLiveModeration(
     actorId: string,
-    actionType: 'KICK' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN',
+    actionType: 'KICK' | 'MUTE' | 'UNMUTE' | 'BAN' | 'UNBAN' | 'ADD_MODERATOR' | 'REMOVE_MODERATOR',
     sessionId: string,
     targetUserId: string,
   ) {
@@ -886,7 +1144,7 @@ export class LiveService {
   }
 
   async kickViewer(sessionId: string, actorId: string, targetUserId: string) {
-    const session = await this.assertLiveHost(sessionId, actorId);
+    const session = await this.assertLiveHostOrModerator(sessionId, actorId);
     if (targetUserId === session.hostId) throw new BadRequestException('Cannot kick the host');
     await this.prisma.liveViewer.updateMany({ where: { sessionId, userId: targetUserId, leftAt: null }, data: { leftAt: new Date() } });
     await this.logLiveModeration(actorId, 'KICK', sessionId, targetUserId);
@@ -896,7 +1154,7 @@ export class LiveService {
   }
 
   async muteViewer(sessionId: string, actorId: string, targetUserId: string) {
-    const session = await this.assertLiveHost(sessionId, actorId);
+    const session = await this.assertLiveHostOrModerator(sessionId, actorId);
     if (targetUserId === session.hostId) throw new BadRequestException('Cannot mute the host');
     await this.logLiveModeration(actorId, 'MUTE', sessionId, targetUserId);
     this.emitLiveModeration(sessionId, 'MUTE', actorId, targetUserId);
@@ -904,14 +1162,14 @@ export class LiveService {
   }
 
   async unmuteViewer(sessionId: string, actorId: string, targetUserId: string) {
-    await this.assertLiveHost(sessionId, actorId);
+    await this.assertLiveHostOrModerator(sessionId, actorId);
     await this.logLiveModeration(actorId, 'UNMUTE', sessionId, targetUserId);
     this.emitLiveModeration(sessionId, 'UNMUTE', actorId, targetUserId);
     return { muted: false };
   }
 
   async banViewer(sessionId: string, actorId: string, targetUserId: string) {
-    const session = await this.assertLiveHost(sessionId, actorId);
+    const session = await this.assertLiveHostOrModerator(sessionId, actorId);
     if (targetUserId === session.hostId) throw new BadRequestException('Cannot ban the host');
     await this.prisma.liveViewer.updateMany({ where: { sessionId, userId: targetUserId, leftAt: null }, data: { leftAt: new Date() } });
     await this.logLiveModeration(actorId, 'BAN', sessionId, targetUserId);
@@ -921,10 +1179,31 @@ export class LiveService {
   }
 
   async unbanViewer(sessionId: string, actorId: string, targetUserId: string) {
-    await this.assertLiveHost(sessionId, actorId);
+    await this.assertLiveHostOrModerator(sessionId, actorId);
     await this.logLiveModeration(actorId, 'UNBAN', sessionId, targetUserId);
     this.emitLiveModeration(sessionId, 'UNBAN', actorId, targetUserId);
     return { banned: false };
+  }
+
+  async addModerator(sessionId: string, actorId: string, targetUserId: string) {
+    const session = await this.assertLiveHost(sessionId, actorId);
+    if (targetUserId === session.hostId) throw new BadRequestException('The host is already an admin');
+    const target = await this.prisma.user.findUnique({ where: { id: targetUserId }, select: { id: true } });
+    if (!target) throw new NotFoundException('User not found');
+    await this.prisma.liveModerator.upsert({
+      where: { sessionId_userId: { sessionId, userId: targetUserId } },
+      update: {},
+      create: { sessionId, userId: targetUserId },
+    });
+    await this.logLiveModeration(actorId, 'ADD_MODERATOR', sessionId, targetUserId);
+    return { added: true };
+  }
+
+  async removeModerator(sessionId: string, actorId: string, targetUserId: string) {
+    await this.assertLiveHost(sessionId, actorId);
+    await this.prisma.liveModerator.deleteMany({ where: { sessionId, userId: targetUserId } });
+    await this.logLiveModeration(actorId, 'REMOVE_MODERATOR', sessionId, targetUserId);
+    return { removed: true };
   }
 
   async listViewers(sessionId: string, hostId: string) {
@@ -934,7 +1213,8 @@ export class LiveService {
     });
     if (!session) throw new NotFoundException('Session not found');
     if (session.hostId !== hostId) {
-      throw new ForbiddenException('Only the host can list viewers');
+      const mod = await this.prisma.liveModerator.findUnique({ where: { sessionId_userId: { sessionId, userId: hostId } } });
+      if (!mod) throw new ForbiddenException('Only the host or moderator can list viewers');
     }
 
     const viewers = await this.prisma.liveViewer.findMany({
@@ -947,10 +1227,13 @@ export class LiveService {
       },
     });
 
+    const mods = await this.prisma.liveModerator.findMany({ where: { sessionId }, select: { userId: true } });
+    const modIds = new Set(mods.map((m) => m.userId));
     return viewers.map((v) => ({
       userId: v.userId,
       displayName: v.user.displayName,
       joinedAt: v.joinedAt,
+      isModerator: modIds.has(v.userId),
     }));
   }
 }

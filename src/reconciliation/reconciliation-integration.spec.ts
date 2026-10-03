@@ -12,7 +12,7 @@ function books() {
   fake.wallet.findMany = async () => [...fake.wallets.values()].map((w: any) => ({ id: w.id, balance: w.balance }));
   fake.wallet.findUniqueOrThrow = async ({ where: { id } }: any) => [...fake.wallets.values()].find((w: any) => w.id === id);
   fake.ledgerEntry.aggregate = async ({ where: { walletId } }: any) => ({ _sum: { amount: [...fake.ledger.values()].filter((l: any) => l.walletId === walletId).reduce((n: bigint, l: any) => n + BigInt(l.amount), 0n) } });
-  return { fake, wallet: new WalletService(fake), recon: new ReconciliationService(fake) };
+  return { fake, wallet: new WalletService(fake), recon: new ReconciliationService(fake, { record: async () => undefined } as any) };
 }
 const move = (i: number) => ({ reference: `r${i}`, idempotencyKey: `k${i}` });
 
@@ -24,7 +24,7 @@ describe('wallet reconciliation', () => {
     await wallet.debit({ userId: 'a', walletType: WalletType.COIN, amount: 300n, ledgerType: 'GIFT_SENT' as any, ...move(2) });
     await expect(wallet.debit({ userId: 'a', walletType: WalletType.COIN, amount: 5000n, ledgerType: 'GIFT_SENT' as any, ...move(3) })).rejects.toThrow(/Insufficient/);
     await wallet.forceDebit({ userId: 'a', walletType: WalletType.COIN, amount: 900n, ledgerType: 'CHARGEBACK' as any, ...move(4) });
-    await wallet.credit({ userId: 'b', walletType: WalletType.CREATOR_EARNINGS, amount: 70n, ledgerType: 'BONUS' as any, ...move(5) });
+    await wallet.credit({ userId: 'b', walletType: WalletType.CREATOR_EARNINGS, amount: 70n, ledgerType: 'GIFT_RECEIVED' as any, ...move(5) });
     expect(await wallet.getBalance('a', WalletType.COIN)).toBe(-200n);
     const r = await recon.checkAll();
     expect(r.checked).toBe(2);

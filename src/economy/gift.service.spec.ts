@@ -25,7 +25,7 @@ describe('GiftService', () => {
     const { prisma, wallet, gifts } = makeService();
     await wallet.credit({
       userId: 'sender',
-      walletType: WalletType.COIN,
+      walletType: WalletType.BONUS,
       amount: 100n,
       ledgerType: 'BONUS' as any,
       idempotencyKey: 'seed',
@@ -67,7 +67,7 @@ describe('GiftService', () => {
     const { wallet, gifts } = makeService();
     await wallet.credit({
       userId: 'sender',
-      walletType: WalletType.COIN,
+      walletType: WalletType.BONUS,
       amount: 100n,
       ledgerType: 'BONUS' as any,
       idempotencyKey: 'seed',
@@ -83,7 +83,7 @@ describe('GiftService', () => {
   it('does not let a different user replay someone else\'s idempotency key', async () => {
     const { prisma, wallet, gifts } = makeService();
     prisma.users.set('other', { id: 'other', countryCode: 'NG' });
-    await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+    await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
     await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'shared-key' });
     await expect(
       gifts.send({ senderId: 'other', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'shared-key' }),
@@ -101,7 +101,7 @@ describe('GiftService', () => {
 
     it('returns the bonus to the sender and books it as a platform expense', async () => {
       const { prisma, wallet, gifts } = luckyService(alwaysWin);
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
       const tx = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'lucky', idempotencyKey: 'lucky-1' });
 
       expect(tx).toMatchObject({ luckyRewardCoins: 60, luckyRewardLabel: 'Win', luckyType: 'clover' });
@@ -112,7 +112,7 @@ describe('GiftService', () => {
 
     it('a losing draw pays nothing and books nothing extra', async () => {
       const { prisma, wallet, gifts } = luckyService(neverWin);
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
       const tx = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'lucky', idempotencyKey: 'lucky-2' });
 
       expect(tx).toMatchObject({ luckyRewardCoins: 0, luckyRewardLabel: 'None' });
@@ -123,7 +123,7 @@ describe('GiftService', () => {
 
     it('retrying the same key never pays the bonus twice', async () => {
       const { wallet, gifts } = luckyService(alwaysWin);
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
       const first = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'lucky', idempotencyKey: 'lucky-3' });
       const second = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'lucky', idempotencyKey: 'lucky-3' });
       expect(second).toEqual(first);
@@ -153,7 +153,7 @@ describe('GiftService', () => {
     });
     await wallet.credit({
       userId: 'sender',
-      walletType: WalletType.COIN,
+      walletType: WalletType.BONUS,
       amount: 100n,
       ledgerType: 'BONUS' as any,
       idempotencyKey: 'seed',
@@ -176,7 +176,7 @@ describe('gifts do not create notifications', () => {
     prisma.users.set('sender', { id: 'sender', countryCode: 'NG' });
     prisma.users.set('recipient', { id: 'recipient', countryCode: 'NG' });
     prisma.gifts.set('rose', { id: 'rose', coinPrice: 100, active: true });
-    await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+    await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
     await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'g-1' });
 
@@ -203,7 +203,7 @@ describe('gifts contribute to the sender\'s season points', () => {
     prisma.users.set('sender', { id: 'sender', countryCode: 'NG' });
     prisma.users.set('recipient', { id: 'recipient', countryCode: 'NG' });
     prisma.gifts.set('rose', { id: 'rose', coinPrice: 100, active: true });
-    await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+    await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
     await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'g-1' });
 
@@ -217,7 +217,7 @@ describe('gifts contribute to the sender\'s season points', () => {
     prisma.users.set('sender', { id: 'sender', countryCode: 'NG' });
     prisma.users.set('recipient', { id: 'recipient', countryCode: 'NG' });
     prisma.gifts.set('rose', { id: 'rose', coinPrice: 100, active: true });
-    await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+    await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
     await expect(
       gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'g-2' }),
@@ -253,7 +253,7 @@ describe('gifts contribute to the sender\'s season points', () => {
 
     it('increments the recipient seat\'s running total by the gift\'s coin price', async () => {
       const { prisma, wallet, gifts } = seatedService();
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', context: 'ROOM' as any, contextId: 'room-1', idempotencyKey: 'g-room-1' });
 
@@ -272,7 +272,7 @@ describe('gifts contribute to the sender\'s season points', () => {
 
     it('still completes the gift — and does not touch any seat — when the recipient is not actually seated in that room', async () => {
       const { prisma, wallet, gifts } = unseatedService();
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       const tx = await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', context: 'ROOM' as any, contextId: 'room-1', idempotencyKey: 'g-room-c' });
 
@@ -282,7 +282,7 @@ describe('gifts contribute to the sender\'s season points', () => {
 
     it('never touches a seat total for a non-ROOM gift, even to the same recipient', async () => {
       const { prisma, wallet, gifts } = seatedService();
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       await gifts.send({ senderId: 'sender', recipientId: 'recipient', giftId: 'rose', idempotencyKey: 'g-no-context' });
 
@@ -319,7 +319,7 @@ describe('gifts contribute to the sender\'s season points', () => {
       const { prisma, wallet, gifts } = pkService();
       activeBattle(prisma, {});
       prisma.users.set('leader-a', { id: 'leader-a', countryCode: 'NG' });
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       await gifts.send({ senderId: 'sender', recipientId: 'leader-a', giftId: 'rose', context: 'LIVE' as any, idempotencyKey: 'g-1' });
 
@@ -331,7 +331,7 @@ describe('gifts contribute to the sender\'s season points', () => {
       activeBattle(prisma, { mode: 'TEAM', challengerId: 'leader-a', opponentId: 'leader-b', challengerTeamId: 'team-x', opponentTeamId: 'team-y', challengerParticipantIds: ['leader-a'], opponentParticipantIds: ['leader-b', 'member'] });
       prisma.users.set('member', { id: 'member', countryCode: 'NG' });
       prisma.liveSessions.set('session-1', { id: 'session-1', hostId: 'member', status: 'LIVE' });
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       await gifts.send({ senderId: 'sender', recipientId: 'member', giftId: 'rose', context: 'LIVE' as any, contextId: 'session-1', idempotencyKey: 'g-2' });
 
@@ -344,7 +344,7 @@ describe('gifts contribute to the sender\'s season points', () => {
       activeBattle(prisma, { mode: 'TEAM', challengerTeamId: 'team-x', opponentTeamId: 'team-y', challengerParticipantIds: ['leader-a'], opponentParticipantIds: ['leader-b', 'member'] });
       prisma.users.set('member', { id: 'member', countryCode: 'NG' });
       prisma.liveSessions.set('session-1', { id: 'session-1', hostId: 'someone-else', status: 'LIVE' }); // member isn't the host here
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       await gifts.send({ senderId: 'sender', recipientId: 'member', giftId: 'rose', context: 'LIVE' as any, contextId: 'session-1', idempotencyKey: 'g-3' });
 
@@ -363,7 +363,7 @@ describe('gifts contribute to the sender\'s season points', () => {
       prisma.users.set('latecomer', { id: 'latecomer', countryCode: 'NG' });
       prisma.teamMembers.set('latecomer', { userId: 'latecomer', teamId: 'team-y' }); // genuinely on the team now
       prisma.liveSessions.set('session-1b', { id: 'session-1b', hostId: 'latecomer', status: 'LIVE' }); // genuinely hosting right now
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       await gifts.send({ senderId: 'sender', recipientId: 'latecomer', giftId: 'rose', context: 'LIVE' as any, contextId: 'session-1b', idempotencyKey: 'g-2b' });
 
@@ -376,7 +376,7 @@ describe('gifts contribute to the sender\'s season points', () => {
       activeBattle(prisma, { mode: 'AGENCY', challengerId: 'owner-a', opponentId: 'owner-b', challengerAgencyId: 'agency-x', opponentAgencyId: 'agency-y', challengerParticipantIds: ['owner-a'], opponentParticipantIds: ['owner-b', 'creator'] });
       prisma.users.set('creator', { id: 'creator', countryCode: 'NG' });
       prisma.liveSessions.set('session-2', { id: 'session-2', hostId: 'creator', status: 'LIVE' });
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       await gifts.send({ senderId: 'sender', recipientId: 'creator', giftId: 'rose', context: 'LIVE' as any, contextId: 'session-2', idempotencyKey: 'g-4' });
 
@@ -388,7 +388,7 @@ describe('gifts contribute to the sender\'s season points', () => {
       activeBattle(prisma, { mode: 'AGENCY', challengerId: 'someone', opponentId: 'someone-else', challengerAgencyId: 'agency-x', opponentAgencyId: 'agency-y', challengerParticipantIds: ['owner'], opponentParticipantIds: ['someone-else'] });
       prisma.users.set('owner', { id: 'owner', countryCode: 'NG' });
       prisma.liveSessions.set('session-3', { id: 'session-3', hostId: 'owner', status: 'LIVE' });
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       await gifts.send({ senderId: 'sender', recipientId: 'owner', giftId: 'rose', context: 'LIVE' as any, contextId: 'session-3', idempotencyKey: 'g-5' });
 
@@ -401,7 +401,7 @@ describe('gifts contribute to the sender\'s season points', () => {
       prisma.users.set('recruit', { id: 'recruit', countryCode: 'NG' });
       prisma.agencyMemberships.set('recruit', { creatorId: 'recruit', agencyId: 'agency-y', status: 'ACTIVE' }); // genuinely a member now
       prisma.liveSessions.set('session-2b', { id: 'session-2b', hostId: 'recruit', status: 'LIVE' });
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       await gifts.send({ senderId: 'sender', recipientId: 'recruit', giftId: 'rose', context: 'LIVE' as any, contextId: 'session-2b', idempotencyKey: 'g-4b' });
 
@@ -414,7 +414,7 @@ describe('gifts contribute to the sender\'s season points', () => {
       // no battle set up
       prisma.users.set('creator', { id: 'creator', countryCode: 'NG' });
       prisma.liveSessions.set('session-4', { id: 'session-4', hostId: 'creator', status: 'LIVE' });
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       // Must not throw — the gift itself still succeeds even with no PK to score.
       await expect(
@@ -430,7 +430,7 @@ describe('gifts contribute to the sender\'s season points', () => {
       prisma.users.set('member', { id: 'member', countryCode: 'NG' });
       prisma.agencyMemberships.set('member', { creatorId: 'member', agencyId: 'agency-y', status: 'ACTIVE' }); // unrelated to this battle
       prisma.liveSessions.set('session-5', { id: 'session-5', hostId: 'member', status: 'LIVE' });
-      await wallet.credit({ userId: 'sender', walletType: WalletType.COIN, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
+      await wallet.credit({ userId: 'sender', walletType: WalletType.BONUS, amount: 100n, ledgerType: 'BONUS' as any, idempotencyKey: 'seed' });
 
       await gifts.send({ senderId: 'sender', recipientId: 'member', giftId: 'rose', context: 'LIVE' as any, contextId: 'session-5', idempotencyKey: 'g-7' });
 

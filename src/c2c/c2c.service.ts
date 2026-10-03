@@ -15,50 +15,12 @@ export class C2CService {
     private readonly audit: AuditService,
   ) {}
 
-  async create(buyerId: string, coinAmount: number, _clientFiatAmountMinor: number | undefined, _clientCurrencyCode: string | undefined, ttlMinutes = DEFAULT_TTL_MINUTES) {
-    if (!Number.isInteger(coinAmount) || coinAmount <= 0) throw new BadRequestException('coinAmount must be a positive whole number');
-    if (!Number.isInteger(ttlMinutes) || ttlMinutes < 5 || ttlMinutes > 1440) throw new BadRequestException('ttlMinutes must be between 5 and 1440');
-
-    const buyer = await this.prisma.user.findUnique({ where: { id: buyerId }, select: { id: true, countryCode: true, status: true } });
-    if (!buyer || buyer.status !== 'ACTIVE') throw new ForbiddenException('Account is not active');
-    const region = await this.prisma.regionalConfig.findUnique({ where: { countryCode: buyer.countryCode.toUpperCase() } });
-    const methods = Array.isArray(region?.paymentMethods) ? region!.paymentMethods.map(String).map(v => v.toUpperCase()) : [];
-    if (!region?.active || !region.paymentsEnabled || !methods.includes('C2C')) throw new BadRequestException('C2C is not enabled in your country');
-    if (!region.c2cFiatMinorPer100Coins || region.c2cFiatMinorPer100Coins <= 0) {
-      throw new BadRequestException('C2C rate is not configured for your country');
-    }
-
-    // Never trust a client-supplied fiat quote or currency. The admin-configured
-    // regional rate and currency are the source of truth for a financial order.
-    const fiatAmountMinor = Math.ceil((coinAmount * region.c2cFiatMinorPer100Coins) / 100);
-    const currencyCode = region.currencyCode.toUpperCase();
-
-    return this.prisma.c2COrder.create({
-      data: {
-        buyerId,
-        sellerId: '',
-        coinAmount,
-        fiatAmountMinor,
-        currencyCode,
-        status: C2COrderStatus.OPEN,
-        expiresAt: new Date(Date.now() + ttlMinutes * 60_000),
-      },
-    });
+  async create(_buyerId: string, _coinAmount: number, _clientFiatAmountMinor: number | undefined, _clientCurrencyCode: string | undefined, _ttlMinutes = DEFAULT_TTL_MINUTES) {
+    throw new BadRequestException('C2C coin trading is currently unavailable');
   }
 
-  async listOpen(buyerId: string) {
-    await this.expireStale();
-    const buyer = await this.prisma.user.findUnique({ where: { id: buyerId }, select: { countryCode: true, status: true } });
-    if (!buyer || buyer.status !== 'ACTIVE') throw new ForbiddenException('Account is not active');
-    const region = await this.prisma.regionalConfig.findUnique({ where: { countryCode: buyer.countryCode.toUpperCase() }, select: { currencyCode: true, active: true, paymentsEnabled: true, paymentMethods: true } });
-    const methods = Array.isArray(region?.paymentMethods) ? region.paymentMethods.map(String).map(v => v.toUpperCase()) : [];
-    if (!region?.active || !region.paymentsEnabled || !methods.includes('C2C')) return [];
-    return this.prisma.c2COrder.findMany({
-      where: { status: C2COrderStatus.OPEN, expiresAt: { gt: new Date() }, buyerId: { not: buyerId }, currencyCode: region.currencyCode.toUpperCase() },
-      orderBy: { createdAt: 'desc' },
-      take: 100,
-      select: { id: true, coinAmount: true, fiatAmountMinor: true, currencyCode: true, status: true, expiresAt: true, createdAt: true },
-    });
+  async listOpen(_buyerId: string) {
+    return [];
   }
 
   async accept(orderId: string, sellerId: string) {

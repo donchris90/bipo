@@ -55,7 +55,7 @@ describe('RoomsService closing', () => {
     const prisma: any = { partyRoom: { findUnique: jest.fn().mockResolvedValue(room(status)), findUniqueOrThrow: jest.fn().mockResolvedValue(room('CLOSED')), update: jest.fn(async ({ data }: any) => data) } };
     const rtc: any = { destroyChannel: jest.fn() };
     const ludo: any = { resolvePartyLudoOnRoomClose: jest.fn().mockResolvedValue(undefined) };
-    const svc = new RoomsService(prisma, {} as any, {} as any, rtc, {} as any, {} as any, ludo);
+    const svc = new (RoomsService as any)(prisma, {} as any, {} as any, rtc, {} as any, {} as any, ludo, { recordHostSession: jest.fn() } as any);
     return { svc, prisma, rtc, ludo };
   };
 

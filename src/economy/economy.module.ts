@@ -6,6 +6,8 @@ import { Logger, Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { WalletModule } from './wallet.module';
 import { RevenueSplitService } from './revenue-split.service';
+import { RevenueSplitAdminService } from './revenue-split-admin.service';
+import { RevenueSplitAdminController } from './revenue-split-admin.controller';
 import { CoinPurchaseService, PAYMENT_PROVIDER } from './coin-purchase.service';
 import { GiftService } from './gift.service';
 import { GifterService } from './gifter.service';
@@ -48,7 +50,7 @@ const logger = new Logger('EconomyModule');
     SeasonsModule,
     RrydaExperienceModule,
   ],
-  providers: [CoinPackageAdminService, GiftAdminService,
+  providers: [CoinPackageAdminService, GiftAdminService, RevenueSplitAdminService,
     RevenueSplitService,
     CoinPurchaseService,
     GiftService,
@@ -72,7 +74,7 @@ const logger = new Logger('EconomyModule');
       },
     },
   ],
-  controllers: [WalletController, CoinPurchaseController, GiftController, GiftAdminController, CoinPackageAdminController, PaymentWebhookController],
+  controllers: [WalletController, CoinPurchaseController, GiftController, GiftAdminController, CoinPackageAdminController, RevenueSplitAdminController, PaymentWebhookController],
   // WalletModule re-exported (not just its own WalletService) so every existing consumer that
   // imports EconomyModule to get WalletService keeps working unchanged.
   exports: [WalletModule, RevenueSplitService, GiftService, GifterService, ChargebackService],

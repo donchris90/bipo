@@ -63,7 +63,9 @@ export class FeedService {
     if (sessions.length === 0) return [];
 
     const hostIds = sessions.map((s) => s.hostId);
-    const [hosts, counts, battles] = await Promise.all([
+    const privateSessions = sessions.filter((s) => s.privacy === 'PRIVATE');
+    const privateHostIds = privateSessions.map((s) => s.hostId);
+    const [hosts, counts, battles, cheapest, busy] = await Promise.all([
       this.prisma.user.findMany({
         where: { id: { in: hostIds } },
         select: { id: true, displayName: true, avatarUrl: true },
@@ -77,10 +79,23 @@ export class FeedService {
         where: { status: { in: ['COUNTDOWN', 'ACTIVE'] }, OR: [{ challengerId: { in: hostIds } }, { opponentId: { in: hostIds } }] },
         select: { challengerId: true, opponentId: true },
       }),
+      // Private lives show "from X coins" (the host's cheapest package) on their card.
+      privateHostIds.length
+        ? this.prisma.privateRatePackage.groupBy({ by: ['hostId'], where: { hostId: { in: privateHostIds } }, _min: { priceCoins: true } })
+        : Promise.resolve([] as { hostId: string; _min: { priceCoins: number | null } }[]),
+      // ...and "In session" while a viewer is accepted or already inside.
+      privateSessions.length
+        ? this.prisma.privateLiveRequest.findMany({
+            where: { sessionId: { in: privateSessions.map((s) => s.id) }, status: { in: ['ACCEPTED', 'ACTIVE'] } },
+            select: { sessionId: true },
+          })
+        : Promise.resolve([] as { sessionId: string }[]),
     ]);
     const hostById = new Map(hosts.map((h) => [h.id, h]));
     const countBySession = new Map(counts.map((c) => [c.sessionId, c._count._all]));
     const inPk = new Set(battles.flatMap((b) => [b.challengerId, b.opponentId]));
+    const fromCoinsByHost = new Map(cheapest.map((c) => [c.hostId, c._min.priceCoins ?? null]));
+    const inSession = new Set(busy.map((r) => r.sessionId));
 
     return sessions
       .map((s) => ({
@@ -96,6 +111,8 @@ export class FeedService {
         countryCode: s.countryCode,
         startedAt: s.startedAt,
         privacy: s.privacy,
+        privateFromCoins: s.privacy === 'PRIVATE' ? fromCoinsByHost.get(s.hostId) ?? null : null,
+        privateInSession: s.privacy === 'PRIVATE' ? inSession.has(s.id) : false,
         viewerCount: countBySession.get(s.id) ?? 0,
         inPk: inPk.has(s.hostId),
       }))

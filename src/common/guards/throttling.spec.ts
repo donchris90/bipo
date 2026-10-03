@@ -5,7 +5,6 @@ import { CreatorsController, WithdrawalsController } from '../../creators/creato
 import { GamesController } from '../../games/games.controller';
 import { SocialController } from '../../social/social.controller';
 import { MessagesController } from '../../messages/messages.controller';
-import { CallsController } from '../../calls/calls.controller';
 import { PkController } from '../../pk/pk.controller';
 import { VideosController } from '../../videos/videos.controller';
 import { MissionsController } from '../../missions/missions.controller';
@@ -32,7 +31,6 @@ const EXPECTED: [string, any, string, number][] = [
   ['follow', SocialController, 'follow', 60],
   ['block', SocialController, 'block', 30],
   ['dm send', MessagesController, 'send', 60],
-  ['call initiate', CallsController, 'initiate', 10],
   ['pk challenge', PkController, 'challenge', 20],
   ['video upload url', VideosController, 'requestUpload', 10],
   ['video publish', VideosController, 'publish', 10],

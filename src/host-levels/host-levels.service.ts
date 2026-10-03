@@ -10,14 +10,25 @@ export class HostLevelsService {
 
   // Which unlockable feature a daily-task activity actually requires, so a
   // task built around an activity a host can't perform yet (e.g. 1-on-1
-  // hosting minutes, before ONE_ON_ONE_VIDEO is unlocked) can be hidden
+  // hosting minutes, before PRIVATE_LIVE is unlocked) can be hidden
   // instead of shown as a permanently un-completable 0/10.
-  private static readonly ACTIVITY_FEATURE_REQUIREMENTS: Record<string, string> = {
-    PRIVATE_MINUTE: 'ONE_ON_ONE_VIDEO',
+  // Any ONE of the listed features is enough. Private 1-on-1 hosting minutes only come from
+  // private live sessions, which unlock with PRIVATE_LIVE (Host Level 3 by default).
+  private static readonly ACTIVITY_FEATURE_REQUIREMENTS: Record<string, string[]> = {
+    PRIVATE_MINUTE: ['PRIVATE_LIVE'],
   };
 
-  async list() {
-    return this.prisma.hostLevel.findMany({ orderBy: { level: 'asc' } });
+  // `activeOnly` is what the app should use: a disabled level is not a level anyone can reach,
+  // so the app must not promise it (the admin screen passes false to see everything).
+  async list(activeOnly = false) {
+    return this.prisma.hostLevel.findMany({ where: activeOnly ? { active: true } : undefined, orderBy: { level: 'asc' } });
+  }
+
+  // The lowest ACTIVE level whose unlocks include `feature` — the single definition used by
+  // both the "Reach Host Level N" error and the level shown in the app, so they cannot disagree.
+  private static levelFor(levels: { level: number; unlocks: unknown }[], feature: string): number | null {
+    const hit = levels.find((l) => Array.isArray(l.unlocks) && (l.unlocks as unknown[]).map(String).includes(feature));
+    return hit ? hit.level : null;
   }
 
   async rules() {
@@ -41,12 +52,19 @@ export class HostLevelsService {
     // forward whatever an earlier milestone level unlocked. Reading only
     // the current tier's own unlocks (as this used to) meant a host who
     // levelled past a milestone lost that unlock the moment they advanced
-    // — e.g. reaching Level 6 silently revoked the ONE_ON_ONE_VIDEO access
+    // — e.g. reaching Level 6 silently revoked a milestone unlock such as PRIVATE_LIVE
     // granted at Level 5, and any daily task or call gated on it would
     // start failing again right after the host leveled up.
     const unlocks = Array.from(
       new Set((reached.length ? reached : [fallback]).flatMap((l) => (Array.isArray(l.unlocks) ? l.unlocks.map(String) : []))),
     );
+
+    const unlockLevels: Record<string, number> = {};
+    for (const l of levels) {
+      for (const key of Array.isArray(l.unlocks) ? (l.unlocks as unknown[]).map(String) : []) {
+        if (unlockLevels[key] === undefined) unlockLevels[key] = l.level;
+      }
+    }
 
     return {
       xp: user.hostXp,
@@ -54,6 +72,8 @@ export class HostLevelsService {
       name: current.name,
       badgeUrl: current.badgeUrl,
       unlocks,
+      // feature key -> the level that unlocks it (same rule as the error message below).
+      unlockLevels,
       nextLevel: next ? { level: next.level, name: next.name, xpRequired: next.xpRequired } : null,
       progressXp: next ? Math.max(0, user.hostXp - current.xpRequired) : 0,
       requiredForNext: next ? Math.max(0, next.xpRequired - current.xpRequired) : 0,
@@ -61,15 +81,22 @@ export class HostLevelsService {
     };
   }
 
-  async assertUnlock(userId: string, feature: string) {
+  // Throws unless the host has unlocked `feature`. `label` names it for people ("voice calls").
+  async assertUnlock(userId: string, feature: string, label = 'this feature') {
+    return this.assertAnyUnlock(userId, [feature], label);
+  }
+
+  // Passes if the host has unlocked ANY of the features (e.g. voice OR video 1-on-1).
+  async assertAnyUnlock(userId: string, features: string[], label = 'this feature') {
     const p = await this.progress(userId);
     const unlocked = Array.isArray(p.unlocks) ? p.unlocks.map((x) => String(x)) : [];
-    if (!unlocked.includes(feature)) {
-      const levels = await this.prisma.hostLevel.findMany({ where: { active: true }, orderBy: { level: 'asc' } });
-      const required = levels.find((l) => Array.isArray(l.unlocks) && (l.unlocks as any[]).map(String).includes(feature));
-      throw new ForbiddenException(required ? `Reach Host Level ${required.level} to unlock this feature` : 'This host feature is not available yet');
-    }
-    return p;
+    if (features.some((f) => unlocked.includes(f))) return p;
+    const levels = await this.prisma.hostLevel.findMany({ where: { active: true }, orderBy: { level: 'asc' } });
+    const required = features
+      .map((f) => HostLevelsService.levelFor(levels, f))
+      .filter((n): n is number => n !== null)
+      .sort((a, b) => a - b)[0];
+    throw new ForbiddenException(required ? `Reach Host Level ${required} to unlock ${label}` : `${label[0].toUpperCase()}${label.slice(1)} is not available yet`);
   }
 
   async addXp(userId: string, amount: number) {
@@ -121,8 +148,8 @@ export class HostLevelsService {
     const unlocked = new Set(hostProgress.unlocks);
     return tasks
       .filter((task) => {
-        const requiredFeature = HostLevelsService.ACTIVITY_FEATURE_REQUIREMENTS[task.activityKey];
-        return !requiredFeature || unlocked.has(requiredFeature);
+        const requiredFeatures = HostLevelsService.ACTIVITY_FEATURE_REQUIREMENTS[task.activityKey];
+        return !requiredFeatures || requiredFeatures.some((f) => unlocked.has(f));
       })
       .map((task) => {
         const row = byTask.get(task.id);

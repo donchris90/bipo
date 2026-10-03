@@ -15,7 +15,7 @@ function build() {
     team: {
       findUnique: async ({ where }: any) => teams.get(where.id) ?? null,
       create: async ({ data }: any) => {
-        if ([...teams.values()].some((t) => t.name === data.name)) throw new Prisma.PrismaClientKnownRequestError('dup', { code: 'P2002' });
+        if ([...teams.values()].some((t) => t.name === data.name)) throw new Prisma.PrismaClientKnownRequestError('dup', { code: 'P2002', clientVersion: 'test' });
         const t = { id: `team-${++idCounter}`, teamXp: 0, teamLevel: 1, createdAt: new Date(), ...data };
         teams.set(t.id, t);
         return t;
@@ -45,7 +45,7 @@ function build() {
       },
       count: async ({ where }: any) => [...membersByUser.values()].filter((m) => m.teamId === where.teamId).length,
       create: async ({ data }: any) => {
-        if (membersByUser.has(data.userId)) throw new Prisma.PrismaClientKnownRequestError('dup', { code: 'P2002' });
+        if (membersByUser.has(data.userId)) throw new Prisma.PrismaClientKnownRequestError('dup', { code: 'P2002', clientVersion: 'test' });
         const m = { id: `member-${++idCounter}`, xp: 0, joinedAt: new Date(), ...data };
         membersByUser.set(data.userId, m);
         return m;

@@ -104,6 +104,69 @@ export class AdminService {
     };
   }
 
+  /**
+   * Finance-only platform economics snapshot. This deliberately reports
+   * accounting components rather than calling the result "profit": payment
+   * processor fees, app-store fees, tax and other operating costs are not
+   * represented by the wallet ledger.
+   */
+  async platformEconomics(days = 30) {
+    const safeDays = Number.isSafeInteger(days) ? Math.min(Math.max(days, 1), 365) : 30;
+    const since = new Date(Date.now() - safeDays * DAY_MS);
+
+    const [platformLedger, purchases, chargebacks, withdrawals] = await Promise.all([
+      this.prisma.ledgerEntry.findMany({
+        where: { walletId: null, createdAt: { gte: since } },
+        select: { type: true, amount: true },
+      }),
+      this.prisma.coinPurchase.aggregate({
+        where: { status: PurchaseStatus.CONFIRMED, confirmedAt: { gte: since } },
+        _sum: { amountMinor: true },
+        _count: { _all: true },
+      }),
+      this.prisma.chargeback.aggregate({
+        where: { createdAt: { gte: since } },
+        _sum: { amountMinor: true, coinAmount: true },
+        _count: { _all: true },
+      }),
+      this.prisma.withdrawalRequest.aggregate({
+        where: { requestedAt: { gte: since }, status: { in: [WithdrawalStatus.APPROVED, WithdrawalStatus.PAID] } },
+        _sum: { grossMinor: true, feeMinor: true, netMinor: true },
+        _count: { _all: true },
+      }),
+    ]);
+
+    const byType = new Map<string, bigint>();
+    for (const row of platformLedger) byType.set(row.type, (byType.get(row.type) ?? 0n) + row.amount);
+    const platformShareCoins = [...byType.values()].reduce((sum, n) => sum + (n > 0n ? n : 0n), 0n);
+    const bonusExpenseCoins = [...byType.values()].reduce((sum, n) => sum + (n < 0n ? -n : 0n), 0n);
+
+    return {
+      periodDays: safeDays,
+      asOf: new Date().toISOString(),
+      grossCoinPurchases: {
+        amountMinor: purchases._sum.amountMinor ?? 0,
+        count: purchases._count._all,
+      },
+      chargebacks: {
+        amountMinor: chargebacks._sum.amountMinor ?? 0,
+        coinAmount: chargebacks._sum.coinAmount ?? 0,
+        count: chargebacks._count._all,
+      },
+      platformShareCoins: platformShareCoins.toString(),
+      platformLedgerByType: Object.fromEntries([...byType.entries()].map(([type, amount]) => [type, amount.toString()])),
+      bonusExpenseCoins: bonusExpenseCoins.toString(),
+      platformShareAfterBonusExpenseCoins: (platformShareCoins - bonusExpenseCoins).toString(),
+      withdrawals: {
+        grossMinor: withdrawals._sum.grossMinor ?? 0,
+        feeMinor: withdrawals._sum.feeMinor ?? 0,
+        netMinor: withdrawals._sum.netMinor ?? 0,
+        count: withdrawals._count._all,
+      },
+      profitWarning: 'Not net profit: processor/app-store fees, taxes, FX, infrastructure, refunds and other operating costs are not fully represented here.',
+    };
+  }
+
   async users(q: Page & { search?: unknown; status?: unknown }) {
     const take = clampLimit(q.limit);
     const before = parseBefore(q.before);
@@ -134,7 +197,7 @@ export class AdminService {
     return rows.map((u) => ({ ...u, coinBalance: (balances.get(u.id) ?? 0n).toString(), roles: u.roles.map((r) => r.role) }));
   }
 
-  async grantCoins(userId: string, input: { amount?: unknown; wallet?: unknown; note?: unknown }) {
+  async grantCoins(userId: string, input: { amount?: unknown; wallet?: unknown; note?: unknown }, actorId?: string) {
     const amount = Number(input.amount);
     if (!Number.isSafeInteger(amount) || amount < 1 || amount > 10_000_000) {
       throw new Error('The amount must be a whole number from 1 to 10,000,000');
@@ -153,7 +216,7 @@ export class AdminService {
       idempotencyKey: `admin-grant:${randomUUID()}`,
     });
     await this.prisma.auditLog.create({
-      data: { action: 'wallet.admin_grant', targetType: 'user', targetId: user.id, metadata: { amount, wallet: walletType, note: note || null, ledgerEntryId: entry.id, via: 'admin-dashboard' } },
+      data: { actorId: actorId ?? null, action: 'wallet.admin_grant', targetType: 'user', targetId: user.id, metadata: { amount, wallet: walletType, note: note || null, ledgerEntryId: entry.id, via: 'admin-dashboard' } },
     });
     const after = await this.wallets.getBalance(user.id, walletType);
     return { ok: true, user, walletType, before: before.toString(), after: after.toString(), amount };

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Put, Query, Req, UseGuards } from '@nestjs/common';
 import { Throttle } from '@nestjs/throttler';
 import { UserThrottlerGuard } from '../common/guards/user-throttler.guard';
 import { LiveMediaService } from './live-media.service';
@@ -34,6 +34,25 @@ export class LiveController {
     return this.live.findMyWatchHistory(req.user.userId);
   }
 
+  // ── Private session rates (the host's saved price list) ──────
+
+  @Get('private/rates/mine')
+  myRates(@Req() req: AuthedRequest) {
+    return this.live.getMyRateCard(req.user.userId);
+  }
+
+  @Put('private/rates/mine')
+  saveMyRates(@Body('packages') packages: unknown, @Req() req: AuthedRequest) {
+    return this.live.saveMyRateCard(req.user.userId, packages);
+  }
+
+  // Anyone can see a host's rates (join sheet, host profile).
+  @Get('private/rates/host/:hostId')
+  hostRates(@Param('hostId') hostId: string) {
+    return this.live.getHostRateCard(hostId);
+  }
+
+
   @Post()
   create(
     @Body('title') title: string,
@@ -42,13 +61,9 @@ export class LiveController {
     @Body('coverUrl') coverUrl: string | undefined,
     @Body('dailyTargetCoins') dailyTargetCoins: number | string | undefined,
     @Body('privacy') privacy: 'PUBLIC' | 'PRIVATE' | undefined,
-    @Body('privatePriceCoins') privatePriceCoins: number | string | undefined,
-    @Body('privateDurationMinutes') privateDurationMinutes: number | string | undefined,
     @Req() req: AuthedRequest,
   ) {
     const target = dailyTargetCoins == null ? undefined : Number(dailyTargetCoins);
-    const price = privatePriceCoins == null ? undefined : Number(privatePriceCoins);
-    const duration = privateDurationMinutes == null ? undefined : Number(privateDurationMinutes);
     return this.live.create(
       req.user.userId,
       title,
@@ -58,8 +73,6 @@ export class LiveController {
       coverUrl,
       target,
       privacy === 'PRIVATE' ? 'PRIVATE' : 'PUBLIC',
-      price,
-      duration,
     );
   }
 
@@ -85,8 +98,14 @@ export class LiveController {
   // ── Paid private 1-on-1 live ────────────────────────────────
 
   @Post(':id/private/request')
-  requestPrivate(@Param('id') id: string, @Req() req: AuthedRequest) {
-    return this.live.requestPrivateAccess(id, req.user.userId);
+  requestPrivate(@Param('id') id: string, @Body('packageId') packageId: string | undefined, @Req() req: AuthedRequest) {
+    return this.live.requestPrivateAccess(id, req.user.userId, packageId);
+  }
+
+  // Viewer buys more time from the host's rate card while the session is running.
+  @Post(':id/private/renew')
+  renewPrivate(@Param('id') id: string, @Body('packageId') packageId: string | undefined, @Req() req: AuthedRequest) {
+    return this.live.renewPrivateSession(id, req.user.userId, packageId);
   }
 
   @Get(':id/private/status')
@@ -163,6 +182,16 @@ export class LiveController {
   @Post(':id/unban/:userId')
   unban(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
     return this.live.unbanViewer(id, req.user.userId, userId);
+  }
+
+  @Post(':id/moderators/:userId')
+  addModerator(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
+    return this.live.addModerator(id, req.user.userId, userId);
+  }
+
+  @Post(':id/moderators/:userId/remove')
+  removeModerator(@Param('id') id: string, @Param('userId') userId: string, @Req() req: AuthedRequest) {
+    return this.live.removeModerator(id, req.user.userId, userId);
   }
 
   @Post(':id/leave')

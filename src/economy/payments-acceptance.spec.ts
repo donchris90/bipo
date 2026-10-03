@@ -400,7 +400,7 @@ describe('Phase 4 — chargebacks and refunds', () => {
 
   // Documented in UPDATE-V7 as done; the code does not do it. These two tests describe what
   // the note promises, and are expected to FAIL until it is implemented.
-  it.failing('DEFECT: a Paystack refund.processed event claws the coins back (UPDATE-V7 says it does; the Paystack adapter ignores the event)', async () => {
+  it('a Paystack refund.processed event claws the coins back exactly once', async () => {
     const { w, p } = await confirmed();
     await w.webhook({ event: 'refund.processed', data: { transaction_reference: p.providerRef, reference: p.providerRef } });
     expect(await w.balance()).toBe(0n);
@@ -408,9 +408,10 @@ describe('Phase 4 — chargebacks and refunds', () => {
 });
 
 describe('Phase 4 — security findings', () => {
-  it.failing("DEFECT: reusing SOMEONE ELSE'S idempotency key returns their purchase (and payment link) instead of being refused", async () => {
+  it("reusing SOMEONE ELSE'S idempotency key is refused without exposing their purchase", async () => {
     const w = world();
-    await w.start('u1', KEY);
-    await expect(w.start('u2', KEY)).rejects.toBeDefined();
+    const first = await w.start('u1', KEY);
+    await expect(w.start('u2', KEY)).rejects.toThrow(/already used by another user/);
+    expect((w.purchases.get(first.id) as any).userId).toBe('u1');
   });
 });

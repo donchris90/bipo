@@ -35,6 +35,9 @@ model User {
   rrydaXp       Int            @default(0)
   rrydaLevel    Int            @default(1)
   oneOnOneEnabled Boolean       @default(true)
+  // What this host charges per minute for 1-on-1 calls. Null = use the admin default price.
+  videoCallPricePerMinute Int?
+  audioCallPricePerMinute Int?
   // First-run flow (pick interests, follow a few people). null = not completed yet. Existing
   // users are backfilled to their createdAt in the migration so only NEW sign-ups see it.
   onboardedAt   DateTime?
@@ -53,6 +56,7 @@ model User {
   profilePhotos ProfilePhoto[]
   liveViews     LiveViewer[]
   privateLiveRequests PrivateLiveRequest[]
+  privateRates  PrivateRatePackage[]
   liveModerators LiveModerator[]
   refreshTokens RefreshToken[]
   referredBy    User?          @relation("Referrals", fields: [referredById], references: [id])
@@ -276,12 +280,41 @@ model PrivateLiveRequest {
   endsAt          DateTime?
   settledAt       DateTime?
   refundedAt      DateTime?
+  // Rate-card package this block was bought from. Plain id (no FK): the host may edit their card
+  // later, and price/duration above are the snapshot that was actually charged.
+  packageId       String?
+  // Renewals are separate blocks chained to the first request, each settled on its own.
+  parentRequestId String?
+  // When this block's paid time begins. The first block starts when the viewer joins; a renewal
+  // starts where the previous block ends. Null on rows created before renewals existed.
+  blockStartsAt   DateTime?
+  // Recorded at settlement (end of session): what the host was credited (60%) and what the viewer
+  // got back for unused time. The platform keeps the rest of the delivered amount (40%).
+  hostCoins       Int                       @default(0)
+  refundedCoins   Int                       @default(0)
+  settleReason    String?
   session         LiveSession               @relation(fields: [sessionId], references: [id], onDelete: Cascade)
   viewer          User                      @relation(fields: [viewerId], references: [id], onDelete: Cascade)
 
   @@index([sessionId, status])
   @@index([viewerId, status])
   @@index([sessionId, viewerId])
+}
+
+// A host's saved price list for private 1-on-1 live ("5 min = 200 coins"). One row per package.
+model PrivateRatePackage {
+  id         String   @id @default(uuid())
+  hostId     String
+  minutes    Int
+  priceCoins Int
+  // What the host intends to offer for this rate; shown when a viewer taps the package.
+  description String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  host       User     @relation(fields: [hostId], references: [id], onDelete: Cascade)
+
+  @@unique([hostId, minutes])
+  @@index([hostId])
 }
 
 enum RoomMode {
@@ -1019,6 +1052,16 @@ model WithdrawalRequest {
   @@index([status])
 }
 
+// Single-row (id 'global') settings for agencies. minRrydaLevel is the Rryda Identity level a user
+// must reach before they can create an agency themselves; an admin can still create an agency for
+// anyone regardless of level.
+model AgencyConfig {
+  id            String   @id @default("global")
+  minRrydaLevel Int      @default(10)
+  updatedBy     String?
+  updatedAt     DateTime @default(now()) @updatedAt
+}
+
 model Agency {
   id        String       @id @default(uuid())
   name      String
@@ -1039,6 +1082,36 @@ model AgencyMembership {
   @@index([creatorId, status])
 }
 
+// A request to put a creator under an agency. APPLICATION = the creator asked to join (the agency
+// owner accepts and sets the commission); INVITE = the owner asked the creator (the creator
+// accepts at the commission the owner offered). Accepting creates the AgencyMembership.
+model AgencyRequest {
+  id            String              @id @default(uuid())
+  agencyId      String
+  creatorId     String
+  direction     AgencyRequestKind
+  status        AgencyRequestStatus @default(PENDING)
+  commissionBps Int?
+  message       String?
+  createdAt     DateTime            @default(now())
+  respondedAt   DateTime?
+
+  @@index([agencyId, status])
+  @@index([creatorId, status])
+}
+
+enum AgencyRequestKind {
+  APPLICATION
+  INVITE
+}
+
+enum AgencyRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELLED
+}
+
 model Call {
   id              String     @id @default(uuid())
   callerId        String
@@ -1051,16 +1124,30 @@ model Call {
   pricePerMinute  Int        @default(100)
   billedMinutes   Int        @default(0)
   totalCoins      Int        @default(0)
+  mediaType       CallMediaType @default(VIDEO)
+  // Platform cut (basis points) snapshotted when the call is created, so an admin change
+  // mid-call can't alter what this call pays out. hostCoins = what the host has actually earned.
+  platformFeeBps  Int        @default(4000)
+  hostCoins       Int        @default(0)
 
   @@index([callerId])
   @@index([calleeId])
 }
 
+enum CallMediaType {
+  VIDEO
+  AUDIO
+}
+
 model CallPricingConfig {
   id             String   @id @default(uuid())
   pricePerMinute Int      @default(100)
+  // Price of a voice-only call. Null = same as pricePerMinute.
+  audioPricePerMinute Int?
   maxDurationMin Int      @default(60)
   active         Boolean  @default(true)
+  // Share of every 1-on-1 call kept by the platform (calls cost more to run). 4000 = 40%.
+  platformFeeBps Int      @default(4000)
   updatedAt      DateTime @updatedAt
   createdAt      DateTime @default(now())
 }
@@ -1105,12 +1192,22 @@ model PKBattle {
 }
 
 model PKScoreConfig {
-  id            String  @id @default(uuid())
-  countryCode   String?
-  coinsPerPoint Int     @default(1)
-  active        Boolean @default(true)
+  id                String  @id @default(uuid())
+  countryCode       String?
+  coinsPerPoint     Int     @default(1)
+  winnerRewardCoins Int     @default(500)
+  active            Boolean @default(true)
 
   @@index([countryCode, active])
+}
+
+// Admin-editable referral reward (BONUS wallet), single row id = 'global'.
+// Defaults to 100 so behaviour is unchanged until an admin edits it.
+model ReferralConfig {
+  id          String   @id @default("global")
+  rewardCoins Int      @default(100)
+  updatedBy   String?
+  updatedAt   DateTime @updatedAt
 }
 
 model GameDefinition {
@@ -1149,6 +1246,7 @@ model LudoSpectatorBet {
   userId         String
   playerUserId   String
   coinAmount     Int
+  bonusAmount    Int                 @default(0)
   rewardAmount   Int                 @default(0)
   status         SpectatorBetStatus  @default(PLACED)
   idempotencyKey String              @unique
@@ -1165,6 +1263,7 @@ model AyoSpectatorBet {
   userId         String
   playerUserId   String
   coinAmount     Int
+  bonusAmount    Int                 @default(0)
   rewardAmount   Int                 @default(0)
   status         SpectatorBetStatus  @default(PLACED)
   idempotencyKey String              @unique
@@ -1684,7 +1783,6 @@ model SupporterLevel {
   badgeUrl   String?
   active     Boolean  @default(true)
   updatedAt  DateTime @updatedAt
-  fanClubJoinedAt DateTime?
 }
 
 // The per-relationship record itself: one row per (supporter, creator) pair, holding that pair's

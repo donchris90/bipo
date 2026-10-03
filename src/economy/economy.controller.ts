@@ -26,12 +26,18 @@ export class WalletController {
 
   @Get()
   async balances(@Req() req: AuthedRequest) {
-    const [coin, earnings, bonus] = await Promise.all([
+    const [coin, earnings, agencyEarnings, bonus] = await Promise.all([
       this.wallet.getBalance(req.user.userId, WalletType.COIN),
       this.wallet.getBalance(req.user.userId, WalletType.CREATOR_EARNINGS),
+      this.wallet.getBalance(req.user.userId, WalletType.AGENCY_EARNINGS),
       this.wallet.getBalance(req.user.userId, WalletType.BONUS),
     ]);
-    return { coin: coin.toString(), creatorEarnings: earnings.toString(), bonus: bonus.toString() };
+    return {
+      coin: coin.toString(),
+      creatorEarnings: earnings.toString(),
+      agencyEarnings: agencyEarnings.toString(),
+      bonus: bonus.toString(),
+    };
   }
 }
 

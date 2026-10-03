@@ -11,6 +11,7 @@ import { WalletService } from '../economy/wallet.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { RoleName, WalletType, LedgerEntryType } from '@prisma/client';
+import { ReferralConfigService } from '../referral-config/referral-config.service';
 
 function hashToken(token: string): string {
   // Refresh tokens are opaque random strings; we never store them raw.
@@ -26,11 +27,6 @@ function parseExpiryToMs(value: string): number {
   return n * mult;
 }
 
-// Referral bonus, coins, credited to both sides on a successful signup
-// with a valid code — a real economic decision made here, not something
-// hidden in a config file, since this project's whole economy is meant
-// to be inspectable rather than magic numbers scattered around.
-const REFERRAL_BONUS_COINS = 100n;
 
 @Injectable()
 export class AuthService {
@@ -41,6 +37,7 @@ export class AuthService {
     private readonly audit: AuditService,
     private readonly email: EmailService,
     private readonly wallet: WalletService,
+    private readonly referralConfig: ReferralConfigService,
   ) {}
 
   // Short, unique, manually-typeable — see the schema comment on
@@ -142,22 +139,19 @@ export class AuthService {
         } else if (sameIp) {
           await this.audit.record({ actorId: user.id, action: 'referral.same_ip_signal', targetType: 'user', targetId: referrer.id, ipAddress, metadata: { referredUserId: user.id } });
         }
-        if (!sameDevice) {
-          await this.wallet.credit({
-          userId: referrer.id,
-          walletType: WalletType.COIN,
-          amount: REFERRAL_BONUS_COINS,
-          ledgerType: LedgerEntryType.BONUS,
-          reference: `referral:${user.id}`,
-          idempotencyKey: `referral-bonus-referrer-${user.id}`,
-        });
-        await this.wallet.credit({
-          userId: user.id,
-          walletType: WalletType.COIN,
-          amount: REFERRAL_BONUS_COINS,
-          ledgerType: LedgerEntryType.BONUS,
-          reference: `referred-by:${referrer.id}`,
-          idempotencyKey: `referral-bonus-referee-${user.id}`,
+        const referralReward = BigInt(await this.referralConfig.getRewardCoins());
+        if (!sameDevice && referralReward > 0n) {
+          await this.prisma.$transaction(async (tx) => {
+            await this.wallet.credit({
+              userId: referrer.id, walletType: WalletType.BONUS, amount: referralReward,
+              ledgerType: LedgerEntryType.BONUS, reference: `referral:${user.id}`,
+              idempotencyKey: `referral-bonus-referrer-${user.id}`,
+            }, tx);
+            await this.wallet.credit({
+              userId: user.id, walletType: WalletType.BONUS, amount: referralReward,
+              ledgerType: LedgerEntryType.BONUS, reference: `referred-by:${referrer.id}`,
+              idempotencyKey: `referral-bonus-referee-${user.id}`,
+            }, tx);
           });
         }
       } catch (err) {

@@ -1,1 +1,0 @@
-ALTER TABLE "User" ADD COLUMN "oneOnOneEnabled" BOOLEAN NOT NULL DEFAULT true;

@@ -43,7 +43,7 @@ describe('country / economy configuration (admin)', () => {
     expect(await svc.isGamesEnabled('ZZ')).toBe(false);
   });
 
-  it.failing('DEFECT: nothing checks the currency code, country name or minimum age an admin types in (e.g. "XX", an empty name, age 0)', async () => {
+  it('rejects an invalid country code, empty country name, invalid currency code and unsafe minimum age', async () => {
     const { svc } = regional();
     await expect(svc.upsert({ countryCode: 'NG', countryName: '', currencyCode: 'naira!', defaultLanguage: 'en', minAge: 0 } as any, 'a', [] as any)).rejects.toBeInstanceOf(BadRequestException);
   });

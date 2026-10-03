@@ -34,7 +34,15 @@ export class CoinPurchaseService {
     }
 
     const existing = await this.prisma.coinPurchase.findUnique({ where: { idempotencyKey } });
-    if (existing) return existing; // idempotent on retry
+    if (existing) {
+      // Idempotency keys are scoped to the authenticated user. Reusing a key
+      // from another account must never reveal that user's purchase or checkout
+      // URL, even though the database key itself is globally unique.
+      if (existing.userId !== userId) {
+        throw new BadRequestException('Idempotency key is already used by another user');
+      }
+      return existing;
+    }
 
     const payment = await this.paymentProvider.createPayment({
       amountMinor: pkg.priceMinor,

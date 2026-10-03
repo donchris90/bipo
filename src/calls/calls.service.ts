@@ -7,7 +7,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { assertNotBlocked } from '../common/blocks';
 import { WalletService } from '../economy/wallet.service';
 import { RevenueSplitService } from '../economy/revenue-split.service';
-import { WalletType, LedgerEntryType, RoleName } from '@prisma/client';
+import { Prisma, WalletType, LedgerEntryType, RoleName, CallMediaType } from '@prisma/client';
 import { HostLevelsService } from '../host-levels/host-levels.service';
 import { AuditService } from '../audit/audit.service';
 
@@ -42,48 +42,143 @@ export class CallsService {
 
   async getPricing() {
     const config = await this.prisma.callPricingConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
-    return config ?? { id: 'default', pricePerMinute: 100, maxDurationMin: 60, active: true };
+    return config ?? { id: 'default', pricePerMinute: 100, audioPricePerMinute: null, maxDurationMin: 60, active: true, platformFeeBps: 4000 };
+  }
+
+  private static readonly MAX_HOST_PRICE = 1_000_000;
+
+  // Calls with a feature each: voice and video unlock separately in Host Levels.
+  private static featureFor(mediaType: CallMediaType) {
+    return mediaType === CallMediaType.AUDIO
+      ? { key: 'ONE_ON_ONE_AUDIO', label: 'voice calls' }
+      : { key: 'ONE_ON_ONE_VIDEO', label: 'video calls' };
+  }
+
+  // What this host charges per minute: their own price if they set one, otherwise the admin default.
+  private hostPriceFor(
+    host: { videoCallPricePerMinute?: number | null; audioCallPricePerMinute?: number | null },
+    pricing: { pricePerMinute: number; audioPricePerMinute?: number | null },
+    mediaType: CallMediaType,
+  ) {
+    const own = mediaType === CallMediaType.AUDIO ? host.audioCallPricePerMinute : host.videoCallPricePerMinute;
+    return own ?? this.priceFor(pricing, mediaType);
+  }
+
+  // What a caller sees BEFORE ringing someone: the host's prices and whether each kind is open.
+  async hostPricing(hostId: string) {
+    const [host, pricing, progress] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: hostId },
+        select: { id: true, oneOnOneEnabled: true, videoCallPricePerMinute: true, audioCallPricePerMinute: true, roles: { select: { role: true } } },
+      }),
+      this.getPricing(),
+      this.hostLevels.progress(hostId),
+    ]);
+    if (!host) throw new NotFoundException('User not found');
+    const isHost = host.roles.some((r) => r.role === RoleName.CREATOR);
+    const open = isHost && host.oneOnOneEnabled && pricing.active;
+    return {
+      hostId,
+      maxDurationMin: pricing.maxDurationMin,
+      audio: { available: open && progress.unlocks.includes('ONE_ON_ONE_AUDIO'), pricePerMinute: this.hostPriceFor(host, pricing, CallMediaType.AUDIO) },
+      video: { available: open && progress.unlocks.includes('ONE_ON_ONE_VIDEO'), pricePerMinute: this.hostPriceFor(host, pricing, CallMediaType.VIDEO) },
+    };
+  }
+
+  // The host's own settings screen: what they currently charge, the default they'd get otherwise,
+  // and the cut the platform keeps.
+  async myPricing(userId: string) {
+    const [me, pricing] = await Promise.all([
+      this.prisma.user.findUniqueOrThrow({ where: { id: userId }, select: { videoCallPricePerMinute: true, audioCallPricePerMinute: true } }),
+      this.getPricing(),
+    ]);
+    return {
+      audioPricePerMinute: me.audioCallPricePerMinute,
+      videoPricePerMinute: me.videoCallPricePerMinute,
+      defaultAudioPricePerMinute: this.priceFor(pricing, CallMediaType.AUDIO),
+      defaultVideoPricePerMinute: this.priceFor(pricing, CallMediaType.VIDEO),
+      platformFeeBps: pricing.platformFeeBps,
+      maxPricePerMinute: CallsService.MAX_HOST_PRICE,
+    };
+  }
+
+  // null/'' clears the host's own price (back to the default); undefined leaves it unchanged.
+  async updateMyPricing(userId: string, body: { audioPricePerMinute?: unknown; videoPricePerMinute?: unknown }) {
+    const creator = await this.prisma.userRole.findFirst({ where: { userId, role: RoleName.CREATOR } });
+    if (!creator) throw new ForbiddenException('Only hosts can set call prices');
+    const parse = (raw: unknown, name: string): number | null | undefined => {
+      if (raw === undefined) return undefined;
+      if (raw === null || raw === '') return null;
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1 || n > CallsService.MAX_HOST_PRICE) throw new BadRequestException(`${name} must be a whole number between 1 and ${CallsService.MAX_HOST_PRICE}`);
+      return n;
+    };
+    const audio = parse(body.audioPricePerMinute, 'Voice call price');
+    const video = parse(body.videoPricePerMinute, 'Video call price');
+    if (audio === undefined && video === undefined) throw new BadRequestException('Nothing to update');
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { ...(audio !== undefined ? { audioCallPricePerMinute: audio } : {}), ...(video !== undefined ? { videoCallPricePerMinute: video } : {}) },
+    });
+    return this.myPricing(userId);
+  }
+
+  // Voice calls fall back to the video price until an admin sets their own.
+  private priceFor(pricing: { pricePerMinute: number; audioPricePerMinute?: number | null }, mediaType: CallMediaType) {
+    return mediaType === CallMediaType.AUDIO ? pricing.audioPricePerMinute ?? pricing.pricePerMinute : pricing.pricePerMinute;
   }
 
   async updatePricing(body: any, actorId: string) {
     const pricePerMinute = Math.floor(Number(body.pricePerMinute));
     const maxDurationMin = Math.floor(Number(body.maxDurationMin));
     const active = body.active === undefined ? true : Boolean(body.active);
+    const audioRaw = body.audioPricePerMinute;
+    // Platform cut of every call, in basis points (4000 = 40%). Capped at 90% so a host always earns something.
+    const platformFeeBps = body.platformFeeBps === undefined || body.platformFeeBps === null || body.platformFeeBps === '' ? 4000 : Math.floor(Number(body.platformFeeBps));
+    if (!Number.isFinite(platformFeeBps) || platformFeeBps < 0 || platformFeeBps > 9000) throw new BadRequestException('platformFeeBps must be between 0 and 9000 (0%–90%)');
+    const audioPricePerMinute = audioRaw === undefined || audioRaw === null || audioRaw === '' ? null : Math.floor(Number(audioRaw));
+    if (audioPricePerMinute !== null && (!Number.isFinite(audioPricePerMinute) || audioPricePerMinute < 1 || audioPricePerMinute > 1_000_000)) throw new BadRequestException('audioPricePerMinute must be between 1 and 1000000');
     if (!Number.isFinite(pricePerMinute) || pricePerMinute < 1 || pricePerMinute > 1_000_000) throw new BadRequestException('pricePerMinute must be between 1 and 1000000');
     if (!Number.isFinite(maxDurationMin) || maxDurationMin < 1 || maxDurationMin > 240) throw new BadRequestException('maxDurationMin must be between 1 and 240');
     const existing = await this.prisma.callPricingConfig.findFirst({ orderBy: { updatedAt: 'desc' } });
     const config = existing
-      ? await this.prisma.callPricingConfig.update({ where: { id: existing.id }, data: { pricePerMinute, maxDurationMin, active } })
-      : await this.prisma.callPricingConfig.create({ data: { pricePerMinute, maxDurationMin, active } });
-    await this.audit.record({ actorId, actorRole: 'SUPER_ADMIN' as RoleName, action: 'call_pricing.update', targetType: 'call_pricing', targetId: config.id, metadata: { pricePerMinute, maxDurationMin, active } });
+      ? await this.prisma.callPricingConfig.update({ where: { id: existing.id }, data: { pricePerMinute, audioPricePerMinute, maxDurationMin, active, platformFeeBps } })
+      : await this.prisma.callPricingConfig.create({ data: { pricePerMinute, audioPricePerMinute, maxDurationMin, active, platformFeeBps } });
+    await this.audit.record({ actorId, actorRole: 'SUPER_ADMIN' as RoleName, action: 'call_pricing.update', targetType: 'call_pricing', targetId: config.id, metadata: { pricePerMinute, audioPricePerMinute, maxDurationMin, active, platformFeeBps } });
     return config;
   }
 
-  async initiate(callerId: string, calleeId: string) {
+  async initiate(callerId: string, calleeId: string, rawMediaType?: unknown) {
+    const mediaType = rawMediaType === 'AUDIO' ? CallMediaType.AUDIO : CallMediaType.VIDEO;
     if (callerId === calleeId) throw new BadRequestException("You can't call yourself");
     const callee = await this.prisma.user.findUnique({
       where: { id: calleeId },
-      select: { id: true, oneOnOneEnabled: true, roles: { select: { role: true } } },
+      select: { id: true, oneOnOneEnabled: true, videoCallPricePerMinute: true, audioCallPricePerMinute: true, roles: { select: { role: true } } },
     });
     if (!callee) throw new NotFoundException('User not found');
     if (!callee.roles.some((r) => r.role === RoleName.CREATOR)) throw new ForbiddenException('1-on-1 is available to hosts only');
-    await this.hostLevels.assertUnlock(calleeId, 'ONE_ON_ONE_VIDEO');
+    // Voice and video unlock separately (Host Levels: ONE_ON_ONE_AUDIO / ONE_ON_ONE_VIDEO). This used to
+    // check the video unlock for voice calls too, so a voice call told people "Level 5" while the admin
+    // had unlocked it at Level 3.
+    const feature = CallsService.featureFor(mediaType);
+    await this.hostLevels.assertUnlock(calleeId, feature.key, feature.label);
     if (!callee.oneOnOneEnabled) throw new ForbiddenException('This host is not currently accepting 1-on-1 requests');
     await assertNotBlocked(this.prisma, callerId, calleeId, "You can't call this user");
 
     const pricing = await this.getPricing();
-    if (!pricing.active) throw new ForbiddenException('1-on-1 video is currently disabled');
+    if (!pricing.active) throw new ForbiddenException('1-on-1 calls are currently disabled');
+    const price = this.hostPriceFor(callee, pricing, mediaType);
     const balance = await this.wallet.getBalance(callerId, WalletType.COIN);
-    if (balance < BigInt(pricing.pricePerMinute)) throw new BadRequestException(`You need at least ${pricing.pricePerMinute} coins to start this call`);
+    if (balance < BigInt(price)) throw new BadRequestException(`You need at least ${price} coins to start this call`);
 
     const existingRinging = await this.prisma.call.findFirst({
-      where: { callerId, calleeId, status: 'RINGING' },
+      where: { callerId, calleeId, status: 'RINGING', mediaType },
     });
     if (existingRinging) return existingRinging;
 
     const { channelName } = await this.rtc.createChannel(`call-${Date.now()}`);
     const call = await this.prisma.call.create({
-      data: { callerId, calleeId, providerChannel: channelName, pricePerMinute: pricing.pricePerMinute },
+      data: { callerId, calleeId, providerChannel: channelName, pricePerMinute: price, mediaType, platformFeeBps: pricing.platformFeeBps },
     });
 
     // The actual point of this whole feature — an instant signal to the
@@ -92,7 +187,7 @@ export class CallsService {
     // call-initiation time, not per-poll) so the incoming-call screen
     // shows a name instead of a raw id.
     const caller = await this.prisma.user.findUnique({ where: { id: callerId }, select: { displayName: true } });
-    this.realtime.emitToUser(calleeId, 'call:incoming', { callId: call.id, callerId, callerDisplayName: caller?.displayName ?? null });
+    this.realtime.emitToUser(calleeId, 'call:incoming', { callId: call.id, callerId, callerDisplayName: caller?.displayName ?? null, mediaType });
 
     return call;
   }
@@ -169,21 +264,32 @@ export class CallsService {
 
   private async settleDueMinutes(call: any) {
     if (call.status !== 'ACCEPTED' || !call.startedAt) return call;
-    const elapsedMs = Math.max(0, Date.now() - call.startedAt.getTime());
     const pricing = await this.getPricing();
-    const dueMinutes = Math.min(Math.ceil(elapsedMs / 60_000), pricing.maxDurationMin);
-    const additionalMinutes = Math.max(0, dueMinutes - call.billedMinutes);
-    if (additionalMinutes <= 0) return call;
-    const totalDue = additionalMinutes * call.pricePerMinute;
-    const host = await this.prisma.user.findUniqueOrThrow({ where: { id: call.calleeId }, select: { countryCode: true } });
-    const split = await this.revenueSplit.resolve(host.countryCode);
-    const creatorShare = Math.floor((totalDue * split.creatorShareBps) / 10000);
-    const platformShare = totalDue - creatorShare;
+    // Billing can be called concurrently by both clients, reconnect logic, or
+    // an end-of-call request. The wallet ledger is idempotent, but that alone
+    // is not enough: two callers could both observe the same billedMinutes and
+    // each increment Call.totalCoins. Lock the call row and re-read it inside
+    // the same transaction that performs the wallet movements.
     return this.prisma.$transaction(async (tx) => {
-      await this.wallet.debit({ userId: call.callerId, walletType: WalletType.COIN, amount: BigInt(totalDue), ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT, reference: call.id, idempotencyKey: `call:${call.id}:minutes:${dueMinutes}` }, tx);
-      if (creatorShare > 0) await this.wallet.credit({ userId: call.calleeId, walletType: WalletType.CREATOR_EARNINGS, amount: BigInt(creatorShare), ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT, reference: call.id, idempotencyKey: `call:${call.id}:creator:${dueMinutes}` }, tx);
-      if (platformShare > 0) await this.wallet.recordPlatformEntry({ ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT, amount: BigInt(platformShare), reference: call.id, idempotencyKey: `call:${call.id}:platform:${dueMinutes}` }, tx);
-      return tx.call.update({ where: { id: call.id }, data: { billedMinutes: dueMinutes, totalCoins: { increment: totalDue } } });
+      await tx.$queryRaw(Prisma.sql`SELECT "id" FROM "Call" WHERE "id" = ${call.id} FOR UPDATE`);
+      const current = await tx.call.findUnique({ where: { id: call.id } });
+      if (!current || current.status !== 'ACCEPTED' || !current.startedAt) return current ?? call;
+
+      const elapsedMs = Math.max(0, Date.now() - current.startedAt.getTime());
+      const dueMinutes = Math.min(Math.ceil(elapsedMs / 60_000), pricing.maxDurationMin);
+      const additionalMinutes = Math.max(0, dueMinutes - current.billedMinutes);
+      if (additionalMinutes <= 0) return current;
+
+      const totalDue = additionalMinutes * current.pricePerMinute;
+      // Calls use their own fixed split, not the country gift split: the platform keeps
+      // `platformFeeBps` (40% by default) because calls cost more to run; the host keeps the rest.
+      const creatorShare = Math.floor((totalDue * (10000 - current.platformFeeBps)) / 10000);
+      const platformShare = totalDue - creatorShare;
+
+      await this.wallet.debit({ userId: current.callerId, walletType: WalletType.COIN, amount: BigInt(totalDue), ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT, reference: current.id, idempotencyKey: `call:${current.id}:minutes:${dueMinutes}` }, tx);
+      if (creatorShare > 0) await this.wallet.credit({ userId: current.calleeId, walletType: WalletType.CREATOR_EARNINGS, amount: BigInt(creatorShare), ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT, reference: current.id, idempotencyKey: `call:${current.id}:creator:${dueMinutes}` }, tx);
+      if (platformShare > 0) await this.wallet.recordPlatformEntry({ ledgerType: LedgerEntryType.PRIVATE_LIVE_PAYMENT, amount: BigInt(platformShare), reference: current.id, idempotencyKey: `call:${current.id}:platform:${dueMinutes}` }, tx);
+      return tx.call.update({ where: { id: current.id }, data: { billedMinutes: dueMinutes, totalCoins: { increment: totalDue }, hostCoins: { increment: creatorShare } } });
     });
   }
 
@@ -212,7 +318,19 @@ export class CallsService {
     if (call.status === 'ENDED' || call.status === 'DECLINED' || call.status === 'MISSED') return call;
     let finalCall = call;
     if (!skipBilling && call.status === 'ACCEPTED' && call.startedAt) {
-      try { finalCall = await this.settleDueMinutes(call); } catch { /* insufficient balance: end without an unpaid partial minute */ }
+      try {
+        finalCall = await this.settleDueMinutes(call);
+      } catch (e) {
+        // Only insufficient caller funds should end the call without billing
+        // the remaining minute. Any other failure (DB, ledger, transaction,
+        // configuration, etc.) must surface so we do not silently end a paid
+        // call while leaving creator/platform revenue unrecorded.
+        if (e instanceof BadRequestException && /Insufficient balance/i.test(e.message)) {
+          finalCall = call;
+        } else {
+          throw e;
+        }
+      }
     }
 
     await this.rtc.destroyChannel(finalCall.providerChannel);
@@ -247,13 +365,15 @@ export class CallsService {
       const isCaller = call.callerId === userId;
       const other = byId.get(isCaller ? call.calleeId : call.callerId);
       const host = byId.get(call.calleeId);
-      const split = host ? await this.revenueSplit.resolve(host.countryCode) : { creatorShareBps: 0 };
+      // Calls made before the 60/40 call split have no hostCoins recorded: fall back to the old country split.
+      const legacy = call.hostCoins === 0 && call.totalCoins > 0;
+      const split = legacy && host ? await this.revenueSplit.resolve(host.countryCode) : { creatorShareBps: 0 };
       return {
         ...call,
         direction: isCaller ? 'OUTGOING' : 'INCOMING',
         otherUser: other ?? { id: isCaller ? call.calleeId : call.callerId, displayName: null, avatarUrl: null },
         amountSpent: isCaller ? call.totalCoins : 0,
-        amountEarned: !isCaller ? Math.floor((call.totalCoins * split.creatorShareBps) / 10000) : 0,
+        amountEarned: !isCaller ? (legacy ? Math.floor((call.totalCoins * split.creatorShareBps) / 10000) : call.hostCoins) : 0,
       };
     }));
   }

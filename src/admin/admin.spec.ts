@@ -53,10 +53,17 @@ function build(prismaOverrides: Record<string, any> = {}) {
     kycSubmission: { count, findMany: jest.fn().mockResolvedValue([]) },
     coinPurchase: {
       groupBy: jest.fn().mockResolvedValue([{ currencyCode: 'NGN', _sum: { amountMinor: 500000 }, _count: { _all: 4 } }]),
+      aggregate: jest.fn().mockResolvedValue({ _sum: { amountMinor: 500000 }, _count: { _all: 4 } }),
+    },
+    chargeback: {
+      aggregate: jest.fn().mockResolvedValue({ _sum: { amountMinor: 0, coinAmount: 0 }, _count: { _all: 0 } }),
+    },
+    ledgerEntry: {
+      findMany: jest.fn().mockResolvedValue([]),
     },
     ...prismaOverrides,
   };
-  return { svc: new AdminService(prisma), prisma };
+  return { svc: new AdminService(prisma, {} as any), prisma };
 }
 
 describe('AdminService.overview', () => {
@@ -75,6 +82,30 @@ describe('AdminService.overview', () => {
     expect(o.finance).toBeNull();
     expect(prisma.coinPurchase.groupBy).not.toHaveBeenCalled();
     expect(prisma.withdrawalRequest.aggregate).not.toHaveBeenCalled();
+  });
+});
+
+describe('AdminService.platformEconomics', () => {
+  it('separates platform ledger share, bonus expense, purchases, chargebacks and withdrawals', async () => {
+    const { svc, prisma } = build();
+    prisma.ledgerEntry.findMany.mockResolvedValue([
+      { type: 'GIFT_RECEIVED', amount: 700n },
+      { type: 'PRIVATE_LIVE_PAYMENT', amount: 300n },
+      { type: 'GAME_REWARD', amount: 100n },
+      { type: 'BONUS', amount: -50n },
+    ]);
+    prisma.coinPurchase.aggregate.mockResolvedValue({ _sum: { amountMinor: 100000 }, _count: { _all: 2 } });
+    prisma.chargeback.aggregate.mockResolvedValue({ _sum: { amountMinor: 1000, coinAmount: 100 }, _count: { _all: 1 } });
+    prisma.withdrawalRequest.aggregate.mockResolvedValue({ _sum: { grossMinor: 3000, feeMinor: 100, netMinor: 2900 }, _count: { _all: 1 } });
+
+    const result = await svc.platformEconomics(30);
+    expect(result.platformShareCoins).toBe('1100');
+    expect(result.bonusExpenseCoins).toBe('50');
+    expect(result.platformShareAfterBonusExpenseCoins).toBe('1050');
+    expect(result.grossCoinPurchases).toEqual({ amountMinor: 100000, count: 2 });
+    expect(result.chargebacks).toEqual({ amountMinor: 1000, coinAmount: 100, count: 1 });
+    expect(result.withdrawals).toEqual({ grossMinor: 3000, feeMinor: 100, netMinor: 2900, count: 1 });
+    expect(prisma.ledgerEntry.findMany.mock.calls[0][0].where.walletId).toBeNull();
   });
 });
 
@@ -107,7 +138,7 @@ describe('AdminController access', () => {
   const rolesOf = (method: keyof AdminController): RoleName[] => Reflect.getMetadata(ROLES_KEY, AdminController.prototype[method]);
 
   it('every route requires an admin role — a normal user or creator is never enough', () => {
-    for (const m of ['overview', 'users', 'creatorApplications', 'withdrawals', 'purchases', 'agencies', 'liveSessions', 'auditLog', 'moderationActions', 'games'] as const) {
+    for (const m of ['overview', 'users', 'creatorApplications', 'withdrawals', 'purchases', 'agencies', 'liveSessions', 'auditLog', 'moderationActions', 'games', 'platformEconomics'] as const) {
       const roles = rolesOf(m);
       expect(roles.length).toBeGreaterThan(0);
       expect(roles).not.toContain(RoleName.USER);
@@ -116,6 +147,7 @@ describe('AdminController access', () => {
   });
 
   it('money data is finance-only, moderation data is trust-and-safety, games are game-operator', () => {
+    expect(rolesOf('platformEconomics').sort()).toEqual([RoleName.FINANCE_ADMIN, RoleName.SUPER_ADMIN].sort());
     expect(rolesOf('withdrawals').sort()).toEqual([RoleName.FINANCE_ADMIN, RoleName.SUPER_ADMIN].sort());
     expect(rolesOf('purchases')).not.toContain(RoleName.TRUST_SAFETY_ADMIN);
     expect(rolesOf('auditLog')).not.toContain(RoleName.FINANCE_ADMIN);

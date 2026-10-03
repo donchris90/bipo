@@ -50,9 +50,19 @@ export class RegionalConfigService {
     actorId: string,
     actorRoles: RoleName[],
   ) {
-    const countryCode = data.countryCode.toUpperCase();
+    const countryCode = String(data.countryCode ?? '').trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(countryCode)) throw new BadRequestException('countryCode must be a 2-letter ISO country code');
+    const countryName = String(data.countryName ?? '').trim();
+    if (!countryName || countryName.length > 100) throw new BadRequestException('countryName is required (up to 100 characters)');
+    const currencyCode = String(data.currencyCode ?? '').trim().toUpperCase();
+    if (!/^[A-Z]{3}$/.test(currencyCode)) throw new BadRequestException('currencyCode must be a 3-letter ISO currency code');
+    const defaultLanguage = String(data.defaultLanguage ?? '').trim();
+    if (!/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?$/.test(defaultLanguage)) throw new BadRequestException('defaultLanguage must be a language code such as "en" or "fr-CA"');
+    if (data.minAge !== undefined && (!Number.isInteger(Number(data.minAge)) || Number(data.minAge) < 13 || Number(data.minAge) > 99)) {
+      throw new BadRequestException('minAge must be a whole number from 13 to 99');
+    }
     const paymentMethods = Array.isArray(data.paymentMethods)
-      ? [...new Set(data.paymentMethods.map((v) => String(v).toUpperCase()).filter((v) => ['PAYSTACK', 'CRYPTO', 'C2C'].includes(v)))]
+      ? [...new Set(data.paymentMethods.map((v) => String(v).toUpperCase()).filter((v) => ['PAYSTACK', 'CRYPTO'].includes(v)))]
       : undefined;
     const creatorEarningMinorPer100Coins = data.creatorEarningMinorPer100Coins == null ? data.creatorEarningMinorPer100Coins : Number(data.creatorEarningMinorPer100Coins);
     const coinUsdCentsPer100 = data.coinUsdCentsPer100 == null ? data.coinUsdCentsPer100 : Number(data.coinUsdCentsPer100);
@@ -66,7 +76,7 @@ export class RegionalConfigService {
     if (c2cFiatMinorPer100Coins != null && (!Number.isInteger(c2cFiatMinorPer100Coins) || c2cFiatMinorPer100Coins <= 0)) {
       throw new BadRequestException('c2cFiatMinorPer100Coins must be a positive whole number');
     }
-    const clean = { ...data, countryCode, ...(paymentMethods ? { paymentMethods } : {}), creatorEarningMinorPer100Coins, coinUsdCentsPer100, c2cFiatMinorPer100Coins };
+    const clean = { ...data, countryCode, countryName, currencyCode, defaultLanguage, ...(paymentMethods ? { paymentMethods } : {}), creatorEarningMinorPer100Coins, coinUsdCentsPer100, c2cFiatMinorPer100Coins };
     const config = await this.prisma.regionalConfig.upsert({
       where: { countryCode },
       update: clean,

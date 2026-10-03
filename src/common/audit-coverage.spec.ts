@@ -5,7 +5,7 @@ import { ROLES_KEY } from './decorators/roles.decorator';
 const SRC = join(__dirname, '..');
 function walk(d: string): string[] { return readdirSync(d).flatMap((f) => { const p = join(d, f); return statSync(p).isDirectory() ? (f === 'node_modules' ? [] : walk(p)) : p.endsWith('.ts') && !p.endsWith('.spec.ts') ? [p] : []; }); }
 const METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'];
-export const AUDIT = /audit[A-Za-z]*\.record\(|\.audit\.record\(|logModeration|moderationAction\.create/;
+export const AUDIT = /audit[A-Za-z]*\.record\(|\.audit\.record\(|logModeration|moderationAction\.create|auditLog\.create/;
 
 // Phase 6: does every admin/privileged WRITE action leave an audit-log entry? This follows
 // each write route into the service method it calls and looks for an audit record there.

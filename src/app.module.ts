@@ -10,7 +10,6 @@ import { FeatureFlagsModule } from './feature-flags/feature-flags.module';
 import { SocialModule } from './social/social.module';
 import { NotificationsModule } from './notifications/notifications.module';
 import { MessagesModule } from './messages/messages.module';
-import { CallsModule } from './calls/calls.module';
 import { SearchModule } from './search/search.module';
 import { FeedModule } from './feed/feed.module';
 import { LiveModule } from './live/live.module';
@@ -20,6 +19,7 @@ import { EconomyModule } from './economy/economy.module';
 import { CreatorsModule } from './creators/creators.module';
 import { AgenciesModule } from './agencies/agencies.module';
 import { PkModule } from './pk/pk.module';
+import { ReferralConfigModule } from './referral-config/referral-config.module';
 import { GamesModule } from './games/games.module';
 import { QueueModule } from './queue/queue.module';
 import { JobsModule } from './jobs/jobs.module';
@@ -62,7 +62,6 @@ import { TranslationModule } from './translation/translation.module';
     SocialModule,
     NotificationsModule,
     MessagesModule,
-    CallsModule,
     SearchModule,
     FeedModule,
     LiveModule,
@@ -72,6 +71,7 @@ import { TranslationModule } from './translation/translation.module';
     CreatorsModule,
     AgenciesModule,
     PkModule,
+    ReferralConfigModule,
     GamesModule,
     JobsModule,
     ReconciliationModule,

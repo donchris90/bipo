@@ -20,11 +20,23 @@ export class CallsController {
   @Get('pricing')
   pricing() { return this.calls.getPricing(); }
 
+  // Declared before ':id' routes so 'my-pricing' / 'pricing/:hostId' are never read as a call id.
+  @Get('my-pricing')
+  myPricing(@Req() req: AuthedRequest) { return this.calls.myPricing(req.user.userId); }
+
+  @Put('my-pricing')
+  updateMyPricing(@Body() body: { audioPricePerMinute?: unknown; videoPricePerMinute?: unknown }, @Req() req: AuthedRequest) {
+    return this.calls.updateMyPricing(req.user.userId, body ?? {});
+  }
+
+  @Get('pricing/:hostId')
+  hostPricing(@Param('hostId') hostId: string) { return this.calls.hostPricing(hostId); }
+
   @Post()
   @UseGuards(UserThrottlerGuard)
   @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  initiate(@Body('calleeId') calleeId: string, @Req() req: AuthedRequest) {
-    return this.calls.initiate(req.user.userId, calleeId);
+  initiate(@Body('calleeId') calleeId: string, @Body('mediaType') mediaType: string | undefined, @Req() req: AuthedRequest) {
+    return this.calls.initiate(req.user.userId, calleeId, mediaType);
   }
 
   @Get('history')

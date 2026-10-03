@@ -88,6 +88,14 @@ describe('WalletService', () => {
     expect(await wallet.getBalance('u1', WalletType.COIN)).toBe(50n); // not 100n
   });
 
+  it('rejects BONUS ledger credits into the COIN wallet', async () => {
+    const { wallet } = makeService();
+    await expect(wallet.credit({
+      userId: 'u1', walletType: WalletType.COIN, amount: 10n,
+      ledgerType: LedgerEntryType.BONUS, idempotencyKey: 'bonus-into-coin',
+    })).rejects.toThrow('BONUS rewards must be credited to the BONUS wallet');
+  });
+
   it('rejects a non-positive credit or debit amount', async () => {
     const { wallet } = makeService();
     await expect(

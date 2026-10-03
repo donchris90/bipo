@@ -8,6 +8,7 @@ import { AuthController } from './auth.controller';
 import { JwtStrategy } from './strategies/jwt.strategy';
 import { EmailModule } from '../notifications/email/email.module';
 import { EconomyModule } from '../economy/economy.module';
+import { ReferralConfigModule } from '../referral-config/referral-config.module';
 
 @Module({
   imports: [
@@ -15,6 +16,7 @@ import { EconomyModule } from '../economy/economy.module';
     ConfigModule,
     EmailModule,
     EconomyModule,
+    ReferralConfigModule,
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],

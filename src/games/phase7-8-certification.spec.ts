@@ -59,7 +59,7 @@ describe('Phase 8 — social/communications certification invariants', () => {
     };
     const notifications: any = { create: jest.fn().mockResolvedValue({}) };
     const audit: any = { record: jest.fn() };
-    const svc = new SocialService(prisma, audit, notifications);
+    const svc = new (SocialService as any)(prisma, audit, notifications, { addXp: jest.fn() }, { contributeXp: jest.fn() }, { contributePoints: jest.fn() });
 
     await expect(svc.follow('u1', 'u1')).rejects.toThrow();
     await svc.follow('u1', 'u2');

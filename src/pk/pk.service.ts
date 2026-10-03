@@ -736,26 +736,64 @@ export class PkService implements OnModuleDestroy {
     ]);
   }
 
-  // Winner coin reward — a real payout, separate from Season points, on top of whatever the
-  // winner already earned from gifts received during the battle. Skips draws entirely (there is
-  // no winner to pay) and is guarded on rewardCoinsPaid so a retried settle, or settleIfDue racing
-  // a forfeit, can never pay twice.
-  private static readonly WINNER_REWARD_COINS = 500n;
+  // Winner bonus is configurable through PKScoreConfig. A 500-coin default keeps
+  // existing behavior intact when no configuration row has been created yet.
+  // The reward remains BONUS (not COIN), so it cannot be withdrawn or converted
+  // into creator earnings.
+  private static readonly DEFAULT_WINNER_REWARD_COINS = 500;
+
+  async getWinnerRewardConfig() {
+    const config = await this.prisma.pKScoreConfig.findFirst({ where: { active: true, countryCode: null }, orderBy: { id: 'desc' } });
+    return { winnerRewardCoins: config?.winnerRewardCoins ?? PkService.DEFAULT_WINNER_REWARD_COINS };
+  }
+
+  async updateWinnerRewardConfig(winnerRewardCoinsInput: unknown, actorId?: string) {
+    const winnerRewardCoins = Number(winnerRewardCoinsInput);
+    if (!Number.isInteger(winnerRewardCoins) || winnerRewardCoins < 0 || winnerRewardCoins > 1_000_000) {
+      throw new BadRequestException('winnerRewardCoins must be a whole number between 0 and 1000000');
+    }
+
+    const existing = await this.prisma.pKScoreConfig.findFirst({ where: { active: true, countryCode: null }, orderBy: { id: 'desc' } });
+    const config = existing
+      ? await this.prisma.pKScoreConfig.update({ where: { id: existing.id }, data: { winnerRewardCoins } })
+      : await this.prisma.pKScoreConfig.create({ data: { winnerRewardCoins, active: true } });
+    await this.prisma.auditLog.create({
+      data: {
+        actorId: actorId ?? null, action: 'pk.winner_reward_updated', targetType: 'pk_score_config', targetId: String(config.id),
+        metadata: { before: existing?.winnerRewardCoins ?? null, after: winnerRewardCoins },
+      },
+    });
+    return { winnerRewardCoins: config.winnerRewardCoins, configId: config.id };
+  }
 
   private async payWinnerReward(battleId: string, winnerId: string | null) {
     if (!winnerId || !this.wallet) return;
-    const flipped = await this.prisma.pKBattle.updateMany({
-      where: { id: battleId, rewardCoinsPaid: false },
-      data: { rewardCoinsPaid: true },
-    });
-    if (flipped.count === 0) return; // already paid (or lost the race to another caller)
-    await this.wallet.credit({
-      userId: winnerId,
-      walletType: WalletType.BONUS,
-      amount: PkService.WINNER_REWARD_COINS,
-      ledgerType: LedgerEntryType.BONUS,
-      reference: `pk_win:${battleId}`,
-      idempotencyKey: `pk_win:${battleId}`,
+    const config = await this.prisma.pKScoreConfig.findFirst({ where: { active: true, countryCode: null }, orderBy: { id: 'desc' } });
+    const configuredReward = Number(config?.winnerRewardCoins ?? PkService.DEFAULT_WINNER_REWARD_COINS);
+    const rewardCoins = Number.isInteger(configuredReward) && configuredReward >= 0 && configuredReward <= 1_000_000
+      ? BigInt(configuredReward)
+      : BigInt(PkService.DEFAULT_WINNER_REWARD_COINS);
+    if (rewardCoins === 0n) return;
+    const wallet = this.wallet; // narrowed above; keep the non-optional reference inside the callback
+
+    // Claiming the reward and crediting BONUS must be one transaction. The old
+    // order flipped rewardCoinsPaid first; if wallet credit then failed, the
+    // battle was permanently marked paid and the winner could never be retried.
+    await this.prisma.$transaction(async (tx) => {
+      const flipped = await tx.pKBattle.updateMany({
+        where: { id: battleId, rewardCoinsPaid: false },
+        data: { rewardCoinsPaid: true },
+      });
+      if (flipped.count === 0) return; // already paid (or lost the race)
+
+      await wallet.credit({
+        userId: winnerId,
+        walletType: WalletType.BONUS,
+        amount: rewardCoins,
+        ledgerType: LedgerEntryType.BONUS,
+        reference: `pk_win:${battleId}`,
+        idempotencyKey: `pk_win:${battleId}`,
+      }, tx);
     });
   }
 

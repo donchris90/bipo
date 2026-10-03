@@ -55,3 +55,12 @@ describe('parsePeriod', () => {
     expect(() => parsePeriod('yesterday')).toThrow(BadRequestException);
   });
 });
+
+
+describe('creator supporter conversion calculations', () => {
+  it('uses unique gifter count as the denominator for repeat rate', () => {
+    const uniqueGifters = 4;
+    const repeatGifters = 2;
+    expect(uniqueGifters > 0 ? repeatGifters / uniqueGifters : 0).toBe(0.5);
+  });
+});

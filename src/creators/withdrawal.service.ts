@@ -163,7 +163,7 @@ export class WithdrawalService {
       });
     }, EXTENDED_TX_OPTIONS);
 
-    if (!risk.needsReview) {
+    if (!risk.needsReview && !manualReview) {
       await this.processPayout(withdrawal.id);
     }
 

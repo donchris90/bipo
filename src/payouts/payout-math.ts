@@ -70,7 +70,7 @@ export function validatePayoutConfig(raw: any): PayoutConfigInput {
     if (v !== undefined && v !== null && v !== '' && (!Number.isInteger(v) || v < 1 || v > max)) errors.push(`${label} must be empty or a positive whole number`);
   }
   if (raw.cooldownHours !== undefined && (!Number.isInteger(raw.cooldownHours) || raw.cooldownHours < 0 || raw.cooldownHours > 168)) errors.push('cooldownHours must be a whole number from 0 to 168');
-  if (raw.allowedProviders !== undefined && raw.allowedProviders !== null && (!Array.isArray(raw.allowedProviders) || raw.allowedProviders.some((v: any) => !['PAYSTACK','CRYPTO','C2C','BANK'].includes(String(v).toUpperCase())))) errors.push('allowedProviders contains an unsupported provider');
+  if (raw.allowedProviders !== undefined && raw.allowedProviders !== null && (!Array.isArray(raw.allowedProviders) || raw.allowedProviders.some((v: any) => !['PAYSTACK','CRYPTO','C2C','BANK','BANK_TRANSFER'].includes(String(v).toUpperCase())))) errors.push('allowedProviders contains an unsupported provider');
   if (!isInt(raw.minorPer100Coins, 1, 100_000_000)) errors.push('minorPer100Coins must be a whole number of at least 1');
   if (!isInt(raw.minWithdrawalCoins, 1, 1_000_000_000)) errors.push('minWithdrawalCoins must be a whole number of at least 1');
   const max = raw.maxWithdrawalCoins === undefined || raw.maxWithdrawalCoins === null || raw.maxWithdrawalCoins === '' ? null : raw.maxWithdrawalCoins;

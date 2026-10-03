@@ -292,7 +292,7 @@ export class GiftService {
         await this.wallet.credit(
           {
             userId: params.senderId,
-            walletType: WalletType.COIN,
+            walletType: WalletType.BONUS,
             amount: BigInt(luckyCoins),
             ledgerType: LedgerEntryType.BONUS,
             reference: params.idempotencyKey,

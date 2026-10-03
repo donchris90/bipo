@@ -248,7 +248,8 @@ export class MissionsService {
       tier,
       rewardCoins: target.rewardCoins,
       bonusBalance: bonus.toString(),
-      perfectDayStreak: streakResult ? streakResult.nextStreak : undefined,
+      // TS can't see the assignment made inside the transaction callback and narrows to never.
+      perfectDayStreak: (streakResult as { nextStreak: number } | null)?.nextStreak,
     };
   }
 

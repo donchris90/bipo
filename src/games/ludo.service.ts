@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { WalletService } from '../economy/wallet.service';
 import { RoundService } from './round.service';
 import { LedgerEntryType, WalletType } from '@prisma/client';
+import { planStake, creditGameReward } from './game-payout';
 import { v4 as uuid } from 'uuid';
 import { ConfigService } from '@nestjs/config';
 import IORedis from 'ioredis';
@@ -11,6 +12,11 @@ import { randomInt } from 'node:crypto';
 import { calculateSpectatorPoolSplit, calculateWinningSpectatorReward } from './ludo-payout';
 import { randomPlayerNames } from './bot-names';
 import { AUTOPILOT_AFTER_MISSED_TURNS, createLudoState, LudoPlayerState, LudoState, TURN_MS, advanceTurn, applyMove, giveControlBack, handToAi, isAiControlled, legalMoves, pickBotMove, recordFinish, rollForTurn, serverActsAt } from './ludo.rules';
+
+// BONUS and COIN are both spendable in games (BONUS is spent first), so affordability is their sum.
+export function hasSufficientSpendableGameBalance(coinBalance: bigint, bonusBalance: bigint, entryFee: number): boolean {
+  return coinBalance + bonusBalance >= BigInt(entryFee);
+}
 
 // A search whose app has not checked in for this long is treated as abandoned (the app polls every 2 s).
 const STALE_TICKET_MS = 20_000;
@@ -266,8 +272,9 @@ export class LudoService implements OnModuleDestroy {
       if (paid) {
         const funded: QueueItem[] = [];
         for (const h of humans) {
-          const balance = await this.wallet.getBalance(h.userId, WalletType.COIN).catch(() => 0n);
-          if (balance >= BigInt(data.entryFee)) funded.push(h); else broke.push(h);
+          const bonusBal = await this.wallet.getBalance(h.userId, WalletType.BONUS).catch(() => 0n);
+          const coinBal = await this.wallet.getBalance(h.userId, WalletType.COIN).catch(() => 0n);
+          if (hasSufficientSpendableGameBalance(coinBal, bonusBal, data.entryFee)) funded.push(h); else broke.push(h);
         }
         humans = funded;
         for (const b of broke) {
@@ -427,8 +434,9 @@ export class LudoService implements OnModuleDestroy {
     const dropped: QueueItem[] = [];
     for (const p of room.players) {
       if (p.synthetic) { keep.push(p); continue; }
-      const balance = await this.wallet.getBalance(p.userId, WalletType.COIN).catch(() => null);
-      if (balance !== null && balance < BigInt(room.entryFee)) dropped.push(p); else keep.push(p);
+      const bonus = await this.wallet.getBalance(p.userId, WalletType.BONUS).catch(() => 0n);
+      const coin = await this.wallet.getBalance(p.userId, WalletType.COIN).catch(() => 0n);
+      if (bonus + coin < BigInt(room.entryFee)) dropped.push(p); else keep.push(p);
     }
     room.players = keep;
     return dropped;
@@ -689,8 +697,10 @@ export class LudoService implements OnModuleDestroy {
     const round = await this.prisma.$transaction(async tx => {
       const created = await tx.gameRound.create({ data: { id: matchId, gameCode: 'LUDO', rulesVersion: 1, entryPrice: entryFee, openAt: now, lockAt: new Date(now.getTime() + 10_000), status: 'OPEN', hiddenState: {} as any } });
       for (const p of practice ? [] : players.filter(x => !x.synthetic)) {
-        await this.wallet.debit({ userId: p.userId, walletType: WalletType.COIN, amount: BigInt(entryFee), ledgerType: LedgerEntryType.GAME_ENTRY, reference: created.id, idempotencyKey: `ludo_entry:${created.id}:${p.userId}` }, tx);
-        await tx.gameEntry.create({ data: { roundId: created.id, userId: p.userId, selection: { roomCode }, coinAmount: entryFee, idempotencyKey: `ludo_entry_record:${created.id}:${p.userId}` } });
+        const funding = planStake(entryFee, await this.wallet.getBalance(p.userId, WalletType.BONUS), true);
+        if (funding.bonus > 0) await this.wallet.debit({ userId: p.userId, walletType: WalletType.BONUS, amount: BigInt(funding.bonus), ledgerType: LedgerEntryType.GAME_ENTRY, reference: created.id, idempotencyKey: `ludo_entry_bonus:${created.id}:${p.userId}` }, tx);
+        if (funding.coin > 0) await this.wallet.debit({ userId: p.userId, walletType: WalletType.COIN, amount: BigInt(funding.coin), ledgerType: LedgerEntryType.GAME_ENTRY, reference: created.id, idempotencyKey: `ludo_entry:${created.id}:${p.userId}` }, tx);
+        await tx.gameEntry.create({ data: { roundId: created.id, userId: p.userId, selection: { roomCode }, coinAmount: entryFee, bonusAmount: funding.bonus, idempotencyKey: `ludo_entry_record:${created.id}:${p.userId}` } });
       }
       return created;
     }, { maxWait: 15000, timeout: 60000 });
@@ -974,7 +984,7 @@ export class LudoService implements OnModuleDestroy {
         const entry = await tx.gameEntry.findFirst({ where: { roundId: state.matchId, userId, status: 'PLACED' } });
         if (!entry) continue;
         if (amount > 0) {
-          await this.wallet.credit({ userId, walletType: WalletType.COIN, amount: BigInt(amount), ledgerType: LedgerEntryType.GAME_REWARD, reference: entry.id, idempotencyKey: `ludo_reward:${entry.id}` }, tx);
+          await creditGameReward(this.wallet, { userId, reward: amount, coinAmount: entry.coinAmount, bonusAmount: entry.bonusAmount, entryId: entry.id }, tx);
         }
         await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'WON', rewardAmount: amount } });
       }
@@ -1176,7 +1186,7 @@ export class LudoService implements OnModuleDestroy {
 
   private async requireState(matchId: string) { const state = this.states.get(matchId); if (state) return state; const data = await this.getState(matchId); this.states.set(matchId, data as LudoState); return data as LudoState; }
   private playerFor(state: LudoState, userId: string) { const p = state.players.find(p => p.userId === userId); if (!p) throw new BadRequestException('You are not a player in this match'); return p; }
-  private async requireBalance(userId: string, amount: number) { const balance = await this.wallet.getBalance(userId, WalletType.COIN); if (balance < BigInt(amount)) throw new BadRequestException('Insufficient balance'); }
+  private async requireBalance(userId: string, amount: number) { const bonus = await this.wallet.getBalance(userId, WalletType.BONUS); const coin = await this.wallet.getBalance(userId, WalletType.COIN); if (!hasSufficientSpendableGameBalance(coin, bonus, amount)) throw new BadRequestException('Insufficient balance'); }
   private async persistState(state: LudoState) { await this.prisma.gameRound.update({ where: { id: state.matchId }, data: { hiddenState: state as any } }); }
   // serverNow lets each phone correct for its own clock when drawing the turn countdown.
   private publicState(state: LudoState): LudoState { return { ...state, serverNow: Date.now() }; }

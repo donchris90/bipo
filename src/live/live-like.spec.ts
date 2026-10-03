@@ -9,7 +9,7 @@ function build(hostId = 'host') {
     },
   };
   const realtime: any = { broadcastLiveLike: jest.fn() };
-  return { svc: new LiveService(prisma, {} as any, {} as any, realtime), prisma, realtime };
+  return { svc: new (LiveService as any)(prisma, {} as any, {} as any, realtime), prisma, realtime };
 }
 
 describe('likes on a live stream', () => {

@@ -80,7 +80,7 @@ describe('EntryService.place funding', () => {
     };
     const wallet: any = { debit, getBalance: jest.fn().mockResolvedValue(bonus) };
     const rounds: any = { assertGameAvailable: jest.fn(), assertAcceptingEntries: jest.fn() };
-    return { svc: new EntryService(prisma, wallet, rounds), debit, created };
+    return { svc: new EntryService(prisma, wallet, rounds, { contributePoints: jest.fn() } as any), debit, created };
   };
   const place = (svc: EntryService, extra: any = {}) => svc.place({ userId: 'u', countryCode: 'NG', roundId: 'r1', selection: [], stakeAmount: 100, idempotencyKey: 'k', ...extra });
 

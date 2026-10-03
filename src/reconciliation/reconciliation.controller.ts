@@ -32,6 +32,11 @@ export class ReconciliationController {
     return { checked, discrepancyCount: discrepancies.length, discrepancies: discrepancies.map(toResponse) };
   }
 
+  @Get('financial-links')
+  async financialLinks() {
+    return this.reconciliation.checkFinancialLinks();
+  }
+
   @Get(':walletId')
   async checkOne(@Param('walletId') walletId: string) {
     return toResponse(await this.reconciliation.checkWallet(walletId));

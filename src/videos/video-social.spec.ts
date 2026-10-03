@@ -29,7 +29,7 @@ function build(w: { videos?: any[]; follows?: string[]; blocks?: [string, string
     videoComment: { groupBy: jest.fn().mockResolvedValue(w.comments ?? []), findMany: jest.fn().mockResolvedValue([]), create: jest.fn(async ({ data }: any) => ({ id: 'cm1', createdAt: new Date(NOW), ...data })), findUnique: jest.fn(), delete: jest.fn() },
     giftTransaction: { groupBy: jest.fn().mockResolvedValue(w.gifts ?? []) },
   };
-  return { svc: new VideosService(prisma, { get: () => undefined } as any, {} as any), prisma };
+  return { svc: new (VideosService as any)(prisma, { get: () => undefined } as any, {} as any), prisma };
 }
 
 describe('Explore feed tabs', () => {

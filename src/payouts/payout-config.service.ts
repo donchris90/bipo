@@ -38,6 +38,7 @@ export class PayoutConfigService {
     const region = await this.prisma.regionalConfig.findUnique({ where: { countryCode: code } });
     if (!region) throw new NotFoundException('That country is not set up under Regions');
     const input = validatePayoutConfig(body);
+    const allowedProvidersValue = input.allowedProviders == null ? Prisma.DbNull : input.allowedProviders;
 
     const before = await this.prisma.payoutConfig.findUnique({ where: { countryCode: code } });
     const saved = await this.prisma.payoutConfig.upsert({

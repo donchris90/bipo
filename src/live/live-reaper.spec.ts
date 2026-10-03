@@ -88,7 +88,7 @@ describe('LiveService cover + end', () => {
       liveViewer: { updateMany: jest.fn() },
     };
     const rtc: any = { destroyChannel: jest.fn() };
-    const svc = new LiveService(prisma, rtc, {} as any, {} as any);
+    const svc = new (LiveService as any)(prisma, rtc, {} as any, {} as any);
     await svc.end('s', 'h');
     expect(prisma.liveSession.update).not.toHaveBeenCalled();
     expect(rtc.destroyChannel).not.toHaveBeenCalled();

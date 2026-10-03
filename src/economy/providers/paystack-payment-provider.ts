@@ -135,10 +135,14 @@ export class PaystackPaymentProvider implements PaymentProvider {
     // after the caller has already verified the signature and decided
     // this looks like a purchase-confirmation event.
     const event = payload?.event;
-    const reference = payload?.data?.reference;
+    // Paystack uses `reference` for charge events and
+    // `transaction_reference` for refund events. Accept both forms, but never
+    // infer a purchase reference from unrelated refund metadata.
+    const reference = payload?.data?.reference ?? payload?.data?.transaction_reference;
     if (!reference) return { providerRef: '', status: 'ignored' };
     if (event === 'charge.success') return { providerRef: String(reference), status: 'confirmed' };
     if (event === 'charge.failed') return { providerRef: String(reference), status: 'failed' };
+    if (event === 'refund.processed') return { providerRef: String(reference), status: 'refunded' };
     return { providerRef: String(reference), status: 'ignored' };
   }
 }

@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { reconcileWallet, WalletReconciliation } from './reconciliation-rules';
 import { AuditService } from '../audit/audit.service';
+import { buildExpectedLedgerMovements, FinancialReconciliationResult, FinancialReconciliationIssue } from './financial-reconciliation';
 
 @Injectable()
 export class ReconciliationService {
@@ -55,6 +56,92 @@ export class ReconciliationService {
       });
     }
     return result;
+  }
+
+  // Source-record reconciliation catches a different class of drift than the
+  // wallet sum check: a purchase/gift/withdrawal can have a matching wallet
+  // balance but still be missing the ledger movement that explains it. This is
+  // deliberately read-only; finance gets an issue list instead of an automatic
+  // "repair" that could mint or destroy value.
+  async checkFinancialLinks(limit = 5000): Promise<FinancialReconciliationResult> {
+    const take = Math.min(Math.max(Math.floor(limit) || 5000, 1), 5000);
+    const [gifts, purchases, chargebacks, withdrawals] = await Promise.all([
+      this.prisma.giftTransaction.findMany({
+        orderBy: { createdAt: 'desc' },
+        take,
+        select: { id: true, coinAmount: true, idempotencyKey: true, creatorShareCoins: true, platformShareCoins: true, agencyShareCoins: true, luckyRewardCoins: true },
+      }),
+      this.prisma.coinPurchase.findMany({
+        orderBy: { createdAt: 'desc' },
+        take,
+        select: { id: true, status: true, coinAmount: true },
+      }),
+      this.prisma.chargeback.findMany({
+        orderBy: { createdAt: 'desc' },
+        take,
+        select: { id: true, coinPurchaseId: true, coinAmount: true },
+      }),
+      this.prisma.withdrawalRequest.findMany({
+        orderBy: { requestedAt: 'desc' },
+        take,
+        select: { id: true, idempotencyKey: true, status: true },
+      }),
+    ]);
+
+    const sources = [
+      ...gifts.map((data) => ({ category: 'GIFT' as const, data })),
+      ...purchases.map((data) => ({ category: 'COIN_PURCHASE' as const, data })),
+      ...chargebacks.map((data) => ({ category: 'CHARGEBACK' as const, data })),
+      ...withdrawals.map((data) => ({ category: 'WITHDRAWAL' as const, data })),
+    ];
+    const expected = sources.flatMap((source) => buildExpectedLedgerMovements(source).map((movement) => ({ ...movement, source })));
+    const ledgerByKey = new Map<string, any>();
+
+    // Prisma/Postgres can have a practical parameter limit. Chunk the IN query
+    // so a busy installation can still run reconciliation without one giant
+    // SQL statement.
+    for (let i = 0; i < expected.length; i += 500) {
+      const chunk = expected.slice(i, i + 500);
+      const rows = await this.prisma.ledgerEntry.findMany({
+        where: { idempotencyKey: { in: chunk.map((item) => item.key) } },
+        select: { idempotencyKey: true, amount: true },
+      });
+      for (const row of rows) ledgerByKey.set(row.idempotencyKey, row);
+    }
+
+    const issues: FinancialReconciliationIssue[] = [];
+    for (const source of sources) {
+      const expectedMovements = buildExpectedLedgerMovements(source);
+      const missingLedgerKeys = expectedMovements.filter((movement) => !ledgerByKey.has(movement.key)).map((movement) => movement.key);
+      const mismatchedLedgerEntries = expectedMovements
+        .filter((movement) => ledgerByKey.has(movement.key))
+        .map((movement) => ({ movement, actual: ledgerByKey.get(movement.key) }))
+        .filter(({ movement, actual }) => BigInt(actual.amount) !== movement.amount)
+        .map(({ movement, actual }) => ({
+          key: movement.key,
+          expectedAmount: movement.amount.toString(),
+          actualAmount: BigInt(actual.amount).toString(),
+        }));
+      if (missingLedgerKeys.length === 0 && mismatchedLedgerEntries.length === 0) continue;
+
+      const reference = source.category === 'CHARGEBACK'
+        ? (source.data.coinPurchaseId ?? source.data.id)
+        : source.data.id;
+      const reason = source.category === 'GIFT' &&
+        (source.data.creatorShareCoins == null || source.data.platformShareCoins == null || source.data.agencyShareCoins == null)
+        ? 'Legacy gift is missing immutable split snapshots; verify the legacy row before relying on split reconciliation.'
+        : 'Source record is missing or has an incorrectly valued ledger movement required by the current accounting contract.';
+
+      issues.push({ category: source.category, reference, missingLedgerKeys, mismatchedLedgerEntries, reason });
+    }
+
+    return {
+      checked: { gifts: gifts.length, coinPurchases: purchases.length, chargebacks: chargebacks.length, withdrawals: withdrawals.length },
+      issueCount: issues.length,
+      issues,
+      legacySnapshotWarnings: gifts.filter((gift) => gift.creatorShareCoins == null || gift.platformShareCoins == null || gift.agencyShareCoins == null).length,
+      truncated: [gifts, purchases, chargebacks, withdrawals].some((rows) => rows.length === take),
+    };
   }
 
   async checkWallet(walletId: string): Promise<WalletReconciliation> {

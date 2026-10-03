@@ -68,7 +68,7 @@ function build() {
       findMany: async ({ where, orderBy }: any) => {
         // Supports both shapes the service issues: one season id, or { in: [ids] } (listSeasons).
         const rows = where.seasonId?.in ? where.seasonId.in.flatMap((id: string) => tiers.get(id) ?? []) : (tiers.get(where.seasonId) ?? []);
-        if (orderBy?.minRank === 'asc') rows.sort((a, b) => a.minRank - b.minRank);
+        if (orderBy?.minRank === 'asc') rows.sort((a: any, b: any) => a.minRank - b.minRank);
         return rows;
       },
       deleteMany: async ({ where }: any) => { tiers.set(where.seasonId, []); },

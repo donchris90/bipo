@@ -96,6 +96,8 @@ export class CreatorAnalyticsService {
       followersGained,
       giftAgg,
       topGifterRows,
+      uniqueGifterRows,
+      supporterRows,
       giftEarnedAgg,
       privateEarnedAgg,
       pk,
@@ -122,8 +124,18 @@ export class CreatorAnalyticsService {
         by: ['senderId'],
         where: { recipientId: userId, createdAt: { gte: since } },
         _sum: { coinAmount: true },
+        _count: { _all: true },
         orderBy: { _sum: { coinAmount: 'desc' } },
         take: 3,
+      }),
+      this.prisma.giftTransaction.groupBy({
+        by: ['senderId'],
+        where: { recipientId: userId, createdAt: { gte: since } },
+        _count: { _all: true },
+      }),
+      this.prisma.creatorSupporter.findMany({
+        where: { creatorId: userId },
+        select: { firstGiftAt: true, lastGiftAt: true },
       }),
       wallet
         ? this.prisma.ledgerEntry.aggregate({
@@ -152,6 +164,10 @@ export class CreatorAnalyticsService {
     }
 
     const gifterIds = topGifterRows.map((g) => g.senderId);
+    const uniqueGifters = uniqueGifterRows.length;
+    const repeatGifters = uniqueGifterRows.filter((g) => g._count._all >= 2).length;
+    const supportersGained = supporterRows.filter((r) => r.firstGiftAt >= since).length;
+    const activeSupporters = supporterRows.filter((r) => r.lastGiftAt >= since).length;
     const gifters = gifterIds.length
       ? await this.prisma.user.findMany({
           where: { id: { in: gifterIds } },
@@ -180,7 +196,16 @@ export class CreatorAnalyticsService {
           userId: g.senderId,
           displayName: nameById.get(g.senderId) ?? null,
           coins: g._sum.coinAmount ?? 0,
+          gifts: g._count._all,
         })),
+      },
+      supporterConversion: {
+        totalSupporters: supporterRows.length,
+        gained: supportersGained,
+        active: activeSupporters,
+        uniqueGifters,
+        repeatGifters,
+        repeatRate: uniqueGifters > 0 ? repeatGifters / uniqueGifters : 0,
       },
       // This creator's own share, after the platform (and any agency) split.
       earnings: {

@@ -14,7 +14,7 @@ export class HostLevelsController {
   constructor(private readonly service: HostLevelsService) {}
   @Get('me') me(@Req() req: AuthedRequest) { return this.service.progress(req.user.userId); }
   @Get('tasks/me') tasksMe(@Req() req: AuthedRequest) { return this.service.dailyTasks(req.user.userId); }
-  @Get() list() { return this.service.list(); }
+  @Get() list() { return this.service.list(true); }
 }
 
 @Controller('api/v1/admin/host-levels')

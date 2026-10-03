@@ -78,6 +78,18 @@ export function describeForPush(
       if (payload.event === 'PARTY_INVITE') {
         return { title: 'Party invitation', body: `${payload.hostDisplayName ?? 'A host'} invited you to ${payload.roomTitle ?? 'a party room'}` };
       }
+      if (payload.event === 'AGENCY_INVITE') {
+        return { title: 'Agency invitation', body: `${payload.agencyName ?? 'An agency'} invited you to join` };
+      }
+      if (payload.event === 'AGENCY_APPLICATION') {
+        return { title: 'New agency application', body: `${payload.creatorDisplayName ?? 'A creator'} wants to join ${payload.agencyName ?? 'your agency'}` };
+      }
+      if (payload.event === 'AGENCY_REQUEST_ACCEPTED') {
+        return { title: 'Agency request accepted', body: `${payload.agencyName ?? 'The agency'} request was accepted` };
+      }
+      if (payload.event === 'AGENCY_REQUEST_DECLINED') {
+        return { title: 'Agency request declined', body: `${payload.agencyName ?? 'The agency'} request was declined` };
+      }
       return null;
     case 'SECURITY':
       switch (payload.event) {

@@ -13,6 +13,8 @@ export interface VerifyPaymentResult {
   verified: boolean;
   amountMinor: number;
   currencyCode: string;
+  /** Provider-specific raw status (e.g. NOWPayments 'finished'); informational only. */
+  status?: string;
 }
 
 export interface PaymentProvider {

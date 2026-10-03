@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Post, Query, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Put, Query, Req, UseGuards } from '@nestjs/common';
 import { Request } from 'express';
 import { AgenciesService } from './agencies.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
@@ -19,6 +19,80 @@ export class AgenciesController {
   @Post()
   register(@Body('name') name: string, @Req() req: AuthedRequest) {
     return this.agencies.register(req.user.userId, name);
+  }
+
+  // Fixed-literal GET/POST routes below are all multi-segment or distinct literals, so they cannot
+  // be swallowed by ':id/...' regardless of declaration order.
+  @Get('eligibility')
+  eligibility(@Req() req: AuthedRequest) {
+    return this.agencies.eligibility(req.user.userId);
+  }
+
+  // Admin: the level needed to start an agency, and making anyone an agency regardless of it.
+  @Get('admin/config')
+  @UseGuards(RolesGuard)
+  @Roles(RoleName.SUPER_ADMIN)
+  getConfig() {
+    return this.agencies.getConfig();
+  }
+
+  @Put('admin/config')
+  @UseGuards(RolesGuard)
+  @Roles(RoleName.SUPER_ADMIN)
+  updateConfig(@Body('minRrydaLevel') minRrydaLevel: unknown, @Req() req: AuthedRequest) {
+    return this.agencies.updateConfig(minRrydaLevel, req.user.userId, req.user.roles);
+  }
+
+  @Post('admin/create')
+  @UseGuards(RolesGuard)
+  @Roles(RoleName.SUPER_ADMIN)
+  adminCreate(@Body('ownerId') ownerId: unknown, @Body('name') name: unknown, @Req() req: AuthedRequest) {
+    return this.agencies.adminCreate(req.user.userId, req.user.roles, ownerId, name);
+  }
+
+  @Get('directory')
+  directory(@Query('q') q?: string) {
+    return this.agencies.directory(q);
+  }
+
+  @Get('me/requests')
+  myRequests(@Req() req: AuthedRequest) {
+    return this.agencies.myRequests(req.user.userId);
+  }
+
+  @Post('me/leave')
+  leave(@Req() req: AuthedRequest) {
+    return this.agencies.leave(req.user.userId);
+  }
+
+  @Post('requests/:requestId/accept')
+  acceptRequest(@Param('requestId') requestId: string, @Body('commissionBps') commissionBps: number | undefined, @Req() req: AuthedRequest) {
+    return this.agencies.respond(requestId, req.user.userId, 'accept', commissionBps);
+  }
+
+  @Post('requests/:requestId/decline')
+  declineRequest(@Param('requestId') requestId: string, @Req() req: AuthedRequest) {
+    return this.agencies.respond(requestId, req.user.userId, 'decline');
+  }
+
+  @Post('requests/:requestId/cancel')
+  cancelRequest(@Param('requestId') requestId: string, @Req() req: AuthedRequest) {
+    return this.agencies.respond(requestId, req.user.userId, 'cancel');
+  }
+
+  @Post(':id/apply')
+  apply(@Param('id') id: string, @Body('message') message: string | undefined, @Req() req: AuthedRequest) {
+    return this.agencies.apply(id, req.user.userId, message);
+  }
+
+  @Post(':id/invite')
+  invite(
+    @Param('id') id: string,
+    @Body('creatorId') creatorId: string,
+    @Body('commissionBps') commissionBps: number,
+    @Req() req: AuthedRequest,
+  ) {
+    return this.agencies.invite(id, req.user.userId, creatorId, commissionBps);
   }
 
   @Post(':id/approve')

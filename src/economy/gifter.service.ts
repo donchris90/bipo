@@ -65,14 +65,24 @@ export class GifterService {
       take: safeLimit,
     });
     if (!rows.length) return [];
-    const users = await this.prisma.user.findMany({
-      where: { id: { in: rows.map((row) => row.senderId) } },
-      select: { id: true, displayName: true, avatarUrl: true, countryCode: true },
-    });
+    const ids = rows.map((row) => row.senderId);
+    const [users, lifetimeRows] = await Promise.all([
+      this.prisma.user.findMany({
+        where: { id: { in: ids } },
+        select: { id: true, displayName: true, avatarUrl: true, countryCode: true },
+      }),
+      this.prisma.giftTransaction.groupBy({
+        by: ['senderId'],
+        where: { senderId: { in: ids } },
+        _sum: { coinAmount: true },
+      }),
+    ]);
     const byId = new Map(users.map((user) => [user.id, user]));
+    const lifetimeById = new Map(lifetimeRows.map((row) => [row.senderId, row._sum.coinAmount ?? 0]));
     return rows.map((row, index) => {
       const coins = row._sum.coinAmount ?? 0;
-      const tier = tierFor(coins);
+      const lifetimeCoins = lifetimeById.get(row.senderId) ?? 0;
+      const tier = tierFor(lifetimeCoins);
       const user = byId.get(row.senderId);
       return {
         rank: index + 1,
@@ -82,6 +92,7 @@ export class GifterService {
         countryCode: user?.countryCode ?? null,
         coins,
         giftCount: row._count._all,
+        lifetimeCoins,
         level: tier.level,
         tier: tier.name,
         vip: tier.vip,

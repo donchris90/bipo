@@ -60,8 +60,8 @@ function build() {
     },
   };
 
-  function seedEntry(roundId: string, userId: string, coinAmount: number) {
-    const e = { id: `e${++seq}`, roundId, userId, coinAmount };
+  function seedEntry(roundId: string, userId: string, coinAmount: number, bonusAmount = 0) {
+    const e = { id: `e${++seq}`, roundId, userId, coinAmount, bonusAmount };
     gameEntries.set(e.id, e);
     return e;
   }
@@ -76,7 +76,7 @@ function build() {
 
 function service(prisma: any) {
   const wallet = new WalletService(prisma);
-  return new (AyoService as any)(prisma, wallet, new RoundService(), new ConfigService(), new RealtimeGateway());
+  return new (AyoService as any)(prisma, wallet, new (RoundService as any)(), new ConfigService(), new (RealtimeGateway as any)());
 }
 
 function ayoState(overrides: Record<string, any>) {
@@ -91,6 +91,18 @@ function ayoState(overrides: Record<string, any>) {
 }
 
 describe('AyoService.settle — spectator bet payouts', () => {
+  it('preserves mixed BONUS/COIN funding when paying a game reward', async () => {
+    const { prisma, seedEntry } = build();
+    seedEntry('match-1', 'p1', 100, 60);
+    seedEntry('match-1', 'p2', 100, 0);
+    const svc = service(prisma);
+    await (svc as any).settle(ayoState({ winnerUserId: 'p1' }));
+    const wallet = new WalletService(prisma);
+    // 190 reward split 60/100 bonus funding => 114 BONUS and 76 COIN.
+    expect(await wallet.getBalance('p1', WalletType.BONUS)).toBe(114n);
+    expect(await wallet.getBalance('p1', WalletType.COIN)).toBe(76n);
+  });
+
   it("credits the winning player their prize AND a 20% bonus from the spectator pool for having backers", async () => {
     const { prisma, seedEntry, seedBet, wallets } = build();
     seedEntry('match-1', 'p1', 100);

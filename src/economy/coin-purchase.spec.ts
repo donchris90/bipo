@@ -50,16 +50,17 @@ describe('CoinPurchaseService.statusFor', () => {
 });
 
 describe('payment methods', () => {
-  const methods = (provider: any) => new CoinPurchaseController({} as any, {} as any, provider).paymentMethods();
+  const prisma: any = { regionalConfig: { findUnique: async () => ({ paymentMethods: ['PAYSTACK'] }) } };
+  const methods = async (provider: any) => new CoinPurchaseController({} as any, prisma, provider).paymentMethods({ user: { userId: 'u1', countryCode: 'ng' } } as any);
 
-  it('lists Stripe as coming soon and never available', () => {
-    const stripe = methods(new PaystackPaymentProvider()).find((m: any) => m.id === 'STRIPE')!;
+  it('lists Stripe as coming soon and never available', async () => {
+    const stripe = (await methods(new PaystackPaymentProvider())).find((m: any) => m.id === 'STRIPE')!;
     expect(stripe).toMatchObject({ available: false, comingSoon: true });
   });
 
-  it('Paystack is available when a provider is configured, and not when payments are unavailable', () => {
-    expect(methods(new MockPaymentProvider()).find((m: any) => m.id === 'PAYSTACK')!.available).toBe(true);
-    expect(methods(new UnavailablePaymentProvider()).find((m: any) => m.id === 'PAYSTACK')!.available).toBe(false);
+  it('Paystack is available when a provider is configured, and not when payments are unavailable', async () => {
+    expect((await methods(new MockPaymentProvider())).find((m: any) => m.id === 'PAYSTACK')!.available).toBe(true);
+    expect((await methods(new UnavailablePaymentProvider())).find((m: any) => m.id === 'PAYSTACK')!.available).toBe(false);
   });
 });
 

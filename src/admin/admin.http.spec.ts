@@ -31,6 +31,7 @@ describe('admin API over HTTP', () => {
     agency: { count: jest.fn().mockResolvedValue(0) },
     kycSubmission: { count: jest.fn().mockResolvedValue(2), findMany: jest.fn().mockResolvedValue([]) },
     coinPurchase: { groupBy: jest.fn().mockResolvedValue([]) },
+    ledgerEntry: { groupBy: jest.fn().mockResolvedValue([]), aggregate: jest.fn().mockResolvedValue({ _sum: { amount: 0n } }) },
     auditLog: { findMany: jest.fn().mockResolvedValue([]) },
   };
 

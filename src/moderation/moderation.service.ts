@@ -77,7 +77,11 @@ export class ModerationService {
     if (!['REVIEWING', 'RESOLVED', 'DISMISSED'].includes(status)) throw new BadRequestException('Invalid report status');
     const report = await this.prisma.userReport.findUnique({ where: { id } });
     if (!report) throw new NotFoundException('Report not found');
-    return this.prisma.userReport.update({ where: { id }, data: { status, reviewerId, resolution: input.resolution?.trim().slice(0, 1000) || null } });
+    const updated = await this.prisma.userReport.update({ where: { id }, data: { status, reviewerId, resolution: input.resolution?.trim().slice(0, 1000) || null } });
+    await this.prisma.auditLog.create({
+      data: { actorId: reviewerId, action: 'report.resolve', targetType: 'user_report', targetId: id, metadata: { from: report.status, to: status } },
+    });
+    return updated;
   }
 
 }

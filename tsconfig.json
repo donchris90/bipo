@@ -18,7 +18,17 @@
     "forceConsistentCasingInFileNames": true,
     "noFallthroughCasesInSwitch": false,
     "types": [
-      "node"
+      "node",
+      "jest"
     ]
-  }
+  },
+  "include": [
+    "src/**/*",
+    "tests/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "backend"
+  ]
 }

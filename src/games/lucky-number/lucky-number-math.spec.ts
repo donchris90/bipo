@@ -271,7 +271,7 @@ describe('settleLuckyNumber', () => {
 // ---------------------------------------------------------------------------
 describe('settlement idempotency (claim pattern)', () => {
   function makeFakeRoundStore(initialStatus: 'LOCKED' | 'SETTLED') {
-    let status = initialStatus;
+    let status: string = initialStatus;
     let creditsApplied = 0;
     return {
       // Mirrors `updateMany({ where: { status: 'LOCKED' }, data: { status: 'RESOLVING' } })`:

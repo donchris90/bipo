@@ -4,6 +4,8 @@ import { UserThrottlerGuard } from '../common/guards/user-throttler.guard';
 import { Request } from 'express';
 import { PkService } from './pk.service';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
 import { RoleName } from '@prisma/client';
 
 interface AuthedRequest extends Request {
@@ -38,6 +40,23 @@ export class PkController {
   }
 
   // Who you can challenge, online right now: ?category=friends | agency | random
+
+  // Admin-controlled PK winner bonus. Kept on PKScoreConfig so the existing
+  // PK score configuration can be managed without introducing another config table.
+  @Get('admin/winner-reward')
+  @UseGuards(RolesGuard)
+  @Roles(RoleName.SUPER_ADMIN, RoleName.GAME_OPERATOR)
+  async getWinnerReward() {
+    return this.pk.getWinnerRewardConfig();
+  }
+
+  @Post('admin/winner-reward')
+  @UseGuards(RolesGuard)
+  @Roles(RoleName.SUPER_ADMIN, RoleName.GAME_OPERATOR)
+  async updateWinnerReward(@Body() body: { winnerRewardCoins?: number }, @Req() req: AuthedRequest) {
+    return this.pk.updateWinnerRewardConfig(body?.winnerRewardCoins, req.user.userId);
+  }
+
   @Get('candidates')
   candidates(@Query('category') category: string | undefined, @Req() req: AuthedRequest) {
     const cat = category === 'agency' || category === 'random' ? category : 'friends';

@@ -17,6 +17,11 @@ import { isBlockedEitherWay } from '../common/blocks';
 import { publicName } from '../common/public-name';
 import { topBadgeFor } from '../badges/badge-lookup';
 
+type EntranceBroadcast = {
+  userId: string; displayName: string | null; avatarUrl: string | null; tier: string; level: number; message: string;
+  presentation?: number; presentationName?: string; rrydaLevel?: number; supporterLevel?: number; fanClub?: boolean; badgeEmoji?: string | null;
+};
+
 interface AuthedSocket extends Socket {
   data: { userId?: string };
 }
@@ -237,20 +242,49 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     this.server.to(`LIVE:${sessionId}`).emit('live:like', payload);
   }
 
-  // VIP entrance banner. Ephemeral by design: only people currently watching this live
-  // should see it; it is not persisted as chat history.
-  broadcastLiveEntrance(sessionId: string, payload: { userId: string; displayName: string | null; avatarUrl: string | null; tier: string; level: number; message: string }) {
-    this.server.to(`LIVE:${sessionId}`).emit('live:vip_entrance', payload);
-    this.server.to(`LIVE:${sessionId}`).emit('chat:message', {
-      id: `vip:${payload.userId}:${Date.now()}`,
-      senderId: 'system',
-      senderName: null,
-      content: payload.message,
-      createdAt: new Date().toISOString(),
-      system: true,
-      vipEntrance: true,
-      userId: payload.userId,
-    });
+  // Entrance banners are ephemeral by design: only people currently in the live / room see them and
+  // nothing is stored as history. The same person re-joining (token refresh, reconnect) must not
+  // replay the animation, so each (person, place) plays at most once per window.
+  private static readonly ENTRANCE_REPLAY_MS = 300_000;
+  private readonly entranceSeen = new Map<string, number>();
+
+  private shouldPlayEntrance(userId: string, place: string, now = Date.now()): boolean {
+    const key = `${userId}|${place}`;
+    const last = this.entranceSeen.get(key);
+    if (last !== undefined && now - last < RealtimeGateway.ENTRANCE_REPLAY_MS) return false;
+    this.entranceSeen.set(key, now);
+    if (this.entranceSeen.size > 5000) {
+      for (const [k, t] of this.entranceSeen) if (now - t >= RealtimeGateway.ENTRANCE_REPLAY_MS) this.entranceSeen.delete(k);
+    }
+    return true;
+  }
+
+  // `presentation` (0-4) picks the animation on newer app builds; older payloads without it keep the
+  // previous behaviour (banner + a system chat line).
+  broadcastLiveEntrance(sessionId: string, payload: EntranceBroadcast) {
+    const room = `LIVE:${sessionId}`;
+    if (!this.shouldPlayEntrance(payload.userId, room)) return;
+    this.server.to(room).emit('live:vip_entrance', payload);
+    // The slim WELCOME chip (presentation 1) does not also leave a chat line.
+    if ((payload.presentation ?? 2) >= 2) {
+      this.server.to(room).emit('chat:message', {
+        id: `vip:${payload.userId}:${Date.now()}`,
+        senderId: 'system',
+        senderName: null,
+        content: payload.message,
+        createdAt: new Date().toISOString(),
+        system: true,
+        vipEntrance: true,
+        userId: payload.userId,
+      });
+    }
+  }
+
+  // Same event for a Party room, to the ROOM channel, with no extra chat line.
+  broadcastRoomEntrance(roomId: string, payload: EntranceBroadcast) {
+    const room = `ROOM:${roomId}`;
+    if (!this.shouldPlayEntrance(payload.userId, room)) return;
+    this.server.to(room).emit('live:vip_entrance', payload);
   }
 
   // The host's shared video changed (loaded, played, paused, moved, stopped).
@@ -419,8 +453,8 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   // The actual point of the personal-room change above — emits directly
   // to one specific user's connected socket(s), regardless of what
   // room/live context they're currently in or whether they're in any at
-  // all. Used by CallsService for real, instant call signaling
-  // (incoming/accepted/declined/ended) rather than something polled.
+  // all. Used for real, instant signaling
+  // rather than something polled.
   emitToUser(userId: string, event: string, payload: unknown) {
     this.server.to(`user:${userId}`).emit(event, payload);
   }

@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, Logger, NotFoundException, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { LedgerEntryType, WalletType } from '@prisma/client';
+import { planStake, creditGameReward } from './game-payout';
 import IORedis from 'ioredis';
 import { v4 as uuid } from 'uuid';
 import { randomInt } from 'node:crypto';
@@ -120,7 +121,7 @@ export class AyoService implements OnModuleDestroy {
   }
 
   private async requireBalance(userId: string, amount: number) {
-    if (await this.wallet.getBalance(userId, WalletType.COIN) < BigInt(amount)) {
+    if ((await this.wallet.getBalance(userId, WalletType.BONUS)) + (await this.wallet.getBalance(userId, WalletType.COIN)) < BigInt(amount)) {
       throw new BadRequestException('Insufficient balance');
     }
   }
@@ -156,11 +157,9 @@ export class AyoService implements OnModuleDestroy {
 
     await this.prisma.$transaction(async tx => {
       for (const p of room.players.filter(p => !p.userId.startsWith('bot:'))) {
-        await this.wallet.debit({
-          userId: p.userId, walletType: WalletType.COIN, amount: BigInt(room.entryFee),
-          ledgerType: LedgerEntryType.GAME_ENTRY, reference: matchId,
-          idempotencyKey: `ayo:entry:${matchId}:${p.userId}`,
-        }, tx);
+        const funding = planStake(room.entryFee, await this.wallet.getBalance(p.userId, WalletType.BONUS), true);
+        if (funding.bonus > 0) await this.wallet.debit({ userId: p.userId, walletType: WalletType.BONUS, amount: BigInt(funding.bonus), ledgerType: LedgerEntryType.GAME_ENTRY, reference: matchId, idempotencyKey: `ayo:entry-bonus:${matchId}:${p.userId}` }, tx);
+        if (funding.coin > 0) await this.wallet.debit({ userId: p.userId, walletType: WalletType.COIN, amount: BigInt(funding.coin), ledgerType: LedgerEntryType.GAME_ENTRY, reference: matchId, idempotencyKey: `ayo:entry:${matchId}:${p.userId}` }, tx);
       }
       await tx.gameRound.create({
         data: {
@@ -171,11 +170,13 @@ export class AyoService implements OnModuleDestroy {
         },
       });
       for (const p of room.players.filter(p => !p.userId.startsWith('bot:'))) {
+        const funding = planStake(room.entryFee, await this.wallet.getBalance(p.userId, WalletType.BONUS), true);
         await tx.gameEntry.create({
           data: {
             roundId: matchId, userId: p.userId,
             selection: { roomCode: room.roomCode, seat: room.players.indexOf(p) },
             coinAmount: room.entryFee,
+            bonusAmount: funding.bonus,
             idempotencyKey: `ayo:entry-record:${matchId}:${p.userId}`,
           },
         });
@@ -551,21 +552,21 @@ export class AyoService implements OnModuleDestroy {
       for (const entry of entries) {
         if (!state.winnerUserId) {
           await tx.gameEntry.update({ where: { id: entry.id }, data: { status: 'REFUNDED', rewardAmount: entry.coinAmount, netAmount: 0 } });
-          await this.wallet.credit({
-            userId: entry.userId, walletType: WalletType.COIN, amount: BigInt(entry.coinAmount),
-            ledgerType: LedgerEntryType.REFUND, reference: entry.id,
-            idempotencyKey: `ayo:draw-refund:${entry.id}`,
+          if (entry.bonusAmount > 0) await this.wallet.credit({
+            userId: entry.userId, walletType: WalletType.BONUS, amount: BigInt(entry.bonusAmount),
+            ledgerType: LedgerEntryType.REFUND, reference: entry.id, idempotencyKey: `ayo:draw-refund-bonus:${entry.id}`,
+          }, tx);
+          const coinRefund = entry.coinAmount - entry.bonusAmount;
+          if (coinRefund > 0) await this.wallet.credit({
+            userId: entry.userId, walletType: WalletType.COIN, amount: BigInt(coinRefund),
+            ledgerType: LedgerEntryType.REFUND, reference: entry.id, idempotencyKey: `ayo:draw-refund:${entry.id}`,
           }, tx);
           continue;
         }
         const won = state.winnerUserId === entry.userId;
         await tx.gameEntry.update({ where: { id: entry.id }, data: { status: won ? 'WON' : 'LOST', rewardAmount: won ? prize : 0, netAmount: won ? prize - entry.coinAmount : -entry.coinAmount } });
         if (won && prize > 0) {
-          await this.wallet.credit({
-            userId: entry.userId, walletType: WalletType.COIN, amount: BigInt(prize),
-            ledgerType: LedgerEntryType.GAME_REWARD, reference: entry.id,
-            idempotencyKey: `ayo:reward:${entry.id}`,
-          }, tx);
+          await creditGameReward(this.wallet, { userId: entry.userId, reward: prize, coinAmount: entry.coinAmount, bonusAmount: entry.bonusAmount, entryId: entry.id }, tx);
         }
       }
 

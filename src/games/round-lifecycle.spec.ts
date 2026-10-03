@@ -68,7 +68,7 @@ describe('SettlementService.voidRound', () => {
       { type: 'COIN', amount: 70n, key: 'game_refund:e1' },
       { type: 'BONUS', amount: 30n, key: 'game_refund_bonus:e1' },
     ]);
-    expect(tx.gameEntry.update).toHaveBeenCalledWith({ where: { id: 'e1' }, data: { status: 'REFUNDED', rewardAmount: 0 } });
+    expect(tx.gameEntry.update).toHaveBeenCalledWith({ where: { id: 'e1' }, data: { status: 'REFUNDED', rewardAmount: 0, netAmount: 0 } });
     expect(prisma.gameRound.update).toHaveBeenCalledWith({ where: { id: 'r1' }, data: { status: 'CANCELLED' } });
   });
 

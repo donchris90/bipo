@@ -7,6 +7,7 @@ import { RrydaLevelsService } from '../rryda-levels/rryda-levels.service';
 import { TeamsService } from '../teams/teams.service';
 import { SeasonsService } from '../seasons/seasons.service';
 import { UserStatus, RoleName, WalletType, LedgerEntryType } from '@prisma/client';
+import { ReferralConfigService } from '../referral-config/referral-config.service';
 import { CHECK_IN_REWARD_SCHEDULE, computeCheckInReward, resolveCheckIn, toUtcDateKey } from './check-in-rules';
 
 const MAX_BIO_LENGTH = 220;
@@ -25,6 +26,7 @@ export class UsersService {
     private readonly rrydaLevels: RrydaLevelsService,
     private readonly teams: TeamsService,
     private readonly seasons: SeasonsService,
+    private readonly referralConfig: ReferralConfigService,
   ) {}
 
   async findMe(userId: string) {
@@ -82,11 +84,14 @@ export class UsersService {
   }
 
   async findMyReferrals(userId: string) {
-    return this.prisma.user.findMany({
+    const referrals = await this.prisma.user.findMany({
       where: { referredById: userId },
       select: { id: true, displayName: true, createdAt: true },
       orderBy: { createdAt: 'desc' },
     });
+    // Shape matches the mobile ReferralResponse: the reward amount comes from
+    // the same constant AuthService credits (to the BONUS wallet).
+    return { referrals, referralBonusCoins: await this.referralConfig.getRewardCoins() };
   }
 
 
@@ -136,18 +141,19 @@ export class UsersService {
     const newStreak = state.nextStreak;
     const reward = computeCheckInReward(newStreak);
 
-    await this.prisma.user.update({
-      where: { id: userId },
-      data: { lastCheckInAt: now, checkInStreak: newStreak },
-    });
-
-    await this.wallet.credit({
-      userId,
-      walletType: WalletType.COIN,
-      amount: reward,
-      ledgerType: LedgerEntryType.BONUS,
-      reference: 'daily-check-in',
-      idempotencyKey: `check-in-${userId}-${toUtcDateKey(now)}`,
+    await this.prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: userId },
+        data: { lastCheckInAt: now, checkInStreak: newStreak },
+      });
+      await this.wallet.credit({
+        userId,
+        walletType: WalletType.BONUS,
+        amount: reward,
+        ledgerType: LedgerEntryType.BONUS,
+        reference: 'daily-check-in',
+        idempotencyKey: `check-in-${userId}-${toUtcDateKey(now)}`,
+      }, tx);
     });
 
     void this.rrydaLevels.addXp(userId, 10); // Rryda Identity: showing up counts, every day
@@ -211,7 +217,7 @@ export class UsersService {
       if (typeof updates.oneOnOneEnabled !== 'boolean') throw new BadRequestException('oneOnOneEnabled must be true or false');
       const creator = await this.prisma.userRole.findFirst({ where: { userId, role: RoleName.CREATOR } });
       if (!creator) throw new BadRequestException('Only hosts can change 1-on-1 availability');
-      // Turning this ON before the host has unlocked ONE_ON_ONE_VIDEO used
+      // Turning this ON before the host has unlocked private 1-on-1 live used
       // to save silently — the switch would sit "on" in the app with no
       // indication that nobody could actually reach them, since the level
       // was only ever checked later, at call time. Enforce it here too, so
@@ -219,7 +225,7 @@ export class UsersService {
       // mobile UI now also gates the switch itself — see EditProfileScreen).
       // Turning it OFF is always allowed, at any level.
       if (updates.oneOnOneEnabled) {
-        await this.hostLevels.assertUnlock(userId, 'ONE_ON_ONE_VIDEO');
+        await this.hostLevels.assertUnlock(userId, 'PRIVATE_LIVE', 'private 1-on-1 live');
       }
       data.oneOnOneEnabled = updates.oneOnOneEnabled;
     }
