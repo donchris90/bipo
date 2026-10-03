@@ -1,9 +1,6 @@
 import { BadRequestException, Injectable, ServiceUnavailableException } from '@nestjs/common';
+import { SUPPORTED_LANGUAGE_CODES as SUPPORTED } from '../common/languages';
 
-const SUPPORTED = new Set([
-  'en', 'es', 'fr', 'pt', 'ar', 'zh', 'yo', 'ha', 'ig', 'hi',
-  'id', 'tl', 'tr', 'de', 'ru', 'ja', 'ko', 'vi', 'sw',
-]);
 
 const MAX_TEXTS = 100;
 const MAX_TEXT_LENGTH = 5000;

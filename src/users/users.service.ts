@@ -1,4 +1,5 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { SUPPORTED_LANGUAGE_CODES } from '../common/languages';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
 import { WalletService } from '../economy/wallet.service';
@@ -11,10 +12,6 @@ import { ReferralConfigService } from '../referral-config/referral-config.servic
 import { CHECK_IN_REWARD_SCHEDULE, computeCheckInReward, resolveCheckIn, toUtcDateKey } from './check-in-rules';
 
 const MAX_BIO_LENGTH = 220;
-const SUPPORTED_LANGUAGE_CODES = new Set([
-  'en', 'es', 'fr', 'pt', 'ar', 'zh', 'yo', 'ha', 'ig', 'hi',
-  'id', 'tl', 'tr', 'de', 'ru', 'ja', 'ko', 'vi', 'sw',
-]);
 
 @Injectable()
 export class UsersService {
